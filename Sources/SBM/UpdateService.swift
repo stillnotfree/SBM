@@ -70,11 +70,26 @@ enum UpdateService {
     )
   }
 
-  static func download(_ update: AppUpdate) async throws -> URL {
+  static func download(
+    _ update: AppUpdate,
+    progress: @escaping @Sendable (Double) -> Void = { _ in }
+  ) async throws -> URL {
     var request = URLRequest(url: update.assetURL)
     request.timeoutInterval = 120
     request.setValue("SBM updater", forHTTPHeaderField: "User-Agent")
-    let (temporaryURL, response) = try await session.download(for: request)
+
+    let directory = try updateDirectory()
+    let stagingURL = directory.appendingPathComponent(
+      ".download-\(UUID().uuidString).tmp"
+    )
+    let transfer = UpdateDownloadTransfer(
+      stagingURL: stagingURL,
+      progress: progress
+    )
+    progress(0)
+    let response = try await transfer.start(request)
+    defer { try? FileManager.default.removeItem(at: stagingURL) }
+
     guard let http = response as? HTTPURLResponse,
       http.statusCode == 200,
       http.url?.scheme?.lowercased() == "https"
@@ -82,17 +97,33 @@ enum UpdateService {
       throw UpdateFailure.downloadFailed
     }
 
-    let attributes = try FileManager.default.attributesOfItem(atPath: temporaryURL.path)
+    let attributes = try FileManager.default.attributesOfItem(atPath: stagingURL.path)
     guard let size = attributes[.size] as? NSNumber,
       size.int64Value == update.expectedSize,
       size.int64Value <= maximumAssetSize
     else {
       throw UpdateFailure.assetSizeMismatch
     }
-    guard try sha256(of: temporaryURL) == update.expectedDigest else {
+    progress(1)
+    guard try sha256(of: stagingURL) == update.expectedDigest else {
       throw UpdateFailure.assetDigestMismatch
     }
 
+    let destination = directory.appendingPathComponent(
+      "SBM-\(update.version)-arm64.dmg"
+    )
+    if FileManager.default.fileExists(atPath: destination.path) {
+      try FileManager.default.removeItem(at: destination)
+    }
+    try FileManager.default.moveItem(at: stagingURL, to: destination)
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o600],
+      ofItemAtPath: destination.path
+    )
+    return destination
+  }
+
+  private static func updateDirectory() throws -> URL {
     let directory = try FileManager.default.url(
       for: .cachesDirectory,
       in: .userDomainMask,
@@ -112,19 +143,7 @@ enum UpdateService {
     values.isExcludedFromBackup = true
     var mutableDirectory = directory
     try mutableDirectory.setResourceValues(values)
-
-    let destination = directory.appendingPathComponent(
-      "SBM-\(update.version)-arm64.dmg"
-    )
-    if FileManager.default.fileExists(atPath: destination.path) {
-      try FileManager.default.removeItem(at: destination)
-    }
-    try FileManager.default.moveItem(at: temporaryURL, to: destination)
-    try FileManager.default.setAttributes(
-      [.posixPermissions: 0o600],
-      ofItemAtPath: destination.path
-    )
-    return destination
+    return directory
   }
 
   private static func sha256(of url: URL) throws -> String {
@@ -170,6 +189,117 @@ enum UpdateService {
 private final class UpdateHTTPSOnlySessionDelegate: NSObject, URLSessionTaskDelegate,
   @unchecked Sendable
 {
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(request.url?.scheme?.lowercased() == "https" ? request : nil)
+  }
+}
+
+private final class UpdateDownloadTransfer: NSObject, URLSessionDownloadDelegate,
+  @unchecked Sendable
+{
+  private let stagingURL: URL
+  private let progressHandler: @Sendable (Double) -> Void
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<URLResponse, any Error>?
+  private var session: URLSession?
+  private var downloadResponse: URLResponse?
+  private var transferError: (any Error)?
+
+  init(
+    stagingURL: URL,
+    progress: @escaping @Sendable (Double) -> Void
+  ) {
+    self.stagingURL = stagingURL
+    progressHandler = progress
+  }
+
+  func start(_ request: URLRequest) async throws -> URLResponse {
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<URLResponse, any Error>) in
+      lock.lock()
+      self.continuation = continuation
+      lock.unlock()
+
+      let configuration = URLSessionConfiguration.ephemeral
+      configuration.urlCache = nil
+      configuration.httpCookieStorage = nil
+      configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+      let queue = OperationQueue()
+      queue.maxConcurrentOperationCount = 1
+      let session = URLSession(
+        configuration: configuration,
+        delegate: self,
+        delegateQueue: queue
+      )
+      self.session = session
+      session.downloadTask(with: request).resume()
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didWriteData bytesWritten: Int64,
+    totalBytesWritten: Int64,
+    totalBytesExpectedToWrite: Int64
+  ) {
+    guard totalBytesExpectedToWrite > 0 else { return }
+    let fraction = min(
+      1,
+      max(0, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    )
+    progressHandler(fraction)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didFinishDownloadingTo location: URL
+  ) {
+    do {
+      if FileManager.default.fileExists(atPath: stagingURL.path) {
+        try FileManager.default.removeItem(at: stagingURL)
+      }
+      try FileManager.default.moveItem(at: location, to: stagingURL)
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: stagingURL.path
+      )
+      downloadResponse = downloadTask.response
+    } catch {
+      transferError = error
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didCompleteWithError error: (any Error)?
+  ) {
+    lock.lock()
+    let continuation = self.continuation
+    self.continuation = nil
+    let response = downloadResponse
+    let finalError = transferError ?? error
+    self.session = nil
+    lock.unlock()
+
+    session.finishTasksAndInvalidate()
+    if let finalError {
+      continuation?.resume(throwing: finalError)
+    } else if let response {
+      continuation?.resume(returning: response)
+    } else {
+      continuation?.resume(throwing: UpdateFailure.downloadFailed)
+    }
+  }
+
   func urlSession(
     _ session: URLSession,
     task: URLSessionTask,

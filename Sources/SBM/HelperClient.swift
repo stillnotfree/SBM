@@ -27,6 +27,8 @@ enum HelperClientError: LocalizedError {
 }
 
 enum HelperClient {
+  private static let requestLock = NSLock()
+
   static func send(_ action: HelperAction) throws -> HelperResponse {
     try send(HelperRequest(action: action))
   }
@@ -45,6 +47,9 @@ enum HelperClient {
     _ request: HelperRequest,
     receiveTimeoutSeconds: Int = 30
   ) throws -> HelperResponse {
+    requestLock.lock()
+    defer { requestLock.unlock() }
+
     let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
     guard descriptor >= 0 else {
       throw HelperClientError.socketCreation(errno)

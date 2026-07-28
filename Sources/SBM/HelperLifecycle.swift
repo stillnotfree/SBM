@@ -65,6 +65,7 @@ final class SystemHelperService: HelperServiceManaging {
 enum HelperLifecycleFailure: LocalizedError {
   case approvalRequired
   case registrationDidNotFinish
+  case replacementDidNotFinish(String?)
   case startupTimedOut(String?)
 
   var errorDescription: String? {
@@ -73,6 +74,12 @@ enum HelperLifecycleFailure: LocalizedError {
       "Approve SBMHelper in System Settings, then return to SBM."
     case .registrationDidNotFinish:
       "macOS did not enable the background helper. Approve it in System Settings, then return to SBM."
+    case .replacementDidNotFinish(let detail):
+      if let detail, !detail.isEmpty {
+        "macOS did not finish replacing the background helper: \(detail)"
+      } else {
+        "macOS did not finish replacing the background helper."
+      }
     case .startupTimedOut(let detail):
       if let detail, !detail.isEmpty {
         "The background helper did not start: \(detail)"
@@ -87,7 +94,7 @@ enum HelperLifecycleFailure: LocalizedError {
 enum HelperLifecycle {
   static func enable(
     service: any HelperServiceManaging,
-    timeout: Duration = .seconds(3),
+    timeout: Duration = .seconds(15),
     pollInterval: Duration = .milliseconds(250),
     probe: @escaping @Sendable () async throws -> HelperResponse
   ) async throws -> HelperResponse {
@@ -138,5 +145,75 @@ enum HelperLifecycle {
     throw HelperLifecycleFailure.startupTimedOut(
       mostRecentError?.localizedDescription
     )
+  }
+
+  static func replace(
+    service: any HelperServiceManaging,
+    registrationTimeout: Duration = .seconds(25),
+    pollInterval: Duration = .milliseconds(500),
+    waiting: @escaping () -> Void = {},
+    probe: @escaping @Sendable () async throws -> HelperResponse
+  ) async throws -> HelperResponse {
+    switch service.registrationState {
+    case .enabled:
+      try await service.unregister()
+    case .notRegistered, .notFound:
+      break
+    case .requiresApproval:
+      throw HelperLifecycleFailure.approvalRequired
+    case .unknown:
+      throw HelperLifecycleFailure.registrationDidNotFinish
+    }
+
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: registrationTimeout)
+    var mostRecentError: (any Error)?
+
+    while clock.now < deadline {
+      try Task.checkCancellation()
+
+      switch service.registrationState {
+      case .requiresApproval:
+        throw HelperLifecycleFailure.approvalRequired
+      case .enabled:
+        return try await enable(
+          service: service,
+          timeout: .seconds(15),
+          pollInterval: .milliseconds(250),
+          probe: probe
+        )
+      case .notRegistered, .notFound:
+        do {
+          try service.register()
+          return try await enable(
+            service: service,
+            timeout: .seconds(15),
+            pollInterval: .milliseconds(250),
+            probe: probe
+          )
+        } catch {
+          guard isTransientReplacementError(error) else { throw error }
+          mostRecentError = error
+          waiting()
+        }
+      case .unknown:
+        break
+      }
+
+      try await Task.sleep(for: pollInterval)
+    }
+
+    throw HelperLifecycleFailure.replacementDidNotFinish(
+      mostRecentError?.localizedDescription
+    )
+  }
+
+  private static func isTransientReplacementError(_ error: any Error) -> Bool {
+    // SMAppService can return EPERM for a short period after its asynchronous
+    // unregister completion while Background Task Management still retains the
+    // old item. Retrying only this error avoids hiding signature or approval
+    // failures.
+    let nsError = error as NSError
+    return nsError.code == Int(POSIXErrorCode.EPERM.rawValue)
   }
 }

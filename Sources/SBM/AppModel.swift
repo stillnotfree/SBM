@@ -32,6 +32,8 @@ final class AppModel {
   var updateStatus = "Not checked"
   var availableUpdateVersion: String?
   var isCheckingForUpdates = false
+  var isDownloadingUpdate = false
+  var updateDownloadProgress: Double?
 
   var profiles: [ManagedProfile] = []
   var selectedProfileID: UUID?
@@ -44,6 +46,8 @@ final class AppModel {
   var localSOCKSPort: UInt16 = 1082
   private var subscriptionRefreshTask: Task<Void, Never>?
   private var helperRepairTask: Task<Void, Never>?
+  private var refreshGeneration = 0
+  private var refreshInProgress = false
   private var lastLatencyTestAt: Date?
   private var didAttemptAutomaticConnection = false
   private var helperActiveProfileID: UUID?
@@ -76,8 +80,7 @@ final class AppModel {
     }
     enableLaunchAtLoginIfNeeded()
     refreshRegistrationStatus()
-    refresh()
-    enableHelperOnFirstLaunchIfNeeded()
+    bootstrapHelper()
     if !profiles.isEmpty {
       profileAvailable = selectedProfile?.payload != nil
       startSubscriptionRefreshLoop()
@@ -153,14 +156,22 @@ final class AppModel {
       coreRunning = false
       return
     }
+    guard !helperSetupInProgress, !refreshInProgress else { return }
 
-    beginBusyOperation()
+    refreshGeneration += 1
+    let generation = refreshGeneration
+    refreshInProgress = true
     Task {
-      defer { endBusyOperation() }
+      defer {
+        if refreshGeneration == generation {
+          refreshInProgress = false
+        }
+      }
       do {
         let response = try await Task.detached {
-          try HelperClient.send(.status)
+          try HelperClient.send(.status, receiveTimeoutSeconds: 5)
         }.value
+        guard refreshGeneration == generation, !helperSetupInProgress else { return }
         guard response.helperRevision == HelperConstants.helperRevision else {
           helperStatus = "Helper update required"
           helperReachable = false
@@ -172,6 +183,7 @@ final class AppModel {
         lastError = response.success ? nil : response.message
         connectAutomaticallyIfNeeded()
       } catch {
+        guard refreshGeneration == generation, !helperSetupInProgress else { return }
         helperStatus = "Helper unavailable"
         helperReachable = false
         coreRunning = false
@@ -218,12 +230,24 @@ final class AppModel {
       checkForUpdates()
       return
     }
-    beginBusyOperation()
+    guard !isDownloadingUpdate else { return }
+    isDownloadingUpdate = true
+    updateDownloadProgress = 0
     updateStatus = "Downloading \(update.version)…"
     Task {
-      defer { endBusyOperation() }
+      defer {
+        isDownloadingUpdate = false
+        updateDownloadProgress = nil
+      }
       do {
-        let image = try await UpdateService.download(update)
+        let image = try await UpdateService.download(update) { [weak self] fraction in
+          Task { @MainActor [weak self] in
+            guard self?.isDownloadingUpdate == true else { return }
+            self?.updateDownloadProgress = fraction
+            self?.updateStatus =
+              "Downloading \(update.version)… \(Int((fraction * 100).rounded()))%"
+          }
+        }
         guard NSWorkspace.shared.open(image) else {
           throw UpdateFailure.downloadFailed
         }
@@ -250,6 +274,7 @@ final class AppModel {
       helperStatus = "Helper setup already in progress…"
       return
     }
+    invalidateRefresh()
     beginBusyOperation()
     helperSetupInProgress = true
     helperStatus = "Enabling background helper…"
@@ -283,6 +308,7 @@ final class AppModel {
       helperStatus = "Helper update already in progress…"
       return
     }
+    invalidateRefresh()
     beginBusyOperation()
     helperSetupInProgress = true
     helperReachable = false
@@ -304,10 +330,16 @@ final class AppModel {
           }.value
         }
         helperStatus = "Replacing background helper…"
-        try await unregisterHelper()
-        try await waitForHelperRemoval()
-        helperStatus = "Starting updated helper…"
-        let response = try await enableCurrentHelper()
+        let response = try await HelperLifecycle.replace(
+          service: helperService,
+          waiting: { [weak self] in
+            self?.helperStatus = "Waiting for macOS to replace helper…"
+          }
+        ) {
+          try await Task.detached {
+            try HelperClient.send(.status, receiveTimeoutSeconds: 5)
+          }.value
+        }
         apply(response)
         helperReachable = true
         helperStatus = "Helper updated"
@@ -1039,35 +1071,9 @@ final class AppModel {
   private func enableCurrentHelper() async throws -> HelperResponse {
     try await HelperLifecycle.enable(service: helperService) {
       try await Task.detached {
-        try HelperClient.send(.status, receiveTimeoutSeconds: 1)
+        try HelperClient.send(.status, receiveTimeoutSeconds: 5)
       }.value
     }
-  }
-
-  private func waitForHelperRemoval() async throws {
-    let clock = ContinuousClock()
-    let deadline = clock.now.advanced(by: .seconds(45))
-    var stableChecks = 0
-    while clock.now < deadline {
-      let registrationRemoved =
-        helperService.registrationState == .notRegistered
-        || helperService.registrationState == .notFound
-      let socketRemoved = !FileManager.default.fileExists(
-        atPath: HelperConstants.socketPath
-      )
-      if registrationRemoved && socketRemoved {
-        stableChecks += 1
-        if stableChecks >= 2 { return }
-      } else {
-        stableChecks = 0
-      }
-      try await Task.sleep(for: .milliseconds(1_500))
-    }
-    throw AppModelFailure.helperRemovalTimedOut
-  }
-
-  private func unregisterHelper() async throws {
-    try await helperService.unregister()
   }
 
   private func refreshRegistrationStatus() {
@@ -1099,15 +1105,20 @@ final class AppModel {
     }
   }
 
-  private func enableHelperOnFirstLaunchIfNeeded() {
-    let key = "DidAttemptInitialHelperSetup"
-    guard !UserDefaults.standard.bool(forKey: key) else { return }
-    guard
-      helperService.registrationState == .notRegistered
-        || helperService.registrationState == .notFound
-    else { return }
-    UserDefaults.standard.set(true, forKey: key)
-    enableHelper()
+  private func bootstrapHelper() {
+    switch helperService.registrationState {
+    case .enabled:
+      refresh()
+    case .notRegistered, .notFound:
+      enableHelper()
+    case .requiresApproval, .unknown:
+      break
+    }
+  }
+
+  private func invalidateRefresh() {
+    refreshGeneration += 1
+    refreshInProgress = false
   }
 
   private func presentHelperApproval() {
@@ -1195,9 +1206,6 @@ private enum AppModelFailure: LocalizedError {
   case profileValidationFailed(String)
   case helperRequiredForValidation
   case helperRevisionMismatch
-  case helperApprovalRequired
-  case helperRemovalTimedOut
-  case helperStartupTimedOut(String?)
   case coreStopFailed(String)
 
   var errorDescription: String? {
@@ -1210,16 +1218,6 @@ private enum AppModelFailure: LocalizedError {
       "Enable the background helper before importing a profile."
     case .helperRevisionMismatch:
       "macOS is still running an older background helper. Approve the updated item in System Settings, then repair it again."
-    case .helperApprovalRequired:
-      "macOS requires approval for the background helper in System Settings."
-    case .helperRemovalTimedOut:
-      "macOS did not finish removing the previous background helper within 45 seconds."
-    case .helperStartupTimedOut(let detail):
-      if let detail, !detail.isEmpty {
-        "The updated background helper did not become ready within 45 seconds: \(detail)"
-      } else {
-        "The updated background helper did not become ready within 45 seconds."
-      }
     case .coreStopFailed(let message):
       "The VPN core did not stop: \(message)"
     }

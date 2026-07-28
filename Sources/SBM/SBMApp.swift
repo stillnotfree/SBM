@@ -170,7 +170,6 @@ private struct MenuContentView: View {
     Button("Refresh") {
       model.refresh()
     }
-    .disabled(model.helperSetupInProgress)
     .keyboardShortcut("r")
 
     Divider()
@@ -246,11 +245,20 @@ private struct AboutView: View {
         .font(.caption)
         .foregroundStyle(.secondary)
 
+      if model.isDownloadingUpdate {
+        ProgressView(value: model.updateDownloadProgress ?? 0)
+        Text(
+          "\(Int(((model.updateDownloadProgress ?? 0) * 100).rounded()))%"
+        )
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+      }
+
       if model.availableUpdateVersion != nil {
         Button("Download Verified Update") {
           model.downloadAndOpenUpdate()
         }
-        .disabled(model.isBusy)
+        .disabled(model.isDownloadingUpdate)
       } else {
         Button("Check for Updates") {
           model.checkForUpdates()
