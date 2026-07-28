@@ -1,16 +1,50 @@
-# SBM
+<p align="center">
+  <img src="Resources/AppIcon.icon/Assets/sing-box.png" width="144" alt="SBM icon">
+</p>
 
-Native Apple Silicon menu bar client for sing-box.
+<h1 align="center">SBM</h1>
+
+<p align="center">
+  A minimal native sing-box client for macOS, built exclusively for Apple Silicon.
+</p>
+
+<p align="center">
+  <a href="https://github.com/stillnotfree/SBM/releases/latest"><img src="https://img.shields.io/github/v/release/stillnotfree/SBM?sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/stillnotfree/SBM/releases"><img src="https://img.shields.io/github/downloads/stillnotfree/SBM/total" alt="Downloads"></a>
+  <img src="https://img.shields.io/badge/macOS-26%2B-black?logo=apple" alt="macOS 26 or newer">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-native-black" alt="Apple Silicon native">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/stillnotfree/SBM" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  English · <a href="README_RU.md">Русский</a>
+</p>
 
 > **Development disclosure:** this project was vibe-coded and generated
 > primarily by an AI coding agent (OpenAI Codex), under human direction,
 > review, and testing. It has not received an independent professional security
 > audit.
 
-SBM provides a TUN-only connection, Rule/Global/Direct modes, automatic
-and manual server selection, protocol-aware latency tests, and multiple named
-profiles stored in a user-only Application Support file. It has no system-proxy mode, dashboard,
-traffic statistics, telemetry, or access logging.
+## Highlights
+
+- Native Swift menu bar app with a TUN-only connection and no Electron runtime.
+- Rule, Global, and Direct modes with automatic or manual server selection.
+- HTTPS subscriptions, individual VLESS/Hysteria2 links, and native sing-box JSON profiles.
+- No system-proxy mode, dashboard, traffic statistics, telemetry, or access logging.
+
+## Install
+
+1. Download the latest Apple Silicon DMG from
+   [GitHub Releases](https://github.com/stillnotfree/SBM/releases/latest).
+2. Open the DMG and drag **SBM.app** to Applications.
+3. If Gatekeeper blocks it, use **System Settings > Privacy & Security > Open
+   Anyway**.
+4. Open **Profiles…** and add a subscription, connection link, or sing-box JSON
+   profile.
+
+SBM launches at login and reconnects the selected cached profile automatically.
+See [Install and test](#install-and-test) for helper approval and testing
+details.
 
 ## Profile sources
 
@@ -138,3 +172,6 @@ covered by the test suite, including single-protocol profiles.
 Generic native JSON profiles are validated automatically against the bundled
 core; a userspace WireGuard endpoint is covered by the test suite. This does
 not claim that every sing-box protocol has been tested against every provider.
+
+Please report suspected vulnerabilities through the
+[private security policy](SECURITY.md), not a public issue.
