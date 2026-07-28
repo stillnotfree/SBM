@@ -1,0 +1,57 @@
+{
+  "route": {
+    "rules": [
+      {
+        "domain_suffix": [
+          "google.ru"
+        ],
+        "action": "route",
+        "outbound": "proxy-selector"
+      },
+      {
+        "domain_suffix": [
+          ".ru",
+          ".su",
+          ".xn--p1ai"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-category-ru",
+          "geosite-tld-ru",
+          "geoip-ru"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-category-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
+        "download_detour": "proxy-selector",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-tld-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-tld-ru.srs",
+        "download_detour": "proxy-selector",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+        "download_detour": "proxy-selector",
+        "update_interval": "1d"
+      }
+    ]
+  }
+}
