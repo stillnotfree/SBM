@@ -23,7 +23,17 @@ import Testing
     profiles: [
       ManagedProfile(
         name: "Private",
-        subscriptionURL: "https://user:secret@example.com/subscription"
+        sources: [
+          ManagedSource(
+            name: "Private subscription",
+            value: "https://user:secret@example.com/subscription",
+            headers: SubscriptionHeaders(
+              userAgent: "Custom Client/1.0",
+              deviceOS: "macOS",
+              hardwareID: "private-hwid"
+            )
+          )
+        ]
       )
     ],
     selectedProfileID: nil

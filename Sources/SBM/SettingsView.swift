@@ -59,38 +59,102 @@ struct SettingsView: View {
         }
       }
 
-      Section("Profile source") {
-        SecureField(
-          "HTTPS subscription, vless:// or hysteria2://",
-          text: $model.subscriptionURL
-        )
-        .textFieldStyle(.roundedBorder)
-        Text(
-          "Profile URLs and cached credentials are stored in a user-only file in Application Support and are never written to application logs."
-        )
-        .font(.caption)
-        .foregroundStyle(.secondary)
+      Section("Subscription sources") {
+        if model.canManageSources {
+          HStack {
+            Picker(
+              "Source",
+              selection: Binding(
+                get: { model.selectedSourceID },
+                set: { id in
+                  if let id { model.selectSource(id) }
+                }
+              )
+            ) {
+              ForEach(model.selectedProfileSources) { source in
+                Text(source.name).tag(Optional(source.id))
+              }
+            }
 
-        HStack {
-          Button("Save and Import") {
-            model.saveAndSyncSubscription()
+            ControlGroup {
+              Button {
+                model.addSource()
+              } label: {
+                Label("Add source", systemImage: "plus")
+                  .labelStyle(.iconOnly)
+                  .frame(width: 24)
+              }
+              .help("Add subscription or connection")
+
+              Button {
+                model.deleteSelectedSource()
+              } label: {
+                Label("Delete source", systemImage: "minus")
+                  .labelStyle(.iconOnly)
+                  .frame(width: 24)
+              }
+              .help("Delete selected source")
+              .disabled(model.selectedSourceID == nil)
+            }
           }
-          .disabled(
-            model.isSyncing || model.helperSetupInProgress
-              || model.subscriptionURL.isEmpty
+
+          TextField("Source name", text: $model.sourceName)
+            .textFieldStyle(.roundedBorder)
+            .disabled(model.selectedSourceID == nil)
+
+          SecureField(
+            "HTTPS subscription, vless:// or hysteria2://",
+            text: $model.subscriptionURL
           )
+          .textFieldStyle(.roundedBorder)
+          .disabled(model.selectedSourceID == nil)
 
-          Button("Import Full JSON…") {
-            isImportingProfile = true
+          DisclosureGroup("Request headers") {
+            TextField("User-Agent", text: $model.subscriptionUserAgent)
+              .textFieldStyle(.roundedBorder)
+            TextField("X-Device-OS", text: $model.subscriptionDeviceOS)
+              .textFieldStyle(.roundedBorder)
+            TextField("X-HWID", text: $model.subscriptionHWID)
+              .textFieldStyle(.roundedBorder)
+            HStack {
+              Spacer()
+              Button("Reset Defaults") {
+                model.resetSubscriptionHeaders()
+              }
+            }
           }
-          .disabled(model.helperSetupInProgress)
+          .disabled(model.selectedSourceID == nil)
 
-          if model.isSyncing {
-            ProgressView().controlSize(.small)
+          Text(
+            "Each source keeps its own headers. Credentials are stored in the user-only Application Support file and are never written to logs."
+          )
+          .font(.caption)
+          .foregroundStyle(.secondary)
+
+          HStack {
+            Button("Save and Sync") {
+              model.saveAndSyncSubscription()
+            }
+            .disabled(
+              model.isSyncing || model.helperSetupInProgress
+                || model.selectedSourceID == nil || model.subscriptionURL.isEmpty
+            )
+
+            if model.isSyncing {
+              ProgressView().controlSize(.small)
+            }
+            Text(model.subscriptionStatus)
+              .foregroundStyle(model.profileAvailable ? .green : .secondary)
           }
-          Text(model.subscriptionStatus)
-            .foregroundStyle(model.profileAvailable ? .green : .secondary)
+        } else {
+          Text("Full JSON profiles cannot be combined with subscription sources.")
+            .foregroundStyle(.secondary)
         }
+
+        Button("Import Full JSON as New Profile…") {
+          isImportingProfile = true
+        }
+        .disabled(model.helperSetupInProgress)
       }
 
       Section("Routing") {
@@ -146,7 +210,7 @@ struct SettingsView: View {
       }
     }
     .formStyle(.grouped)
-    .frame(width: 560, height: 500)
+    .frame(width: 620, height: 620)
     .padding()
     .fileImporter(
       isPresented: $isImportingProfile,

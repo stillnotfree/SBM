@@ -1,9 +1,15 @@
 import Foundation
 import SBMShared
 
-private final class HTTPSOnlySessionDelegate: NSObject, URLSessionTaskDelegate,
+private final class SubscriptionSessionDelegate: NSObject, URLSessionTaskDelegate,
   @unchecked Sendable
 {
+  private let sourceURL: URL
+
+  init(sourceURL: URL) {
+    self.sourceURL = sourceURL
+  }
+
   func urlSession(
     _ session: URLSession,
     task: URLSessionTask,
@@ -11,25 +17,33 @@ private final class HTTPSOnlySessionDelegate: NSObject, URLSessionTaskDelegate,
     newRequest request: URLRequest,
     completionHandler: @escaping (URLRequest?) -> Void
   ) {
-    completionHandler(request.url?.scheme?.lowercased() == "https" ? request : nil)
+    completionHandler(
+      SubscriptionClient.sanitizedRedirectRequest(request, from: sourceURL)
+    )
+  }
+}
+
+private struct SubscriptionOrigin: Equatable, Sendable {
+  let scheme: String
+  let host: String
+  let port: Int
+
+  init(url: URL) {
+    scheme = url.scheme?.lowercased() ?? ""
+    host = url.host?.lowercased() ?? ""
+    port = url.port ?? (scheme == "https" ? 443 : -1)
   }
 }
 
 enum SubscriptionClient {
   static let maximumProfileSize = 1_048_576
-  private static let session: URLSession = {
-    let configuration = URLSessionConfiguration.ephemeral
-    configuration.urlCache = nil
-    configuration.httpCookieStorage = nil
-    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-    return URLSession(
-      configuration: configuration,
-      delegate: HTTPSOnlySessionDelegate(),
-      delegateQueue: nil
-    )
-  }()
+  static let maximumConnections = 63
 
-  static func fetch(from value: String) async throws -> CoreProfile {
+  static func fetch(
+    from value: String,
+    headers: SubscriptionHeaders = SubscriptionHeaders()
+  ) async throws -> CoreProfile {
+    try validate(headers: headers)
     let source = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if isDirectSource(source) {
       guard source.utf8.count <= maximumProfileSize else {
@@ -37,19 +51,24 @@ enum SubscriptionClient {
       }
       return try parsePayload(source)
     }
-    guard value.utf8.count <= 4096,
-      let url = URL(string: value),
+    guard source.utf8.count <= 4096,
+      let url = URL(string: source),
       url.scheme?.lowercased() == "https",
       url.host != nil
     else { throw SubscriptionFailure.invalidURL }
 
-    var request = URLRequest(url: url)
-    request.timeoutInterval = 15
-    request.cachePolicy = .reloadIgnoringLocalCacheData
-    request.setValue(
-      "sing-box/1.13 SBM/\(HelperConstants.helperVersion)",
-      forHTTPHeaderField: "User-Agent"
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.urlCache = nil
+    configuration.httpCookieStorage = nil
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    let session = URLSession(
+      configuration: configuration,
+      delegate: SubscriptionSessionDelegate(sourceURL: url),
+      delegateQueue: nil
     )
+    defer { session.finishTasksAndInvalidate() }
+
+    let request = try makeRequest(for: url, headers: headers)
     let (temporaryURL, response) = try await session.download(for: request)
     guard let http = response as? HTTPURLResponse,
       http.statusCode == 200,
@@ -69,6 +88,56 @@ enum SubscriptionClient {
 
     let body = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     return try parsePayload(body)
+  }
+
+  static func validate(headers: SubscriptionHeaders) throws {
+    try validateHeader(headers.userAgent, name: "User-Agent", maximum: 512)
+    try validateHeader(headers.deviceOS, name: "X-Device-OS", maximum: 64)
+    try validateHeader(headers.hardwareID, name: "X-HWID", maximum: 128)
+  }
+
+  private static func validateHeader(_ value: String, name: String, maximum: Int) throws {
+    guard !value.isEmpty, value.utf8.count <= maximum,
+      !value.unicodeScalars.contains(where: {
+        CharacterSet.controlCharacters.contains($0)
+      })
+    else {
+      throw SubscriptionFailure.invalidHeader(name)
+    }
+  }
+
+  static func makeRequest(
+    for url: URL,
+    headers: SubscriptionHeaders
+  ) throws -> URLRequest {
+    try validate(headers: headers)
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 15
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.setValue(headers.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue(headers.deviceOS, forHTTPHeaderField: "X-Device-OS")
+    request.setValue(headers.hardwareID, forHTTPHeaderField: "X-HWID")
+    return request
+  }
+
+  static func sanitizedRedirectRequest(
+    _ request: URLRequest,
+    from sourceURL: URL
+  ) -> URLRequest? {
+    guard let destination = request.url,
+      destination.scheme?.lowercased() == "https"
+    else { return nil }
+    guard SubscriptionOrigin(url: destination) != SubscriptionOrigin(url: sourceURL) else {
+      return request
+    }
+    var sanitized = request
+    sanitized.setValue(nil, forHTTPHeaderField: "X-HWID")
+    sanitized.setValue(nil, forHTTPHeaderField: "X-Device-OS")
+    sanitized.setValue(
+      "SBM/\(HelperConstants.helperVersion)",
+      forHTTPHeaderField: "User-Agent"
+    )
+    return sanitized
   }
 
   static func isRemoteSource(_ value: String) -> Bool {
@@ -100,18 +169,21 @@ enum SubscriptionClient {
       .map(String.init)
       .filter { !$0.isEmpty }
 
-    let vlessLink = links.first(where: { $0.lowercased().hasPrefix("vless://") })
-    let hysteriaLink = links.first(where: {
+    let vlessLinks = links.filter { $0.lowercased().hasPrefix("vless://") }
+    let hysteriaLinks = links.filter {
       $0.lowercased().hasPrefix("hysteria2://") || $0.lowercased().hasPrefix("hy2://")
-    })
-    guard vlessLink != nil || hysteriaLink != nil else {
+    }
+    guard !vlessLinks.isEmpty || !hysteriaLinks.isEmpty else {
       throw SubscriptionFailure.missingProtocols
+    }
+    guard vlessLinks.count + hysteriaLinks.count <= maximumConnections else {
+      throw SubscriptionFailure.tooManyConnections
     }
 
     return .compatibility(
       VPNProfile(
-        vless: try vlessLink.map(parseVLESS),
-        hysteria2: try hysteriaLink.map(parseHysteria2)
+        vless: try vlessLinks.map(parseVLESS),
+        hysteria2: try hysteriaLinks.map(parseHysteria2)
       )
     )
   }
@@ -328,7 +400,7 @@ enum NativeProfileParser {
   }
 }
 
-enum SubscriptionFailure: LocalizedError {
+enum SubscriptionFailure: Equatable, LocalizedError {
   case invalidURL
   case httpFailure
   case tooLarge
@@ -342,6 +414,9 @@ enum SubscriptionFailure: LocalizedError {
   case duplicateNativeTag(String)
   case duplicateSelectableTag
   case invalidDisplayName
+  case invalidHeader(String)
+  case tooManyConnections
+  case nativeProfileCannotBeMerged
 
   var errorDescription: String? {
     switch self {
@@ -366,6 +441,12 @@ enum SubscriptionFailure: LocalizedError {
       "The JSON profile selector contains the same outbound more than once."
     case .invalidDisplayName:
       "A server display name is empty, too long, or contains control characters."
+    case .invalidHeader(let name):
+      "\(name) is empty, too long, or contains control characters."
+    case .tooManyConnections:
+      "A profile may contain at most 63 proxy connections."
+    case .nativeProfileCannotBeMerged:
+      "Full sing-box JSON cannot be merged with subscription sources. Import it as a separate profile."
     }
   }
 }

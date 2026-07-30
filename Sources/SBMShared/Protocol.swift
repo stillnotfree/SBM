@@ -2,7 +2,7 @@ import Foundation
 
 public enum HelperConstants {
   public static let protocolVersion = 4
-  public static let helperVersion = "1.0.2"
+  public static let helperVersion = "1.1.0"
   public static let helperRevision = 29
   public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.sock"
   public static let daemonPlistName = "com.stillnotfree.sbm.helper.plist"
@@ -43,8 +43,6 @@ public struct ProxyNodeID: RawRepresentable, Codable, Hashable, Sendable {
   }
 
   public static let auto = ProxyNodeID(rawValue: "auto")
-  public static let reality = ProxyNodeID(rawValue: "reality")
-  public static let hysteria2 = ProxyNodeID(rawValue: "hysteria2")
 }
 
 public struct ProxyNodeDescriptor: Codable, Equatable, Hashable, Sendable {
@@ -122,13 +120,13 @@ public struct RoutingPolicy: Codable, Equatable, Sendable {
 }
 
 public struct VPNProfile: Codable, Equatable, Sendable {
-  public let vless: VLESSProfile?
-  public let hysteria2: Hysteria2Profile?
+  public let vless: [VLESSProfile]
+  public let hysteria2: [Hysteria2Profile]
   public let routingPolicy: RoutingPolicy?
 
   public init(
-    vless: VLESSProfile? = nil,
-    hysteria2: Hysteria2Profile? = nil,
+    vless: [VLESSProfile] = [],
+    hysteria2: [Hysteria2Profile] = [],
     routingPolicy: RoutingPolicy? = nil
   ) {
     self.vless = vless
@@ -161,11 +159,21 @@ public enum CoreProfile: Codable, Equatable, Sendable {
     switch self {
     case .compatibility(let profile):
       var nodes = [ProxyNodeDescriptor(id: .auto, name: "Auto")]
-      if let vless = profile.vless {
-        nodes.append(ProxyNodeDescriptor(id: .reality, name: vless.displayName))
+      for (index, vless) in profile.vless.enumerated() {
+        nodes.append(
+          ProxyNodeDescriptor(
+            id: ProxyNodeID(rawValue: "vless-\(index + 1)"),
+            name: vless.displayName
+          )
+        )
       }
-      if let hysteria2 = profile.hysteria2 {
-        nodes.append(ProxyNodeDescriptor(id: .hysteria2, name: hysteria2.displayName))
+      for (index, hysteria2) in profile.hysteria2.enumerated() {
+        nodes.append(
+          ProxyNodeDescriptor(
+            id: ProxyNodeID(rawValue: "hysteria2-\(index + 1)"),
+            name: hysteria2.displayName
+          )
+        )
       }
       return nodes
     case .native(let profile):

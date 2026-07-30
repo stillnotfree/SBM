@@ -38,7 +38,12 @@ final class AppModel {
   var profiles: [ManagedProfile] = []
   var selectedProfileID: UUID?
   var profileName = ""
+  var selectedSourceID: UUID?
+  var sourceName = ""
   var subscriptionURL = ""
+  var subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
+  var subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
+  var subscriptionHWID = UUID().uuidString
   var subscriptionStatus = "No subscription synced"
   var isSyncing = false
   var profileAvailable = false
@@ -104,6 +109,16 @@ final class AppModel {
     return true
   }
 
+  var canManageSources: Bool {
+    guard let payload = selectedProfile?.payload else { return selectedProfile != nil }
+    guard case .compatibility = payload else { return false }
+    return true
+  }
+
+  var selectedProfileSources: [ManagedSource] {
+    selectedProfile?.sources ?? []
+  }
+
   var hasRoutingPolicy: Bool {
     guard case .compatibility(let profile) = selectedProfile?.payload else { return false }
     return profile.routingPolicy != nil
@@ -138,6 +153,7 @@ final class AppModel {
       "Profile: \(selectedProfileName)",
       "Profile type: \(profileKind)",
       "Profile updated: \(updated)",
+      "Subscription sources: \(selectedProfile?.sources.count ?? 0)",
       "Selected server: \(selectedNodeID.rawValue)",
       "Local SOCKS5: \(localSOCKSEnabled ? "127.0.0.1:\(localSOCKSPort)" : "disabled")",
       "Servers:",
@@ -469,7 +485,7 @@ final class AppModel {
   }
 
   func saveAndSyncSubscription() {
-    syncSelectedProfile(persistEditor: true)
+    syncSelectedSource()
     startSubscriptionRefreshLoop()
   }
 
@@ -491,6 +507,69 @@ final class AppModel {
     } catch {
       lastError = error.localizedDescription
     }
+  }
+
+  func addSource() {
+    guard canManageSources, let selectedProfileID,
+      let profileIndex = profiles.firstIndex(where: { $0.id == selectedProfileID })
+    else { return }
+    let source = ManagedSource(name: "Subscription \(profiles[profileIndex].sources.count + 1)")
+    profiles[profileIndex].sources.append(source)
+    selectedSourceID = source.id
+    loadSelectedSourceEditor()
+    subscriptionStatus = "Enter a subscription URL or connection link"
+    do {
+      try persistProfileLibrary()
+      lastError = nil
+    } catch {
+      lastError = error.localizedDescription
+    }
+  }
+
+  func deleteSelectedSource() {
+    guard let selectedProfileID, let selectedSourceID,
+      let profileIndex = profiles.firstIndex(where: { $0.id == selectedProfileID }),
+      let sourceIndex = profiles[profileIndex].sources.firstIndex(where: {
+        $0.id == selectedSourceID
+      })
+    else { return }
+
+    let previous = profiles
+    profiles[profileIndex].sources.remove(at: sourceIndex)
+    do {
+      try rebuildCompatibilityPayload(at: profileIndex)
+      self.selectedSourceID = profiles[profileIndex].sources.first?.id
+      loadSelectedSourceEditor()
+      try persistProfileLibrary()
+      updateNodes()
+      profileAvailable = profiles[profileIndex].payload != nil
+      subscriptionStatus = profileAvailable ? "Source removed" : "No sources synced"
+      lastError = nil
+      if coreRunning, self.selectedProfileID == selectedProfileID {
+        if let payload = profiles[profileIndex].payload {
+          send(makeStartRequest(profile: payload, profileID: selectedProfileID))
+        } else {
+          send(.init(action: .stop))
+        }
+      }
+    } catch {
+      profiles = previous
+      loadSelectedProfileEditor()
+      updateNodes()
+      lastError = error.localizedDescription
+    }
+  }
+
+  func selectSource(_ id: UUID) {
+    guard selectedProfileSources.contains(where: { $0.id == id }) else { return }
+    selectedSourceID = id
+    loadSelectedSourceEditor()
+  }
+
+  func resetSubscriptionHeaders() {
+    subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
+    subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
+    subscriptionHWID = UUID().uuidString
   }
 
   func applyLocalSOCKSSettings() {
@@ -633,13 +712,16 @@ final class AppModel {
   }
 
   func addProfile() {
-    let profile = ManagedProfile(name: "New Profile")
+    let profile = ManagedProfile(
+      name: "New Profile",
+      sources: [ManagedSource()]
+    )
     profiles.append(profile)
     selectedProfileID = profile.id
     loadSelectedProfileEditor()
     updateNodes()
     profileAvailable = false
-    subscriptionStatus = "Enter a subscription URL"
+    subscriptionStatus = "Enter a subscription URL or connection link"
     try? persistProfileLibrary()
   }
 
@@ -743,8 +825,10 @@ final class AppModel {
           lastError = error.localizedDescription
         }
       }
-    } else if selectedProfile?.payload == nil, !subscriptionURL.isEmpty {
-      syncSelectedProfile(persistEditor: false)
+    } else if selectedProfile?.payload == nil,
+      selectedProfile?.sources.contains(where: { !$0.value.isEmpty }) == true
+    {
+      syncSelectedSource()
     }
   }
 
@@ -753,58 +837,69 @@ final class AppModel {
     return profiles.first(where: { $0.id == selectedProfileID })
   }
 
-  private func syncSelectedProfile(persistEditor: Bool) {
+  private func syncSelectedSource() {
     let value = subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines)
-    let name = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
-    let targetProfileID: UUID
-    if let selectedProfileID {
-      targetProfileID = selectedProfileID
-    } else {
-      let profile = ManagedProfile(
-        name: name.isEmpty ? "Profile" : name,
-        subscriptionURL: value
-      )
-      profiles.append(profile)
-      selectedProfileID = profile.id
-      targetProfileID = profile.id
+    let name = sourceName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let headers = SubscriptionHeaders(
+      userAgent: subscriptionUserAgent.trimmingCharacters(in: .whitespacesAndNewlines),
+      deviceOS: subscriptionDeviceOS.trimmingCharacters(in: .whitespacesAndNewlines),
+      hardwareID: subscriptionHWID.trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    guard let targetProfileID = selectedProfileID,
+      let targetSourceID = selectedSourceID,
+      let profileIndex = profiles.firstIndex(where: { $0.id == targetProfileID }),
+      let sourceIndex = profiles[profileIndex].sources.firstIndex(where: {
+        $0.id == targetSourceID
+      })
+    else {
+      lastError = "Add a subscription source first."
+      return
     }
-    if persistEditor,
-      let index = profiles.firstIndex(where: { $0.id == targetProfileID })
-    {
-      profiles[index].name = name.isEmpty ? "Profile" : name
-      profiles[index].subscriptionURL = value
-      do {
-        try persistProfileLibrary()
-      } catch {
-        lastError = error.localizedDescription
-        return
-      }
+    if case .native = profiles[profileIndex].payload {
+      lastError = SubscriptionFailure.nativeProfileCannotBeMerged.localizedDescription
+      return
+    }
+    do {
+      try SubscriptionClient.validate(headers: headers)
+      profiles[profileIndex].sources[sourceIndex].name =
+        name.isEmpty ? "Subscription" : name
+      profiles[profileIndex].sources[sourceIndex].value = value
+      profiles[profileIndex].sources[sourceIndex].headers = headers
+      try persistProfileLibrary()
+    } catch {
+      lastError = error.localizedDescription
+      return
     }
     guard !value.isEmpty else {
-      subscriptionStatus = selectedProfile?.payload == nil ? "Choose a profile source" : "Saved"
+      subscriptionStatus = profiles[profileIndex].payload == nil ? "Enter a source" : "Saved"
       return
     }
     isSyncing = true
     subscriptionStatus = "Syncing…"
     Task {
       defer { isSyncing = false }
-      var rollbackProfiles: [ManagedProfile]?
+      let previousProfiles = profiles
       do {
-        let fetched = try await SubscriptionClient.fetch(from: value)
-        guard let index = profiles.firstIndex(where: { $0.id == targetProfileID }) else {
-          return
+        let fetched = try await SubscriptionClient.fetch(from: value, headers: headers)
+        guard case .compatibility = fetched else {
+          throw SubscriptionFailure.nativeProfileCannotBeMerged
         }
-        let effective = applyingCurrentRoutingPolicy(
-          to: fetched,
-          current: profiles[index].payload
-        )
+        guard
+          let currentProfileIndex = profiles.firstIndex(where: {
+            $0.id == targetProfileID
+          }),
+          let currentSourceIndex = profiles[currentProfileIndex].sources.firstIndex(where: {
+            $0.id == targetSourceID
+          })
+        else { return }
+        profiles[currentProfileIndex].sources[currentSourceIndex].payload = fetched
+        profiles[currentProfileIndex].sources[currentSourceIndex].updatedAt = Date()
+        try rebuildCompatibilityPayload(at: currentProfileIndex)
+        guard let effective = profiles[currentProfileIndex].payload else {
+          throw SubscriptionFailure.missingProtocols
+        }
         try await validateProfile(effective)
-        let previousProfiles = profiles
-        rollbackProfiles = previousProfiles
-        profiles[index].name = name.isEmpty ? "Profile" : name
-        profiles[index].subscriptionURL = value
-        profiles[index].payload = effective
-        profiles[index].updatedAt = Date()
+        profiles[currentProfileIndex].updatedAt = Date()
         try persistProfileLibrary()
         if coreRunning, self.selectedProfileID == targetProfileID {
           let request = makeStartRequest(profile: effective, profileID: targetProfileID)
@@ -815,27 +910,22 @@ final class AppModel {
           guard response.success else {
             throw AppModelFailure.profileActivationFailed(response.message)
           }
-          subscriptionStatus = "Updated and active"
-        } else {
-          switch effective {
-          case .compatibility(let profile):
-            subscriptionStatus = profileSummary(profile) + " ready"
-          case .native:
-            subscriptionStatus = "Native JSON profile ready"
-          }
+          subscriptionStatus = "Sources updated and active"
+        } else if case .compatibility(let profile) = effective {
+          subscriptionStatus = profileSummary(profile) + " ready"
         }
         profileAvailable = true
         updateNodes()
         lastError = nil
         connectAutomaticallyIfNeeded()
       } catch {
-        if let rollbackProfiles {
-          profiles = rollbackProfiles
-          try? persistProfileLibrary()
-          updateNodes()
-        }
+        profiles = previousProfiles
+        try? persistProfileLibrary()
+        loadSelectedProfileEditor()
+        updateNodes()
         profileAvailable = selectedProfile?.payload != nil
-        subscriptionStatus = profileAvailable ? "Using cached profile; sync failed" : "Sync failed"
+        subscriptionStatus =
+          profileAvailable ? "Using cached sources; sync failed" : "Sync failed"
         lastError = error.localizedDescription
       }
     }
@@ -869,68 +959,75 @@ final class AppModel {
 
   private func refreshAllProfiles() {
     guard !isSyncing, currentHelperIsReady else { return }
-    let refreshable = profiles.filter {
-      SubscriptionClient.isRemoteSource($0.subscriptionURL)
+    let hasRemoteSources = profiles.contains { profile in
+      profile.sources.contains { SubscriptionClient.isRemoteSource($0.value) }
     }
-    guard !refreshable.isEmpty else { return }
+    guard hasRemoteSources else { return }
     isSyncing = true
     Task {
       defer { isSyncing = false }
       var selectedFailure: Error?
-      for profile in refreshable {
-        do {
-          let fetched = try await SubscriptionClient.fetch(from: profile.subscriptionURL)
-          guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else {
-            continue
-          }
-          let effective = applyingCurrentRoutingPolicy(
-            to: fetched,
-            current: profiles[index].payload
-          )
-          try await validateProfile(effective)
-          let changed = profiles[index].payload != effective
-          guard changed else {
-            profiles[index].updatedAt = Date()
-            continue
-          }
-          let previousProfiles = profiles
-          profiles[index].payload = effective
-          profiles[index].updatedAt = Date()
-          try persistProfileLibrary()
-          if changed, coreRunning, selectedProfileID == profile.id {
+      let previousProfiles = profiles
+      var selectedProfileChanged = false
+      do {
+        for profileIndex in profiles.indices {
+          if case .native = profiles[profileIndex].payload { continue }
+          var refreshedAnySource = false
+          for sourceIndex in profiles[profileIndex].sources.indices {
+            let source = profiles[profileIndex].sources[sourceIndex]
+            guard SubscriptionClient.isRemoteSource(source.value) else { continue }
             do {
-              let request = makeStartRequest(profile: effective, profileID: profile.id)
-              let response = try await Task.detached {
-                try HelperClient.send(request)
-              }.value
-              apply(response)
-              guard response.success else {
-                throw AppModelFailure.profileActivationFailed(response.message)
+              let fetched = try await SubscriptionClient.fetch(
+                from: source.value,
+                headers: source.headers
+              )
+              guard case .compatibility = fetched else {
+                throw SubscriptionFailure.nativeProfileCannotBeMerged
               }
+              profiles[profileIndex].sources[sourceIndex].payload = fetched
+              profiles[profileIndex].sources[sourceIndex].updatedAt = Date()
+              refreshedAnySource = true
             } catch {
-              profiles = previousProfiles
-              try? persistProfileLibrary()
-              updateNodes()
-              throw error
+              if profiles[profileIndex].id == selectedProfileID {
+                selectedFailure = error
+              }
             }
           }
-        } catch {
-          if selectedProfileID == profile.id {
-            selectedFailure = error
+          guard refreshedAnySource else { continue }
+          let oldPayload = profiles[profileIndex].payload
+          try rebuildCompatibilityPayload(at: profileIndex)
+          guard let payload = profiles[profileIndex].payload else { continue }
+          try await validateProfile(payload)
+          profiles[profileIndex].updatedAt = Date()
+          if profiles[profileIndex].id == selectedProfileID, oldPayload != payload {
+            selectedProfileChanged = true
           }
         }
-      }
-      do {
         try persistProfileLibrary()
+        if selectedProfileChanged, coreRunning, let payload = selectedProfile?.payload {
+          let request = makeStartRequest(profile: payload, profileID: selectedProfileID)
+          let response = try await Task.detached {
+            try HelperClient.send(request)
+          }.value
+          apply(response)
+          guard response.success else {
+            throw AppModelFailure.profileActivationFailed(response.message)
+          }
+        }
         updateNodes()
         if let selectedFailure {
-          subscriptionStatus = "Using cached profile; refresh failed"
+          subscriptionStatus = "Some sources could not be refreshed"
           lastError = selectedFailure.localizedDescription
         } else {
-          subscriptionStatus = "Profiles refreshed"
+          subscriptionStatus = "Sources refreshed"
+          lastError = nil
         }
         connectAutomaticallyIfNeeded()
       } catch {
+        profiles = previousProfiles
+        try? persistProfileLibrary()
+        loadSelectedProfileEditor()
+        updateNodes()
         lastError = error.localizedDescription
       }
     }
@@ -938,7 +1035,28 @@ final class AppModel {
 
   private func loadSelectedProfileEditor() {
     profileName = selectedProfile?.name ?? ""
-    subscriptionURL = selectedProfile?.subscriptionURL ?? ""
+    if selectedProfile?.sources.contains(where: { $0.id == selectedSourceID }) != true {
+      selectedSourceID = selectedProfile?.sources.first?.id
+    }
+    loadSelectedSourceEditor()
+  }
+
+  private func loadSelectedSourceEditor() {
+    guard let selectedSourceID,
+      let source = selectedProfile?.sources.first(where: { $0.id == selectedSourceID })
+    else {
+      sourceName = ""
+      subscriptionURL = ""
+      subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
+      subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
+      subscriptionHWID = UUID().uuidString
+      return
+    }
+    sourceName = source.name
+    subscriptionURL = source.value
+    subscriptionUserAgent = source.headers.userAgent
+    subscriptionDeviceOS = source.headers.deviceOS
+    subscriptionHWID = source.headers.hardwareID
   }
 
   private func persistProfileLibrary() throws {
@@ -965,20 +1083,21 @@ final class AppModel {
     )
   }
 
-  private func applyingCurrentRoutingPolicy(
-    to fetched: CoreProfile,
-    current: CoreProfile?
-  ) -> CoreProfile {
-    guard case .compatibility(let newProfile) = fetched,
-      case .compatibility(let currentProfile) = current,
-      let policy = currentProfile.routingPolicy
-    else { return fetched }
-    return .compatibility(
-      VPNProfile(
-        vless: newProfile.vless,
-        hysteria2: newProfile.hysteria2,
-        routingPolicy: policy
-      )
+  private func rebuildCompatibilityPayload(at profileIndex: Int) throws {
+    let policy: RoutingPolicy?
+    if case .compatibility(let current) = profiles[profileIndex].payload {
+      policy = current.routingPolicy
+    } else {
+      policy = nil
+    }
+    guard profiles[profileIndex].sources.contains(where: { $0.payload != nil }) else {
+      profiles[profileIndex].payload = nil
+      profiles[profileIndex].updatedAt = nil
+      return
+    }
+    profiles[profileIndex].payload = try ProfileAggregator.merge(
+      sources: profiles[profileIndex].sources,
+      routingPolicy: policy
     )
   }
 
@@ -1060,12 +1179,10 @@ final class AppModel {
   }
 
   private func symbol(for id: ProxyNodeID) -> String {
-    switch id {
-    case .auto: "wand.and.stars"
-    case .reality: "shield.lefthalf.filled"
-    case .hysteria2: "bolt.horizontal.fill"
-    default: "network"
-    }
+    if id == .auto { return "wand.and.stars" }
+    if id.rawValue.hasPrefix("vless-") { return "shield.lefthalf.filled" }
+    if id.rawValue.hasPrefix("hysteria2-") { return "bolt.horizontal.fill" }
+    return "network"
   }
 
   private func enableCurrentHelper() async throws -> HelperResponse {
@@ -1192,12 +1309,8 @@ final class AppModel {
   }
 
   private func profileSummary(_ profile: VPNProfile) -> String {
-    switch (profile.vless != nil, profile.hysteria2 != nil) {
-    case (true, true): "Reality + Hysteria2"
-    case (true, false): "Reality"
-    case (false, true): "Hysteria2"
-    case (false, false): "Profile"
-    }
+    let count = profile.vless.count + profile.hysteria2.count
+    return "\(count) server\(count == 1 ? "" : "s")"
   }
 }
 

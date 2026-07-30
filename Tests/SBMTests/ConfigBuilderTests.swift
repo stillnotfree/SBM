@@ -11,24 +11,28 @@ import Testing
   #expect(FileManager.default.isExecutableFile(atPath: core.path))
 
   let profile = VPNProfile(
-    vless: VLESSProfile(
-      server: "203.0.113.10",
-      port: 443,
-      uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
-      serverName: "www.debian.org",
-      fingerprint: "chrome",
-      publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-      shortID: "bb6b725b",
-      displayName: "Reality"
-    ),
-    hysteria2: Hysteria2Profile(
-      server: "vpn.example.com",
-      port: 443,
-      password: "test-password",
-      serverName: "vpn.example.com",
-      obfsPassword: "test-obfs-password",
-      displayName: "Hysteria2"
-    )
+    vless: [
+      VLESSProfile(
+        server: "203.0.113.10",
+        port: 443,
+        uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
+        serverName: "www.debian.org",
+        fingerprint: "chrome",
+        publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+        shortID: "bb6b725b",
+        displayName: "Reality"
+      )
+    ],
+    hysteria2: [
+      Hysteria2Profile(
+        server: "vpn.example.com",
+        port: 443,
+        password: "test-password",
+        serverName: "vpn.example.com",
+        obfsPassword: "test-obfs-password",
+        displayName: "Hysteria2"
+      )
+    ]
   )
   let temporary = FileManager.default.temporaryDirectory
     .appendingPathComponent("SBMTests-\(UUID().uuidString)", isDirectory: true)
@@ -52,7 +56,7 @@ import Testing
   let tunnel = try #require(inbounds.first { ($0["tag"] as? String) == "tun-in" })
   #expect(tunnel["mtu"] as? Int == 1400)
   let outbounds = try #require(root["outbounds"] as? [[String: Any]])
-  let reality = try #require(outbounds.first { ($0["tag"] as? String) == "reality" })
+  let reality = try #require(outbounds.first { ($0["tag"] as? String) == "vless-1" })
   #expect(reality["packet_encoding"] as? String == "xudp")
   let route = try #require(root["route"] as? [String: Any])
   let rules = try #require(route["rules"] as? [[String: Any]])
@@ -90,30 +94,34 @@ import Testing
   let profiles: [(VPNProfile, String)] = [
     (
       VPNProfile(
-        vless: VLESSProfile(
-          server: "203.0.113.10",
-          port: 443,
-          uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
-          serverName: "www.debian.org",
-          fingerprint: "chrome",
-          publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-          shortID: "bb6b725b",
-          displayName: "Reality"
-        )
+        vless: [
+          VLESSProfile(
+            server: "203.0.113.10",
+            port: 443,
+            uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
+            serverName: "www.debian.org",
+            fingerprint: "chrome",
+            publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+            shortID: "bb6b725b",
+            displayName: "Reality"
+          )
+        ]
       ),
-      ProxyNodeID.reality.rawValue
+      "vless-1"
     ),
     (
       VPNProfile(
-        hysteria2: Hysteria2Profile(
-          server: "vpn.example.com",
-          port: 443,
-          password: "test-password",
-          serverName: "vpn.example.com",
-          displayName: "Hysteria2"
-        )
+        hysteria2: [
+          Hysteria2Profile(
+            server: "vpn.example.com",
+            port: 443,
+            password: "test-password",
+            serverName: "vpn.example.com",
+            displayName: "Hysteria2"
+          )
+        ]
       ),
-      ProxyNodeID.hysteria2.rawValue
+      "hysteria2-1"
     ),
   ]
 
@@ -198,23 +206,27 @@ import Testing
       """.utf8)
   )
   let profile = VPNProfile(
-    vless: VLESSProfile(
-      server: "203.0.113.10",
-      port: 443,
-      uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
-      serverName: "www.debian.org",
-      fingerprint: "firefox",
-      publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-      shortID: "bb6b725b",
-      displayName: "Reality"
-    ),
-    hysteria2: Hysteria2Profile(
-      server: "vpn.example.com",
-      port: 443,
-      password: "test-password",
-      serverName: "vpn.example.com",
-      displayName: "Hysteria2"
-    ),
+    vless: [
+      VLESSProfile(
+        server: "203.0.113.10",
+        port: 443,
+        uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
+        serverName: "www.debian.org",
+        fingerprint: "firefox",
+        publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+        shortID: "bb6b725b",
+        displayName: "Reality"
+      )
+    ],
+    hysteria2: [
+      Hysteria2Profile(
+        server: "vpn.example.com",
+        port: 443,
+        password: "test-password",
+        serverName: "vpn.example.com",
+        displayName: "Hysteria2"
+      )
+    ],
     routingPolicy: routing
   )
   let temporary = FileManager.default.temporaryDirectory
@@ -232,7 +244,7 @@ import Testing
   )
   let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
   let outbounds = try #require(root["outbounds"] as? [[String: Any]])
-  let hysteria2 = try #require(outbounds.first { ($0["tag"] as? String) == "hysteria2" })
+  let hysteria2 = try #require(outbounds.first { ($0["tag"] as? String) == "hysteria2-1" })
   #expect(hysteria2["obfs"] == nil)
 
   let route = try #require(root["route"] as? [String: Any])
@@ -293,23 +305,27 @@ import Testing
       """.utf8)
   )
   let profile = VPNProfile(
-    vless: VLESSProfile(
-      server: "203.0.113.10",
-      port: 443,
-      uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
-      serverName: "www.debian.org",
-      fingerprint: "firefox",
-      publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-      shortID: "bb6b725b",
-      displayName: "Reality"
-    ),
-    hysteria2: Hysteria2Profile(
-      server: "vpn.example.com",
-      port: 443,
-      password: "test-password",
-      serverName: "vpn.example.com",
-      displayName: "Hysteria2"
-    ),
+    vless: [
+      VLESSProfile(
+        server: "203.0.113.10",
+        port: 443,
+        uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
+        serverName: "www.debian.org",
+        fingerprint: "firefox",
+        publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+        shortID: "bb6b725b",
+        displayName: "Reality"
+      )
+    ],
+    hysteria2: [
+      Hysteria2Profile(
+        server: "vpn.example.com",
+        port: 443,
+        password: "test-password",
+        serverName: "vpn.example.com",
+        displayName: "Hysteria2"
+      )
+    ],
     routingPolicy: policy
   )
   #expect(throws: (any Error).self) {

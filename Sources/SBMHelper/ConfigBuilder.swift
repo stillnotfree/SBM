@@ -40,9 +40,9 @@ struct ConfigBuilder {
   ) throws -> BuiltConfiguration {
     try ProfileValidator.validate(profile)
 
-    var proxyTags: [String] = []
-    if profile.vless != nil { proxyTags.append(ProxyNodeID.reality.rawValue) }
-    if profile.hysteria2 != nil { proxyTags.append(ProxyNodeID.hysteria2.rawValue) }
+    let vlessTags = profile.vless.indices.map { "vless-\($0 + 1)" }
+    let hysteria2Tags = profile.hysteria2.indices.map { "hysteria2-\($0 + 1)" }
+    let proxyTags = vlessTags + hysteria2Tags
     let allowedNodes = [ProxyNodeID.auto] + proxyTags.map(ProxyNodeID.init(rawValue:))
     let selectedTag = allowedNodes.contains(selectedNode) ? selectedNode.rawValue : "auto"
 
@@ -68,10 +68,10 @@ struct ConfigBuilder {
     }
 
     var proxyOutbounds: [[String: Any]] = []
-    if let vless = profile.vless {
+    for (index, vless) in profile.vless.enumerated() {
       proxyOutbounds.append([
         "type": "vless",
-        "tag": "reality",
+        "tag": vlessTags[index],
         "server": vless.server,
         "server_port": Int(vless.port),
         "uuid": vless.uuid,
@@ -93,10 +93,10 @@ struct ConfigBuilder {
         ],
       ])
     }
-    if let hysteria2 = profile.hysteria2 {
+    for (index, hysteria2) in profile.hysteria2.enumerated() {
       var outbound: [String: Any] = [
         "type": "hysteria2",
-        "tag": "hysteria2",
+        "tag": hysteria2Tags[index],
         "server": hysteria2.server,
         "server_port": Int(hysteria2.port),
         "password": hysteria2.password,
@@ -239,11 +239,21 @@ struct ConfigBuilder {
 
   private func profileNodes(_ profile: VPNProfile) -> [ProxyNodeDescriptor] {
     var nodes = [ProxyNodeDescriptor(id: .auto, name: "Auto")]
-    if let vless = profile.vless {
-      nodes.append(ProxyNodeDescriptor(id: .reality, name: vless.displayName))
+    for (index, vless) in profile.vless.enumerated() {
+      nodes.append(
+        ProxyNodeDescriptor(
+          id: ProxyNodeID(rawValue: "vless-\(index + 1)"),
+          name: vless.displayName
+        )
+      )
     }
-    if let hysteria2 = profile.hysteria2 {
-      nodes.append(ProxyNodeDescriptor(id: .hysteria2, name: hysteria2.displayName))
+    for (index, hysteria2) in profile.hysteria2.enumerated() {
+      nodes.append(
+        ProxyNodeDescriptor(
+          id: ProxyNodeID(rawValue: "hysteria2-\(index + 1)"),
+          name: hysteria2.displayName
+        )
+      )
     }
     return nodes
   }
@@ -258,10 +268,14 @@ struct BuiltConfiguration {
 
 enum ProfileValidator {
   static func validate(_ profile: VPNProfile) throws {
-    guard profile.vless != nil || profile.hysteria2 != nil else {
+    guard !profile.vless.isEmpty || !profile.hysteria2.isEmpty else {
       throw CoreFailure.invalidProfile("The profile has no supported proxy connection.")
     }
-    if let vless = profile.vless {
+    guard profile.vless.count + profile.hysteria2.count <= SubscriptionClientMaximum.connections
+    else {
+      throw CoreFailure.invalidProfile("The profile has more than 63 proxy connections.")
+    }
+    for vless in profile.vless {
       guard vless.port > 0 else { throw CoreFailure.invalidProfile("Server port is invalid.") }
       try validateHost(vless.server, field: "VLESS server")
       try validateHost(vless.serverName, field: "REALITY server name")
@@ -272,7 +286,7 @@ enum ProfileValidator {
       try validateBase64URL(vless.publicKey, field: "REALITY public key")
       try validateHex(vless.shortID, field: "REALITY short ID")
     }
-    if let hysteria2 = profile.hysteria2 {
+    for hysteria2 in profile.hysteria2 {
       guard hysteria2.port > 0 else {
         throw CoreFailure.invalidProfile("Server port is invalid.")
       }
@@ -322,6 +336,10 @@ enum ProfileValidator {
       throw CoreFailure.invalidProfile("\(field) is invalid.")
     }
   }
+}
+
+private enum SubscriptionClientMaximum {
+  static let connections = 63
 }
 
 private struct RoutingPolicyComposer {
