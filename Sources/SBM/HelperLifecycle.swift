@@ -150,6 +150,7 @@ enum HelperLifecycle {
   static func replace(
     service: any HelperServiceManaging,
     registrationTimeout: Duration = .seconds(25),
+    startupTimeout: Duration = .seconds(15),
     pollInterval: Duration = .milliseconds(500),
     waiting: @escaping () -> Void = {},
     probe: @escaping @Sendable () async throws -> HelperResponse
@@ -176,18 +177,24 @@ enum HelperLifecycle {
       case .requiresApproval:
         throw HelperLifecycleFailure.approvalRequired
       case .enabled:
-        return try await enable(
-          service: service,
-          timeout: .seconds(15),
-          pollInterval: .milliseconds(250),
-          probe: probe
-        )
+        do {
+          return try await enable(
+            service: service,
+            timeout: startupTimeout,
+            pollInterval: .milliseconds(250),
+            probe: probe
+          )
+        } catch {
+          guard isTransientReplacementError(error) else { throw error }
+          mostRecentError = error
+          waiting()
+        }
       case .notRegistered, .notFound:
         do {
           try service.register()
           return try await enable(
             service: service,
-            timeout: .seconds(15),
+            timeout: startupTimeout,
             pollInterval: .milliseconds(250),
             probe: probe
           )
@@ -213,6 +220,11 @@ enum HelperLifecycle {
     // unregister completion while Background Task Management still retains the
     // old item. Retrying only this error avoids hiding signature or approval
     // failures.
+    if let failure = error as? HelperLifecycleFailure,
+      case .startupTimedOut = failure
+    {
+      return true
+    }
     let nsError = error as NSError
     return nsError.code == Int(POSIXErrorCode.EPERM.rawValue)
   }

@@ -122,6 +122,45 @@ import Testing
   #expect(compatibility.hysteria2.map(\.displayName) == ["Hysteria2 1", "Hysteria2 2"])
 }
 
+@Test func mixedSubscriptionSkipsUnsupportedXHTTPConnections() throws {
+  let links = """
+    vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b&type=tcp#Reality
+    vless://5efab93b-90d0-4904-93d6-44b4f0b00002@203.0.113.11:443?security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&type=xhttp&mode=stream-one&path=%2Ftest#XHTTP
+    hysteria2://password@vpn.example.com:443/?sni=vpn.example.com#Hysteria2
+    """
+  let result = try SubscriptionClient.parsePayloadResult(
+    Data(links.utf8).base64EncodedString()
+  )
+  guard case .compatibility(let profile) = result.profile else {
+    Issue.record("Expected a compatibility subscription")
+    return
+  }
+  #expect(profile.vless.count == 1)
+  #expect(profile.hysteria2.count == 1)
+  #expect(result.skippedTransports == ["xhttp": 1])
+  #expect(result.warningDescription?.contains("2 connections imported") == true)
+  #expect(result.warningDescription?.contains("1 XHTTP connection skipped") == true)
+}
+
+@Test func realityShortIDMayBeEmpty() throws {
+  let link =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&type=tcp#Reality"
+  let profile = try SubscriptionClient.parsePayload(link)
+  guard case .compatibility(let compatibility) = profile else {
+    Issue.record("Expected a compatibility subscription")
+    return
+  }
+  #expect(compatibility.vless.first?.shortID == "")
+}
+
+@Test func directUnsupportedXHTTPLinkReportsTransport() {
+  let link =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&type=xhttp&mode=stream-one&path=%2Ftest#XHTTP"
+  #expect(throws: SubscriptionFailure.unsupportedVLESSTransport("xhttp")) {
+    try SubscriptionClient.parsePayload(link)
+  }
+}
+
 @Test func subscriptionRequestUsesConfiguredHeaders() throws {
   let request = try SubscriptionClient.makeRequest(
     for: URL(string: "https://example.com/subscription")!,

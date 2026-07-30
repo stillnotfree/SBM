@@ -19,7 +19,7 @@ import Testing
         serverName: "www.debian.org",
         fingerprint: "chrome",
         publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-        shortID: "bb6b725b",
+        shortID: "",
         displayName: "Reality"
       )
     ],
@@ -55,6 +55,9 @@ import Testing
   #expect(localSOCKS["listen_port"] as? Int == 1082)
   let tunnel = try #require(inbounds.first { ($0["tag"] as? String) == "tun-in" })
   #expect(tunnel["mtu"] as? Int == 1400)
+  let tunnelAddresses = try #require(tunnel["address"] as? [String])
+  #expect(tunnelAddresses.contains("172.19.0.1/30"))
+  #expect(tunnelAddresses.contains("fdfe:dcba:9876::1/126"))
   let outbounds = try #require(root["outbounds"] as? [[String: Any]])
   let reality = try #require(outbounds.first { ($0["tag"] as? String) == "vless-1" })
   #expect(reality["packet_encoding"] as? String == "xudp")
@@ -181,6 +184,12 @@ import Testing
               "rule_set": ["ru-domains", "ru-ip"],
               "action": "route",
               "outbound": "direct"
+            },
+            {
+              "domain_suffix": ["inverted.example"],
+              "invert": true,
+              "action": "route",
+              "outbound": "direct"
             }
           ],
           "rule_set": [
@@ -266,6 +275,11 @@ import Testing
     !dnsRules.contains {
       ($0["server"] as? String) == "dns-local"
         && $0["rule_set"] != nil
+    })
+  #expect(
+    !dnsRules.contains {
+      ($0["server"] as? String) == "dns-local"
+        && ($0["domain_suffix"] as? [String]) == ["inverted.example"]
     })
   let lastDNSRule = try #require(dnsRules.last)
   #expect(
@@ -498,6 +512,202 @@ import Testing
     outbounds.first { ($0["tag"] as? String) == "websocket-proxy" })
   let transport = try #require(outbound["transport"] as? [String: Any])
   #expect(transport["path"] as? String == "/gateway")
+}
+
+@Test func nativeProfilePreservesHTTPSDNSPath() throws {
+  let source = Data(
+    """
+    {
+      "dns": {
+        "servers": [
+          {
+            "type": "https",
+            "tag": "private-doh",
+            "server": "1.1.1.1",
+            "path": "/dns-query",
+            "tls": {
+              "enabled": true,
+              "server_name": "cloudflare-dns.com"
+            }
+          }
+        ]
+      },
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  let built = try ConfigBuilder(
+    cachePath: "/safe/cache",
+    apiSecret: "secret"
+  ).makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
+  let dns = try #require(root["dns"] as? [String: Any])
+  let servers = try #require(dns["servers"] as? [[String: Any]])
+  let privateDOH = try #require(
+    servers.first { ($0["tag"] as? String) == "private-doh" })
+  #expect(privateDOH["path"] as? String == "/dns-query")
+}
+
+@Test func nativeProfileUsesIndependentManagedDirectOutbound() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080
+        },
+        {
+          "type": "direct",
+          "tag": "user-direct",
+          "detour": "proxy"
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  let built = try ConfigBuilder(
+    cachePath: "/safe/cache",
+    apiSecret: "secret"
+  ).makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
+  let outbounds = try #require(root["outbounds"] as? [[String: Any]])
+  let managedDirect = try #require(
+    outbounds.first { ($0["tag"] as? String) == "sbm-direct" })
+  #expect(managedDirect["type"] as? String == "direct")
+  #expect(managedDirect["detour"] == nil)
+  let userDirect = try #require(
+    outbounds.first { ($0["tag"] as? String) == "user-direct" })
+  #expect(userDirect["detour"] as? String == "proxy")
+
+  let route = try #require(root["route"] as? [String: Any])
+  let rules = try #require(route["rules"] as? [[String: Any]])
+  #expect(
+    rules.contains {
+      ($0["ip_is_private"] as? Bool) == true
+        && ($0["outbound"] as? String) == "sbm-direct"
+    })
+}
+
+@Test func nativeProfileRejectsReservedDirectEndpointTag() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080
+        }
+      ],
+      "endpoints": [
+        {
+          "type": "wireguard",
+          "tag": "sbm-direct",
+          "system": false,
+          "address": ["10.7.0.2/32"],
+          "private_key": "0FIAKxthxpx09BQ1j7xDTzbppW7bjlF6tHW6VjQkDE0=",
+          "peers": []
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsNonHTTPSRemoteRuleSet() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080
+        }
+      ],
+      "route": {
+        "rule_set": [
+          {
+            "type": "remote",
+            "tag": "unsafe",
+            "format": "binary",
+            "url": "http://example.com/rules.srs"
+          }
+        ]
+      }
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsDuplicateNodeMetadata() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080
+        }
+      ]
+    }
+    """.utf8)
+  let native = NativeProfile(
+    configuration: source,
+    selectorTag: "sbm-selector",
+    nodes: [
+      ProxyNodeDescriptor(id: ProxyNodeID(rawValue: "proxy"), name: "First"),
+      ProxyNodeDescriptor(id: ProxyNodeID(rawValue: "proxy"), name: "Second"),
+    ]
+  )
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsExecutableArguments() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "unsafe",
+          "server": "203.0.113.20",
+          "server_port": 1080,
+          "extra_args": ["--write-anywhere"]
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
 }
 
 @Test func nativeProfileRejectsTailscaleEndpointState() throws {

@@ -50,7 +50,7 @@ struct ConfigBuilder {
       [
         "type": "tun",
         "tag": "tun-in",
-        "address": ["172.19.0.1/30"],
+        "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
         "mtu": 1400,
         "auto_route": true,
         "strict_route": true,
@@ -322,7 +322,7 @@ enum ProfileValidator {
 
   private static func validateHex(_ value: String, field: String) throws {
     let allowed = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
-    guard !value.isEmpty, value.utf8.count <= 16, value.utf8.count.isMultiple(of: 2),
+    guard value.utf8.count <= 16, value.utf8.count.isMultiple(of: 2),
       value.unicodeScalars.allSatisfy(allowed.contains)
     else {
       throw CoreFailure.invalidProfile("\(field) is invalid.")
@@ -401,11 +401,12 @@ private struct RoutingPolicyComposer {
     let importedRoute = try parsedRoute(from: policy)
     let rules = importedRoute["rules"] as? [[String: Any]] ?? []
     let dnsMatchKeys = Set([
-      "domain", "domain_suffix", "domain_keyword", "domain_regex", "invert",
+      "domain", "domain_suffix", "domain_keyword", "domain_regex",
     ])
     return rules.compactMap { rule in
       guard (rule["action"] as? String) == "route",
-        (rule["outbound"] as? String) == "direct"
+        (rule["outbound"] as? String) == "direct",
+        (rule["invert"] as? Bool) != true
       else { return nil }
       var dnsRule = rule.filter { dnsMatchKeys.contains($0.key) }
       guard !dnsRule.isEmpty else { return nil }

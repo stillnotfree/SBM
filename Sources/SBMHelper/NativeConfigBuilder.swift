@@ -132,8 +132,15 @@ struct NativeConfigurationComposer {
       outbounds[index]["interrupt_exist_connections"] = false
     }
 
-    let directTag = try ensureDirectOutbound(in: &outbounds)
+    let directTag = try ensureDirectOutbound(in: &outbounds, endpoints: endpoints)
     var route = source["route"] as? [String: Any] ?? [:]
+    let availableRouteTags = Set(
+      (outbounds + endpoints).compactMap { $0["tag"] as? String }
+    )
+    try validateNativeRuleSets(
+      route["rule_set"],
+      availableTags: availableRouteTags
+    )
     let rulesValue = route["rules"]
     guard rulesValue == nil || rulesValue is [[String: Any]] else {
       throw CoreFailure.invalidProfile("The native profile route.rules field must be an array.")
@@ -163,7 +170,7 @@ struct NativeConfigurationComposer {
       [
         "type": "tun",
         "tag": "sbm-tun-in",
-        "address": ["172.19.0.1/30"],
+        "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
         "mtu": 1400,
         "auto_route": true,
         "strict_route": true,
@@ -206,7 +213,14 @@ struct NativeConfigurationComposer {
     if !endpoints.isEmpty {
       root["endpoints"] = endpoints
     }
-    let names = Dictionary(uniqueKeysWithValues: profile.nodes.map { ($0.id.rawValue, $0.name) })
+    var names: [String: String] = [:]
+    for node in profile.nodes {
+      guard names.updateValue(node.name, forKey: node.id.rawValue) == nil else {
+        throw CoreFailure.invalidProfile(
+          "The native profile contains duplicate node metadata for \(node.id.rawValue)."
+        )
+      }
+    }
     let nodes = selectableTags.map { tag in
       ProxyNodeDescriptor(id: ProxyNodeID(rawValue: tag), name: names[tag] ?? tag)
     }
@@ -278,11 +292,16 @@ struct NativeConfigurationComposer {
           || normalized == "state_directory"
           || normalized == "data_directory"
           || normalized.hasSuffix("_directory")
-        let plainPathIsUnsafe = normalized == "path" && !plainPathAllowed
+        let dnsHTTPPathAllowed =
+          normalized == "path"
+          && isSafeDNSHTTPPath(child, in: object, at: path)
+        let plainPathIsUnsafe =
+          normalized == "path" && !plainPathAllowed && !dnsHTTPPathAllowed
         if filesystemField || plainPathIsUnsafe
           || [
             "command", "commands", "script", "listen", "listen_port",
             "certificate_provider", "certificate_providers", "acme",
+            "extra_args", "torrc", "executable", "binary",
           ].contains(normalized)
         {
           throw CoreFailure.invalidProfile(
@@ -349,17 +368,81 @@ struct NativeConfigurationComposer {
     return tags
   }
 
-  private func ensureDirectOutbound(in outbounds: inout [[String: Any]]) throws -> String {
-    if let direct = outbounds.first(where: { ($0["type"] as? String) == "direct" }),
-      let tag = direct["tag"] as? String
-    {
-      return tag
-    }
-    guard !outbounds.contains(where: { ($0["tag"] as? String) == "sbm-direct" }) else {
+  private func ensureDirectOutbound(
+    in outbounds: inout [[String: Any]],
+    endpoints: [[String: Any]]
+  ) throws -> String {
+    guard
+      !(outbounds + endpoints).contains(where: {
+        ($0["tag"] as? String) == "sbm-direct"
+      })
+    else {
       throw CoreFailure.invalidProfile("The profile uses the reserved tag sbm-direct.")
     }
     outbounds.append(["type": "direct", "tag": "sbm-direct"])
     return "sbm-direct"
+  }
+
+  private func validateNativeRuleSets(
+    _ value: Any?,
+    availableTags: Set<String>
+  ) throws {
+    guard let value else { return }
+    guard let items = value as? [[String: Any]], items.count <= 256 else {
+      throw CoreFailure.invalidProfile(
+        "The native profile route.rule_set field must be a bounded array."
+      )
+    }
+    let allowedKeys = Set([
+      "type", "tag", "format", "url", "download_detour", "update_interval",
+    ])
+    var tags = Set<String>()
+    for (index, item) in items.enumerated() {
+      guard Set(item.keys).isSubset(of: allowedKeys),
+        (item["type"] as? String) == "remote",
+        let tag = item["tag"] as? String,
+        !tag.isEmpty,
+        tag.utf8.count <= 128,
+        tags.insert(tag).inserted,
+        let format = item["format"] as? String,
+        ["binary", "source"].contains(format),
+        let urlValue = item["url"] as? String,
+        urlValue.utf8.count <= 4096,
+        let url = URL(string: urlValue),
+        url.scheme?.lowercased() == "https",
+        url.host != nil
+      else {
+        throw CoreFailure.invalidProfile(
+          "Native rule set \(index + 1) must be a unique remote HTTPS rule set."
+        )
+      }
+      if let detour = item["download_detour"] as? String,
+        !availableTags.contains(detour)
+      {
+        throw CoreFailure.invalidProfile(
+          "Native rule set \(index + 1) uses an unknown download detour."
+        )
+      }
+    }
+  }
+
+  private func isSafeDNSHTTPPath(
+    _ value: Any,
+    in object: [String: Any],
+    at path: String
+  ) -> Bool {
+    guard path.hasPrefix("profile.dns."),
+      let type = object["type"] as? String,
+      ["https", "h3"].contains(type),
+      let value = value as? String,
+      value.utf8.count <= 2_048,
+      value.hasPrefix("/"),
+      !value.contains("\\"),
+      !value.unicodeScalars.contains(where: {
+        CharacterSet.controlCharacters.contains($0)
+      })
+    else { return false }
+    return true
   }
 
   private func appendManagedAuto(

@@ -35,6 +35,29 @@ private struct SubscriptionOrigin: Equatable, Sendable {
   }
 }
 
+struct SubscriptionFetchResult: Sendable {
+  let profile: CoreProfile
+  let skippedTransports: [String: Int]
+
+  var warningDescription: String? {
+    guard !skippedTransports.isEmpty else { return nil }
+    let importedCount: Int
+    switch profile {
+    case .compatibility(let profile):
+      importedCount = profile.vless.count + profile.hysteria2.count
+    case .native:
+      importedCount = 1
+    }
+    let details = skippedTransports.keys.sorted().map { transport in
+      let count = skippedTransports[transport, default: 0]
+      return "\(count) \(transport.uppercased())"
+    }.joined(separator: ", ")
+    let skippedCount = skippedTransports.values.reduce(0, +)
+    return
+      "\(importedCount) connection\(importedCount == 1 ? "" : "s") imported; \(details) connection\(skippedCount == 1 ? "" : "s") skipped because sing-box does not support the transport"
+  }
+}
+
 enum SubscriptionClient {
   static let maximumProfileSize = 1_048_576
   static let maximumConnections = 63
@@ -42,14 +65,14 @@ enum SubscriptionClient {
   static func fetch(
     from value: String,
     headers: SubscriptionHeaders = SubscriptionHeaders()
-  ) async throws -> CoreProfile {
+  ) async throws -> SubscriptionFetchResult {
     try validate(headers: headers)
     let source = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if isDirectSource(source) {
       guard source.utf8.count <= maximumProfileSize else {
         throw SubscriptionFailure.tooLarge
       }
-      return try parsePayload(source)
+      return try parsePayloadResult(source)
     }
     guard source.utf8.count <= 4096,
       let url = URL(string: source),
@@ -87,7 +110,7 @@ enum SubscriptionClient {
     guard data.count <= maximumProfileSize else { throw SubscriptionFailure.tooLarge }
 
     let body = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-    return try parsePayload(body)
+    return try parsePayloadResult(body)
   }
 
   static func validate(headers: SubscriptionHeaders) throws {
@@ -153,15 +176,25 @@ enum SubscriptionClient {
   }
 
   static func parsePayload(_ body: String) throws -> CoreProfile {
+    try parsePayloadResult(body).profile
+  }
+
+  static func parsePayloadResult(_ body: String) throws -> SubscriptionFetchResult {
     let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.first == "{" {
-      return .native(try NativeProfileParser.parse(Data(trimmed.utf8)))
+      return SubscriptionFetchResult(
+        profile: .native(try NativeProfileParser.parse(Data(trimmed.utf8))),
+        skippedTransports: [:]
+      )
     }
 
     let decoded = decodeSubscription(body)
     let decodedTrimmed = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
     if decodedTrimmed.first == "{" {
-      return .native(try NativeProfileParser.parse(Data(decodedTrimmed.utf8)))
+      return SubscriptionFetchResult(
+        profile: .native(try NativeProfileParser.parse(Data(decodedTrimmed.utf8))),
+        skippedTransports: [:]
+      )
     }
     let links =
       decoded
@@ -180,11 +213,32 @@ enum SubscriptionClient {
       throw SubscriptionFailure.tooManyConnections
     }
 
-    return .compatibility(
-      VPNProfile(
-        vless: try vlessLinks.map(parseVLESS),
-        hysteria2: try hysteriaLinks.map(parseHysteria2)
-      )
+    var vlessProfiles: [VLESSProfile] = []
+    var skippedTransports: [String: Int] = [:]
+    for link in vlessLinks {
+      let transport = try vlessTransport(link)
+      guard transport == "tcp" else {
+        skippedTransports[transport, default: 0] += 1
+        continue
+      }
+      vlessProfiles.append(try parseVLESS(link))
+    }
+    let hysteriaProfiles = try hysteriaLinks.map(parseHysteria2)
+    guard !vlessProfiles.isEmpty || !hysteriaProfiles.isEmpty else {
+      if let transport = skippedTransports.keys.sorted().first {
+        throw SubscriptionFailure.unsupportedVLESSTransport(transport)
+      }
+      throw SubscriptionFailure.missingProtocols
+    }
+
+    return SubscriptionFetchResult(
+      profile: .compatibility(
+        VPNProfile(
+          vless: vlessProfiles,
+          hysteria2: hysteriaProfiles
+        )
+      ),
+      skippedTransports: skippedTransports
     )
   }
 
@@ -211,9 +265,9 @@ enum SubscriptionClient {
     guard query["security"]?.lowercased() == "reality",
       query["flow"]?.lowercased() == "xtls-rprx-vision",
       let serverName = query["sni"], !serverName.isEmpty,
-      let publicKey = query["pbk"], !publicKey.isEmpty,
-      let shortID = query["sid"], !shortID.isEmpty
+      let publicKey = query["pbk"], !publicKey.isEmpty
     else { throw SubscriptionFailure.invalidVLESS }
+    let shortID = query["sid"] ?? ""
 
     guard let port = UInt16(exactly: components.port ?? 443), port > 0 else {
       throw SubscriptionFailure.invalidVLESS
@@ -228,6 +282,23 @@ enum SubscriptionClient {
       shortID: shortID,
       displayName: try displayName(components.fragment, fallback: "Reality")
     )
+  }
+
+  private static func vlessTransport(_ link: String) throws -> String {
+    guard let components = URLComponents(string: link),
+      components.scheme?.lowercased() == "vless"
+    else { throw SubscriptionFailure.invalidVLESS }
+    let transport =
+      queryMap(components.queryItems)["type"]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased() ?? "tcp"
+    guard !transport.isEmpty,
+      transport.utf8.count <= 32,
+      transport.unicodeScalars.allSatisfy({
+        CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0)
+      })
+    else { throw SubscriptionFailure.invalidVLESS }
+    return transport
   }
 
   private static func parseHysteria2(_ link: String) throws -> Hysteria2Profile {
@@ -406,6 +477,7 @@ enum SubscriptionFailure: Equatable, LocalizedError {
   case tooLarge
   case missingProtocols
   case invalidVLESS
+  case unsupportedVLESSTransport(String)
   case invalidHysteria2
   case invalidRoutingPolicy
   case invalidNativeProfile
@@ -426,6 +498,8 @@ enum SubscriptionFailure: Equatable, LocalizedError {
     case .missingProtocols:
       "Enter an HTTPS subscription, VLESS + REALITY link, or Hysteria2 link."
     case .invalidVLESS: "The VLESS + REALITY link is invalid or unsupported."
+    case .unsupportedVLESSTransport(let transport):
+      "VLESS transport \(transport.uppercased()) is not supported by sing-box."
     case .invalidHysteria2: "The Hysteria2 link is invalid or uses unsupported obfuscation."
     case .invalidRoutingPolicy:
       "The routing JSON may contain only route.rules and remote route.rule_set entries."

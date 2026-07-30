@@ -98,9 +98,17 @@ pass the bundled `sing-box check` before it can be activated. A failed runtime
 activation rolls back to the previous working configuration.
 
 In Rule mode, imported DNS servers and routing rules remain authoritative. The
-Direct and Global modes temporarily prepend app-owned DNS and route overrides;
+imported `route.final` is replaced by the menu-controlled selector, so unmatched
+traffic follows the server selected in SBM. The TUN interface routes both IPv4
+and IPv6 traffic. The Direct and Global modes temporarily prepend app-owned DNS
+and route overrides;
 switching back to Rule restores the profile's policy without rewriting the
 source profile.
+
+The root helper accepts commands only from local administrator accounts. It
+validates and constrains imported profiles before starting the bundled root-owned
+sing-box core; installing SBM therefore extends the trusted local boundary to
+all macOS administrator accounts.
 
 Optional menu metadata can be added to a native profile:
 
@@ -179,7 +187,7 @@ update.
 
 ## Current status
 
-Version 1.1.0 is not an independently audited security product.
+Version 1.1.2 is not an independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
 REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are
 covered by the test suite, including custom request headers, redirects,

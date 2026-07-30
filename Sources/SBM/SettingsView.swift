@@ -144,7 +144,11 @@ struct SettingsView: View {
               ProgressView().controlSize(.small)
             }
             Text(model.subscriptionStatus)
-              .foregroundStyle(model.profileAvailable ? .green : .secondary)
+              .foregroundStyle(
+                model.subscriptionStatusLevel == .warning
+                  ? Color.orange
+                  : model.subscriptionStatusLevel == .success ? Color.green : Color.secondary
+              )
           }
         } else {
           Text("Full JSON profiles cannot be combined with subscription sources.")

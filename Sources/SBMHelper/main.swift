@@ -48,7 +48,7 @@ private final class HelperServer {
   }
 
   private func configureTimeouts(_ descriptor: Int32) throws {
-    var timeout = timeval(tv_sec: 5, tv_usec: 0)
+    var timeout = timeval(tv_sec: 1, tv_usec: 0)
     let receiveResult = withUnsafePointer(to: &timeout) { pointer in
       setsockopt(
         descriptor,
@@ -109,6 +109,8 @@ private final class HelperServer {
       case .shutdown:
         response = try manager.stop()
       }
+    } catch HelperFailure.unauthorizedPeer {
+      return
     } catch {
       let current = manager.status()
       response = HelperResponse(
@@ -168,9 +170,15 @@ private final class HelperServer {
     var request = Data()
     var buffer = [UInt8](repeating: 0, count: 4096)
     let maximumRequestSize = 2 * 1_048_576
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(5))
     while request.count < maximumRequestSize {
+      guard clock.now < deadline else { throw HelperFailure.requestTimedOut }
       let count = Darwin.read(descriptor, &buffer, buffer.count)
       if count < 0 {
+        if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK {
+          continue
+        }
         throw HelperFailure.systemCall("read", errno)
       }
       if count == 0 { break }
@@ -190,6 +198,7 @@ private enum HelperFailure: LocalizedError {
   case protocolMismatch
   case emptyRequest
   case requestTooLarge
+  case requestTimedOut
   case unauthorizedPeer
   case missingParameter(String)
   case systemCall(String, Int32)
@@ -201,6 +210,7 @@ private enum HelperFailure: LocalizedError {
     case .protocolMismatch: "Unsupported helper protocol version."
     case .emptyRequest: "The helper received an empty request."
     case .requestTooLarge: "The helper request is too large."
+    case .requestTimedOut: "The helper request did not complete within five seconds."
     case .unauthorizedPeer: "The helper accepts requests only from local administrators."
     case .missingParameter(let name): "The helper request is missing \(name)."
     case .systemCall(let name, let code): "\(name) failed with errno \(code)."

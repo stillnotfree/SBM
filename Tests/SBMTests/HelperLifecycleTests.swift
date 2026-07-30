@@ -163,6 +163,31 @@ private actor ProbeAttemptCounter {
   #expect(response.success)
 }
 
+@Test @MainActor func helperLifecycleRetriesStartupTimeoutDuringReplacement() async throws {
+  let service = FakeHelperService(registrationState: .enabled)
+  let attemptCounter = ProbeAttemptCounter()
+  var waitingCount = 0
+
+  let response = try await HelperLifecycle.replace(
+    service: service,
+    registrationTimeout: .milliseconds(800),
+    startupTimeout: .milliseconds(5),
+    pollInterval: .milliseconds(5),
+    waiting: { waitingCount += 1 },
+    probe: {
+      let attempt = await attemptCounter.next()
+      if attempt == 1 {
+        throw CocoaError(.fileReadNoSuchFile)
+      }
+      return HelperResponse(success: true, coreRunning: false, message: "ready")
+    }
+  )
+
+  #expect(service.unregistrationCount == 1)
+  #expect(waitingCount == 1)
+  #expect(response.success)
+}
+
 @Test @MainActor func helperLifecycleDoesNotRetryPermanentReplacementFailure() async {
   let service = FakeHelperService(registrationState: .enabled)
   service.permanentRegistrationError = CocoaError(.fileReadCorruptFile)

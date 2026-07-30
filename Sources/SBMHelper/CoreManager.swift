@@ -137,12 +137,11 @@ final class CoreManager: @unchecked Sendable {
 
       try prepareFilesystem()
       let previousConfiguration = try? Data(contentsOf: configURL)
-      let built = try writeValidatedConfiguration(profile: activeProfile)
-      configurationReplaced = true
-      let configurationChanged = previousConfiguration != built.data
-      state.selectorTag = built.selectorTag
-      state.nodes = built.nodes
-      state.selectedNode = built.selectedNode
+      let preview = try validatedConfiguration(
+        profile: activeProfile,
+        apiSecret: state.apiSecret
+      )
+      let configurationChanged = previousConfiguration != preview.data
 
       if isCoreRunning, !profileChanged, !configurationChanged {
         state.desiredRunning = true
@@ -153,6 +152,16 @@ final class CoreManager: @unchecked Sendable {
         terminateCore()
       }
 
+      try ensureAPIPortAvailable()
+      state.apiSecret = Self.makeAPISecret()
+      let built = try writeValidatedConfiguration(
+        profile: activeProfile,
+        apiSecret: state.apiSecret
+      )
+      configurationReplaced = true
+      state.selectorTag = built.selectorTag
+      state.nodes = built.nodes
+      state.selectedNode = built.selectedNode
       try launchCore()
       try waitForAPI()
       try applyMode(state.mode)
@@ -244,15 +253,20 @@ final class CoreManager: @unchecked Sendable {
     guard isCoreRunning else { throw CoreFailure.coreNotRunning }
     let descriptors = state.nodes
     let results = DelayResults()
-    DispatchQueue.concurrentPerform(iterations: descriptors.count) { index in
-      let descriptor = descriptors[index]
-      let node = descriptor.id
-      let encodedURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
-      let component = apiPathComponent(node.rawValue)
-      let path = "/proxies/\(component)/delay?timeout=5000&url=\(encodedURL)"
-      let data = try? apiRequest(method: "GET", path: path, body: nil)
-      let object = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-      results.set(object?["delay"] as? Int, for: node)
+    let workerCount = min(8, descriptors.count)
+    DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
+      for index in stride(from: worker, to: descriptors.count, by: workerCount) {
+        let descriptor = descriptors[index]
+        let node = descriptor.id
+        let encodedURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
+        let component = apiPathComponent(node.rawValue)
+        let path = "/proxies/\(component)/delay?timeout=5000&url=\(encodedURL)"
+        let data = try? apiRequest(method: "GET", path: path, body: nil)
+        let object = data.flatMap {
+          try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        }
+        results.set(object?["delay"] as? Int, for: node)
+      }
     }
     let delays = descriptors.map { descriptor in
       NodeDelay(node: descriptor.id, milliseconds: results.value(for: descriptor.id))
@@ -272,21 +286,10 @@ final class CoreManager: @unchecked Sendable {
 
   func validate(profile: CoreProfile) throws -> HelperResponse {
     try prepareFilesystem()
-    let built = try ConfigBuilder(
-      cachePath: cacheURL.path,
-      apiSecret: state.apiSecret
-    ).makeConfiguration(
+    let built = try validatedConfiguration(
       profile: profile,
-      mode: state.mode,
-      selectedNode: state.selectedNode,
-      localSOCKSPort: state.localSOCKSEnabled ? state.localSOCKSPort : nil
+      apiSecret: state.apiSecret
     )
-    let candidate = supportDirectory.appendingPathComponent(
-      "validation-\(UUID().uuidString).json")
-    try built.data.write(to: candidate, options: .atomic)
-    try secureFile(candidate)
-    defer { try? fileManager.removeItem(at: candidate) }
-    try runCore(arguments: ["check", "-c", candidate.path])
     return HelperResponse(
       success: true,
       coreRunning: isCoreRunning,
@@ -448,10 +451,13 @@ final class CoreManager: @unchecked Sendable {
       && (info.st_mode & 0o022) == 0
   }
 
-  private func writeValidatedConfiguration(profile: CoreProfile) throws -> BuiltConfiguration {
+  private func validatedConfiguration(
+    profile: CoreProfile,
+    apiSecret: String
+  ) throws -> BuiltConfiguration {
     let builder = ConfigBuilder(
       cachePath: cacheURL.path,
-      apiSecret: state.apiSecret
+      apiSecret: apiSecret
     )
     let built = try builder.makeConfiguration(
       profile: profile,
@@ -459,12 +465,25 @@ final class CoreManager: @unchecked Sendable {
       selectedNode: state.selectedNode,
       localSOCKSPort: state.localSOCKSEnabled ? state.localSOCKSPort : nil
     )
-    let candidate = supportDirectory.appendingPathComponent("config.json.candidate")
+    let candidate = supportDirectory.appendingPathComponent(
+      "validation-\(UUID().uuidString).json"
+    )
     try built.data.write(to: candidate, options: .atomic)
     try secureFile(candidate)
     defer { try? fileManager.removeItem(at: candidate) }
     try runCore(arguments: ["check", "-c", candidate.path])
+    return built
+  }
 
+  private func writeValidatedConfiguration(
+    profile: CoreProfile,
+    apiSecret: String
+  ) throws -> BuiltConfiguration {
+    let built = try validatedConfiguration(profile: profile, apiSecret: apiSecret)
+    let candidate = supportDirectory.appendingPathComponent("config.json.candidate")
+    try built.data.write(to: candidate, options: .atomic)
+    try secureFile(candidate)
+    defer { try? fileManager.removeItem(at: candidate) }
     let backup = supportDirectory.appendingPathComponent("config.json.backup")
     if fileManager.fileExists(atPath: configURL.path) {
       try? fileManager.removeItem(at: backup)
@@ -517,7 +536,33 @@ final class CoreManager: @unchecked Sendable {
       try saveState()
       return initial
     }
-    return try JSONDecoder().decode(PersistentState.self, from: Data(contentsOf: stateURL))
+    do {
+      return try JSONDecoder().decode(
+        PersistentState.self,
+        from: Data(contentsOf: stateURL)
+      )
+    } catch {
+      let timestamp = Int(Date().timeIntervalSince1970)
+      let quarantined = supportDirectory.appendingPathComponent(
+        "state.corrupt-\(timestamp).json"
+      )
+      try? fileManager.moveItem(at: stateURL, to: quarantined)
+      if fileManager.fileExists(atPath: quarantined.path) {
+        try? secureFile(quarantined)
+      }
+      FileHandle.standardError.write(
+        Data(
+          "Preserved unreadable state as \(quarantined.lastPathComponent): "
+            .appending(error.localizedDescription)
+            .appending("\n")
+            .utf8
+        )
+      )
+      let initial = PersistentState()
+      state = initial
+      try saveState()
+      return initial
+    }
   }
 
   private func saveState() throws {
@@ -635,8 +680,15 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func waitForAPI() throws {
-    for _ in 0..<30 {
-      if (try? apiRequest(method: "GET", path: "/version", body: nil)) != nil {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(5))
+    while clock.now < deadline {
+      if (try? apiRequest(
+        method: "GET",
+        path: "/version",
+        body: nil,
+        timeoutSeconds: 1
+      )) != nil {
         return
       }
       if !isCoreRunning { break }
@@ -666,14 +718,24 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func apiPathComponent(_ value: String) -> String {
-    value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
+    let unreserved = Set(
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~".utf8
+    )
+    return value.utf8.map { byte in
+      unreserved.contains(byte) ? String(UnicodeScalar(byte)) : String(format: "%%%02X", byte)
+    }.joined()
   }
 
-  private func apiRequest(method: String, path: String, body: Data?) throws -> Data {
+  private func apiRequest(
+    method: String,
+    path: String,
+    body: Data?,
+    timeoutSeconds: Int = 2
+  ) throws -> Data {
     let descriptor = socket(AF_INET, SOCK_STREAM, 0)
     guard descriptor >= 0 else { throw CoreFailure.apiUnavailable }
     defer { close(descriptor) }
-    try configureSocketTimeouts(descriptor, seconds: 7)
+    try configureSocketTimeouts(descriptor, seconds: timeoutSeconds)
 
     var address = sockaddr_in()
     address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -755,6 +817,29 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
+  private func ensureAPIPortAvailable() throws {
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { throw CoreFailure.apiPortUnavailable }
+    defer { close(descriptor) }
+
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(19090).bigEndian
+    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    let result = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard result == 0 else { throw CoreFailure.apiPortUnavailable }
+  }
+
+  private static func makeAPISecret() -> String {
+    UUID().uuidString.replacingOccurrences(of: "-", with: "")
+      + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+  }
+
   private func recentLog() -> String {
     guard let handle = try? FileHandle(forReadingFrom: logURL) else {
       return "No core log available."
@@ -780,6 +865,7 @@ enum CoreFailure: LocalizedError {
   case coreNotRunning
   case coreStopFailed
   case apiUnavailable
+  case apiPortUnavailable
   case configurationCheckTimedOut
 
   var errorDescription: String? {
@@ -793,6 +879,8 @@ enum CoreFailure: LocalizedError {
     case .coreNotRunning: "Connect the VPN before testing latency."
     case .coreStopFailed: "sing-box did not stop after SIGTERM and SIGKILL."
     case .apiUnavailable: "The local sing-box control API is unavailable."
+    case .apiPortUnavailable:
+      "Local control port 19090 is already in use. Stop the conflicting process and try again."
     case .configurationCheckTimedOut: "sing-box configuration validation timed out."
     }
   }

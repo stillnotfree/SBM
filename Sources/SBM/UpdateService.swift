@@ -84,6 +84,7 @@ enum UpdateService {
     )
     let transfer = UpdateDownloadTransfer(
       stagingURL: stagingURL,
+      maximumBytes: min(update.expectedSize, maximumAssetSize),
       progress: progress
     )
     progress(0)
@@ -204,6 +205,7 @@ private final class UpdateDownloadTransfer: NSObject, URLSessionDownloadDelegate
   @unchecked Sendable
 {
   private let stagingURL: URL
+  private let maximumBytes: Int64
   private let progressHandler: @Sendable (Double) -> Void
   private let lock = NSLock()
   private var continuation: CheckedContinuation<URLResponse, any Error>?
@@ -213,9 +215,11 @@ private final class UpdateDownloadTransfer: NSObject, URLSessionDownloadDelegate
 
   init(
     stagingURL: URL,
+    maximumBytes: Int64,
     progress: @escaping @Sendable (Double) -> Void
   ) {
     self.stagingURL = stagingURL
+    self.maximumBytes = maximumBytes
     progressHandler = progress
   }
 
@@ -249,6 +253,17 @@ private final class UpdateDownloadTransfer: NSObject, URLSessionDownloadDelegate
     totalBytesWritten: Int64,
     totalBytesExpectedToWrite: Int64
   ) {
+    if totalBytesWritten > maximumBytes
+      || (totalBytesExpectedToWrite > 0 && totalBytesExpectedToWrite > maximumBytes)
+    {
+      lock.lock()
+      if transferError == nil {
+        transferError = UpdateFailure.assetSizeMismatch
+      }
+      lock.unlock()
+      downloadTask.cancel()
+      return
+    }
     guard totalBytesExpectedToWrite > 0 else { return }
     let fraction = min(
       1,

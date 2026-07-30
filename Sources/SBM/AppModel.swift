@@ -11,6 +11,12 @@ struct ProxyNode: Identifiable, Hashable {
   var delay: Int?
 }
 
+enum SubscriptionStatusLevel {
+  case neutral
+  case success
+  case warning
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -45,6 +51,7 @@ final class AppModel {
   var subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
   var subscriptionHWID = UUID().uuidString
   var subscriptionStatus = "No subscription synced"
+  var subscriptionStatusLevel: SubscriptionStatusLevel = .neutral
   var isSyncing = false
   var profileAvailable = false
   var localSOCKSEnabled = false
@@ -64,6 +71,14 @@ final class AppModel {
 
   private let helperService: any HelperServiceManaging
   private let loginItemService = SMAppService.mainApp
+
+  private func setSubscriptionStatus(
+    _ value: String,
+    level: SubscriptionStatusLevel = .neutral
+  ) {
+    subscriptionStatus = value
+    subscriptionStatusLevel = level
+  }
 
   init(helperService: any HelperServiceManaging = SystemHelperService()) {
     self.helperService = helperService
@@ -502,7 +517,7 @@ final class AppModel {
     profileName = name
     do {
       try persistProfileLibrary()
-      subscriptionStatus = "Profile name saved"
+      setSubscriptionStatus("Profile name saved", level: .success)
       lastError = nil
     } catch {
       lastError = error.localizedDescription
@@ -517,7 +532,7 @@ final class AppModel {
     profiles[profileIndex].sources.append(source)
     selectedSourceID = source.id
     loadSelectedSourceEditor()
-    subscriptionStatus = "Enter a subscription URL or connection link"
+    setSubscriptionStatus("Enter a subscription URL or connection link")
     do {
       try persistProfileLibrary()
       lastError = nil
@@ -543,7 +558,10 @@ final class AppModel {
       try persistProfileLibrary()
       updateNodes()
       profileAvailable = profiles[profileIndex].payload != nil
-      subscriptionStatus = profileAvailable ? "Source removed" : "No sources synced"
+      setSubscriptionStatus(
+        profileAvailable ? "Source removed" : "No sources synced",
+        level: profileAvailable ? .success : .neutral
+      )
       lastError = nil
       if coreRunning, self.selectedProfileID == selectedProfileID {
         if let payload = profiles[profileIndex].payload {
@@ -614,7 +632,7 @@ final class AppModel {
         loadSelectedProfileEditor()
         updateNodes()
         profileAvailable = true
-        subscriptionStatus = "Imported JSON profile"
+        setSubscriptionStatus("Imported JSON profile", level: .success)
         try persistProfileLibrary()
         lastError = nil
         if coreRunning {
@@ -624,7 +642,7 @@ final class AppModel {
         }
       } catch {
         lastError = error.localizedDescription
-        subscriptionStatus = "Import failed"
+        setSubscriptionStatus("Import failed", level: .warning)
       }
     }
   }
@@ -677,10 +695,13 @@ final class AppModel {
           try? persistProfileLibrary()
           throw error
         }
-        subscriptionStatus = coreRunning ? "Routing policy active" : "Routing policy ready"
+        setSubscriptionStatus(
+          coreRunning ? "Routing policy active" : "Routing policy ready",
+          level: .success
+        )
         lastError = nil
       } catch {
-        subscriptionStatus = "Routing import failed"
+        setSubscriptionStatus("Routing import failed", level: .warning)
         lastError = error.localizedDescription
       }
     }
@@ -707,7 +728,7 @@ final class AppModel {
     if coreRunning {
       send(makeStartRequest(profile: updated, profileID: selectedProfileID))
     }
-    subscriptionStatus = "Routing policy removed"
+    setSubscriptionStatus("Routing policy removed", level: .success)
     lastError = nil
   }
 
@@ -721,7 +742,7 @@ final class AppModel {
     loadSelectedProfileEditor()
     updateNodes()
     profileAvailable = false
-    subscriptionStatus = "Enter a subscription URL or connection link"
+    setSubscriptionStatus("Enter a subscription URL or connection link")
     try? persistProfileLibrary()
   }
 
@@ -736,7 +757,10 @@ final class AppModel {
     loadSelectedProfileEditor()
     updateNodes()
     profileAvailable = selectedProfile?.payload != nil
-    subscriptionStatus = profileAvailable ? "Ready" : "No subscription synced"
+    setSubscriptionStatus(
+      profileAvailable ? "Ready" : "No subscription synced",
+      level: profileAvailable ? .success : .neutral
+    )
     do {
       try persistProfileLibrary()
     } catch {
@@ -790,7 +814,10 @@ final class AppModel {
     loadSelectedProfileEditor()
     updateNodes()
     profileAvailable = selectedProfile?.payload != nil
-    subscriptionStatus = profileAvailable ? "Ready" : "Not synced"
+    setSubscriptionStatus(
+      profileAvailable ? "Ready" : "Not synced",
+      level: profileAvailable ? .success : .neutral
+    )
     do {
       try persistProfileLibrary()
     } catch {
@@ -871,16 +898,20 @@ final class AppModel {
       return
     }
     guard !value.isEmpty else {
-      subscriptionStatus = profiles[profileIndex].payload == nil ? "Enter a source" : "Saved"
+      setSubscriptionStatus(
+        profiles[profileIndex].payload == nil ? "Enter a source" : "Saved",
+        level: profiles[profileIndex].payload == nil ? .neutral : .success
+      )
       return
     }
     isSyncing = true
-    subscriptionStatus = "Syncing…"
+    setSubscriptionStatus("Syncing…")
     Task {
       defer { isSyncing = false }
       let previousProfiles = profiles
       do {
-        let fetched = try await SubscriptionClient.fetch(from: value, headers: headers)
+        let result = try await SubscriptionClient.fetch(from: value, headers: headers)
+        let fetched = result.profile
         guard case .compatibility = fetched else {
           throw SubscriptionFailure.nativeProfileCannotBeMerged
         }
@@ -910,9 +941,17 @@ final class AppModel {
           guard response.success else {
             throw AppModelFailure.profileActivationFailed(response.message)
           }
-          subscriptionStatus = "Sources updated and active"
+          if let warning = result.warningDescription {
+            setSubscriptionStatus(warning, level: .warning)
+          } else {
+            setSubscriptionStatus("Sources updated and active", level: .success)
+          }
         } else if case .compatibility(let profile) = effective {
-          subscriptionStatus = profileSummary(profile) + " ready"
+          if let warning = result.warningDescription {
+            setSubscriptionStatus(warning, level: .warning)
+          } else {
+            setSubscriptionStatus(profileSummary(profile) + " ready", level: .success)
+          }
         }
         profileAvailable = true
         updateNodes()
@@ -924,8 +963,10 @@ final class AppModel {
         loadSelectedProfileEditor()
         updateNodes()
         profileAvailable = selectedProfile?.payload != nil
-        subscriptionStatus =
-          profileAvailable ? "Using cached sources; sync failed" : "Sync failed"
+        setSubscriptionStatus(
+          profileAvailable ? "Using cached sources; sync failed" : "Sync failed",
+          level: .warning
+        )
         lastError = error.localizedDescription
       }
     }
@@ -967,6 +1008,7 @@ final class AppModel {
     Task {
       defer { isSyncing = false }
       var selectedFailure: Error?
+      var selectedWarnings: [String] = []
       let previousProfiles = profiles
       var selectedProfileChanged = false
       do {
@@ -977,16 +1019,22 @@ final class AppModel {
             let source = profiles[profileIndex].sources[sourceIndex]
             guard SubscriptionClient.isRemoteSource(source.value) else { continue }
             do {
-              let fetched = try await SubscriptionClient.fetch(
+              let result = try await SubscriptionClient.fetch(
                 from: source.value,
                 headers: source.headers
               )
+              let fetched = result.profile
               guard case .compatibility = fetched else {
                 throw SubscriptionFailure.nativeProfileCannotBeMerged
               }
               profiles[profileIndex].sources[sourceIndex].payload = fetched
               profiles[profileIndex].sources[sourceIndex].updatedAt = Date()
               refreshedAnySource = true
+              if profiles[profileIndex].id == selectedProfileID,
+                let warning = result.warningDescription
+              {
+                selectedWarnings.append(warning)
+              }
             } catch {
               if profiles[profileIndex].id == selectedProfileID {
                 selectedFailure = error
@@ -1016,10 +1064,16 @@ final class AppModel {
         }
         updateNodes()
         if let selectedFailure {
-          subscriptionStatus = "Some sources could not be refreshed"
+          setSubscriptionStatus("Some sources could not be refreshed", level: .warning)
           lastError = selectedFailure.localizedDescription
+        } else if !selectedWarnings.isEmpty {
+          setSubscriptionStatus(
+            Array(Set(selectedWarnings)).sorted().joined(separator: "; "),
+            level: .warning
+          )
+          lastError = nil
         } else {
-          subscriptionStatus = "Sources refreshed"
+          setSubscriptionStatus("Sources refreshed", level: .success)
           lastError = nil
         }
         connectAutomaticallyIfNeeded()

@@ -7,6 +7,23 @@ import SwiftUI
 private final class AppDelegate: NSObject, NSApplicationDelegate {
   weak var model: AppModel?
   private var terminationPending = false
+  private var wakeObserver: NSObjectProtocol?
+
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didWakeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        self?.model?.refresh()
+      }
+    }
+  }
+
+  func applicationDidBecomeActive(_ notification: Notification) {
+    model?.refresh()
+  }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard let model else { return .terminateNow }
@@ -19,6 +36,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     return .terminateLater
   }
+
 }
 
 @main
@@ -34,6 +52,7 @@ struct SBMApp: App {
     MenuBarExtra {
       MenuContentView(model: model)
         .onAppear {
+          model.refresh()
           model.refreshLatencyIfNeeded()
         }
     } label: {
