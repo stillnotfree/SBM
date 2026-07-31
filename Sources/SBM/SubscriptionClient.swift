@@ -487,6 +487,7 @@ enum SubscriptionFailure: Equatable, LocalizedError {
   case duplicateSelectableTag
   case invalidDisplayName
   case invalidHeader(String)
+  case invalidExcludeRegex
   case tooManyConnections
   case nativeProfileCannotBeMerged
 
@@ -517,6 +518,8 @@ enum SubscriptionFailure: Equatable, LocalizedError {
       "A server display name is empty, too long, or contains control characters."
     case .invalidHeader(let name):
       "\(name) is empty, too long, or contains control characters."
+    case .invalidExcludeRegex:
+      "The exclude regex is invalid or longer than 512 bytes."
     case .tooManyConnections:
       "A profile may contain at most 63 proxy connections."
     case .nativeProfileCannotBeMerged:

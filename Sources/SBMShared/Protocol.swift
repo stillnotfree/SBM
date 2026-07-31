@@ -1,9 +1,9 @@
 import Foundation
 
 public enum HelperConstants {
-  public static let protocolVersion = 4
-  public static let helperVersion = "1.1.2"
-  public static let helperRevision = 31
+  public static let protocolVersion = 5
+  public static let helperVersion = "1.1.3"
+  public static let helperRevision = 32
   public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.sock"
   public static let daemonPlistName = "com.stillnotfree.sbm.helper.plist"
 }
@@ -119,19 +119,34 @@ public struct RoutingPolicy: Codable, Equatable, Sendable {
   }
 }
 
+public struct ProxyNodeGroup: Codable, Equatable, Sendable {
+  public let id: String
+  public let name: String
+  public let nodes: [ProxyNodeID]
+
+  public init(id: String, name: String, nodes: [ProxyNodeID]) {
+    self.id = id
+    self.name = name
+    self.nodes = nodes
+  }
+}
+
 public struct VPNProfile: Codable, Equatable, Sendable {
   public let vless: [VLESSProfile]
   public let hysteria2: [Hysteria2Profile]
   public let routingPolicy: RoutingPolicy?
+  public let nodeGroups: [ProxyNodeGroup]?
 
   public init(
     vless: [VLESSProfile] = [],
     hysteria2: [Hysteria2Profile] = [],
-    routingPolicy: RoutingPolicy? = nil
+    routingPolicy: RoutingPolicy? = nil,
+    nodeGroups: [ProxyNodeGroup] = []
   ) {
     self.vless = vless
     self.hysteria2 = hysteria2
     self.routingPolicy = routingPolicy
+    self.nodeGroups = nodeGroups
   }
 }
 

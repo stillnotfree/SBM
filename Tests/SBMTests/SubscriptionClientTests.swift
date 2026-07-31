@@ -1,4 +1,5 @@
 import Foundation
+import SBMShared
 import Testing
 
 @testable import SBM
@@ -238,6 +239,106 @@ import Testing
   }
   #expect(compatibility.vless.count == 1)
   #expect(compatibility.hysteria2.count == 1)
+  let groups = compatibility.nodeGroups ?? []
+  #expect(groups.count == 2)
+  #expect(groups[0].name == "First")
+  #expect(groups[0].nodes == [ProxyNodeID(rawValue: "vless-1")])
+  #expect(groups[1].name == "Second")
+  #expect(groups[1].nodes == [ProxyNodeID(rawValue: "hysteria2-1")])
+}
+
+@Test func profileAggregatorAppliesPerSourceExcludeRegex() throws {
+  let payload = try SubscriptionClient.parsePayload(
+    """
+    vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b#Netherlands
+    vless://5efab93b-90d0-4904-93d6-44b4f0b00002@203.0.113.11:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b#LTE%20Whitelist
+    hysteria2://password@vpn.example.com:443/?sni=vpn.example.com#Russia
+    """
+  )
+  let merged = try ProfileAggregator.merge(
+    sources: [
+      ManagedSource(
+        name: "AID",
+        value: "https://example.com/sub",
+        excludeRegex: "(?i)lte|russia",
+        payload: payload
+      )
+    ],
+    routingPolicy: nil
+  )
+  guard case .compatibility(let compatibility) = merged else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(compatibility.vless.map(\.displayName) == ["Netherlands"])
+  #expect(compatibility.hysteria2.isEmpty)
+  #expect(compatibility.nodeGroups?.first?.nodes == [ProxyNodeID(rawValue: "vless-1")])
+}
+
+@Test func sourceExcludeRegexRejectsInvalidPatterns() {
+  #expect(throws: SubscriptionFailure.invalidExcludeRegex) {
+    try SourceNameFilter.normalized("(?i)(")
+  }
+}
+
+@Test func proxyNodeSectionsPreserveSourcesAndSortMeasuredNodesByLatency() {
+  let nodes = [
+    ProxyNode(
+      id: .auto,
+      name: "Auto",
+      symbol: "wand.and.stars",
+      groupID: nil,
+      groupName: nil,
+      groupOrder: nil,
+      nodeOrder: nil,
+      delay: 30
+    ),
+    ProxyNode(
+      id: ProxyNodeID(rawValue: "vless-1"),
+      name: "Reality",
+      symbol: "network",
+      groupID: "personal",
+      groupName: "My VPS",
+      groupOrder: 0,
+      nodeOrder: 0,
+      delay: 70
+    ),
+    ProxyNode(
+      id: ProxyNodeID(rawValue: "hysteria2-1"),
+      name: "Hysteria2",
+      symbol: "network",
+      groupID: "personal",
+      groupName: "My VPS",
+      groupOrder: 0,
+      nodeOrder: 1,
+      delay: 40
+    ),
+    ProxyNode(
+      id: ProxyNodeID(rawValue: "vless-2"),
+      name: "Netherlands",
+      symbol: "network",
+      groupID: "aid",
+      groupName: "AID",
+      groupOrder: 1,
+      nodeOrder: 0,
+      delay: nil
+    ),
+    ProxyNode(
+      id: ProxyNodeID(rawValue: "hysteria2-2"),
+      name: "Sweden",
+      symbol: "network",
+      groupID: "aid",
+      groupName: "AID",
+      groupOrder: 1,
+      nodeOrder: 1,
+      delay: 35
+    ),
+  ]
+
+  let sections = ProxyNodeSectionBuilder.make(from: nodes)
+  #expect(sections.map(\.name) == ["My VPS", "AID"])
+  #expect(sections[0].nodes.map(\.name) == ["Hysteria2", "Reality"])
+  #expect(sections[1].nodes.map(\.name) == ["Sweden", "Netherlands"])
 }
 
 @Test func profileAggregatorRejectsNativeJSONSource() throws {

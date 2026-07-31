@@ -30,6 +30,7 @@
 - Native Swift menu bar app with a TUN-only connection and no Electron runtime.
 - Rule, Global, and Direct modes with automatic or manual server selection.
 - Multiple HTTPS subscriptions and VLESS/Hysteria2 links in one selectable profile.
+- Source-grouped server menus with per-source latency sorting and exclude regex filters.
 - Per-subscription User-Agent, X-Device-OS, and X-HWID headers.
 - Native sing-box JSON profiles for protocols not represented by compact links.
 - No system-proxy mode, dashboard, traffic statistics, telemetry, or access logging.
@@ -58,6 +59,11 @@ One managed profile can combine:
 Each HTTPS source has independent editable `User-Agent`, `X-Device-OS`, and
 `X-HWID` values. Defaults are supplied for providers that require
 Shadowrocket-style content negotiation, and can be replaced before syncing.
+Each source also has an optional case-sensitive `Exclude regex`; use inline
+flags such as `(?i)` for case-insensitive matching. Matching connection names
+are removed before the menu, Auto group, and sing-box configuration are built.
+The server menu keeps sources in profile order and sorts measured nodes by
+latency only within their own source.
 Sensitive provider headers are removed when a redirect crosses an origin.
 Duplicate connection links are collapsed and a managed profile is limited to
 63 proxy connections.
@@ -187,7 +193,7 @@ update.
 
 ## Current status
 
-Version 1.1.2 is not an independently audited security product.
+Version 1.1.3 is not an independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
 REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are
 covered by the test suite, including custom request headers, redirects,

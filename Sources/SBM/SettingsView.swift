@@ -109,6 +109,16 @@ struct SettingsView: View {
           .textFieldStyle(.roundedBorder)
           .disabled(model.selectedSourceID == nil)
 
+          TextField("Exclude regex (optional)", text: $model.sourceExcludeRegex)
+            .textFieldStyle(.roundedBorder)
+            .disabled(model.selectedSourceID == nil)
+
+          Text(
+            "Connections whose names match this regular expression are omitted from the menu, Auto, and the generated sing-box configuration."
+          )
+          .font(.caption)
+          .foregroundStyle(.secondary)
+
           DisclosureGroup("Request headers") {
             TextField("User-Agent", text: $model.subscriptionUserAgent)
               .textFieldStyle(.roundedBorder)

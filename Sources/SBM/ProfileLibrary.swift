@@ -25,6 +25,7 @@ struct ManagedSource: Codable, Equatable, Identifiable, Sendable {
   var name: String
   var value: String
   var headers: SubscriptionHeaders
+  var excludeRegex: String?
   var payload: CoreProfile?
   var updatedAt: Date?
 
@@ -33,6 +34,7 @@ struct ManagedSource: Codable, Equatable, Identifiable, Sendable {
     name: String = "Subscription",
     value: String = "",
     headers: SubscriptionHeaders = SubscriptionHeaders(),
+    excludeRegex: String? = nil,
     payload: CoreProfile? = nil,
     updatedAt: Date? = nil
   ) {
@@ -40,8 +42,42 @@ struct ManagedSource: Codable, Equatable, Identifiable, Sendable {
     self.name = name
     self.value = value
     self.headers = headers
+    self.excludeRegex = excludeRegex
     self.payload = payload
     self.updatedAt = updatedAt
+  }
+}
+
+enum SourceNameFilter {
+  static let maximumPatternLength = 512
+
+  static func normalized(_ value: String) throws -> String? {
+    let pattern = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !pattern.isEmpty else { return nil }
+    guard pattern.utf8.count <= maximumPatternLength,
+      !pattern.unicodeScalars.contains(where: {
+        CharacterSet.controlCharacters.contains($0)
+      })
+    else {
+      throw SubscriptionFailure.invalidExcludeRegex
+    }
+    do {
+      _ = try NSRegularExpression(pattern: pattern)
+      return pattern
+    } catch {
+      throw SubscriptionFailure.invalidExcludeRegex
+    }
+  }
+
+  static func matcher(for value: String?) throws -> NSRegularExpression? {
+    guard let value, let pattern = try normalized(value) else { return nil }
+    return try NSRegularExpression(pattern: pattern)
+  }
+
+  static func excludes(_ name: String, using expression: NSRegularExpression?) -> Bool {
+    guard let expression else { return false }
+    let range = NSRange(name.startIndex..<name.endIndex, in: name)
+    return expression.firstMatch(in: name, range: range) != nil
   }
 }
 
@@ -74,17 +110,38 @@ enum ProfileAggregator {
   ) throws -> CoreProfile {
     var vless: [VLESSProfile] = []
     var hysteria2: [Hysteria2Profile] = []
+    var groups: [ProxyNodeGroup] = []
 
     for source in sources {
       guard let payload = source.payload else { continue }
       guard case .compatibility(let profile) = payload else {
         throw SubscriptionFailure.nativeProfileCannotBeMerged
       }
-      for connection in profile.vless where !vless.contains(connection) {
+      let sourceName = try SubscriptionClient.validateDisplayName(source.name)
+      let filter = try SourceNameFilter.matcher(for: source.excludeRegex)
+      var groupNodes: [ProxyNodeID] = []
+      for connection in profile.vless
+      where !SourceNameFilter.excludes(connection.displayName, using: filter)
+        && !vless.contains(connection)
+      {
         vless.append(connection)
+        groupNodes.append(ProxyNodeID(rawValue: "vless-\(vless.count)"))
       }
-      for connection in profile.hysteria2 where !hysteria2.contains(connection) {
+      for connection in profile.hysteria2
+      where !SourceNameFilter.excludes(connection.displayName, using: filter)
+        && !hysteria2.contains(connection)
+      {
         hysteria2.append(connection)
+        groupNodes.append(ProxyNodeID(rawValue: "hysteria2-\(hysteria2.count)"))
+      }
+      if !groupNodes.isEmpty {
+        groups.append(
+          ProxyNodeGroup(
+            id: source.id.uuidString,
+            name: sourceName,
+            nodes: groupNodes
+          )
+        )
       }
     }
 
@@ -98,7 +155,8 @@ enum ProfileAggregator {
       VPNProfile(
         vless: vless,
         hysteria2: hysteria2,
-        routingPolicy: routingPolicy
+        routingPolicy: routingPolicy,
+        nodeGroups: groups
       )
     )
   }

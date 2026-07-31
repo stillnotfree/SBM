@@ -130,14 +130,16 @@ private struct MenuContentView: View {
     .disabled(model.helperSetupInProgress)
 
     Menu("Server: \(selectedNodeName)") {
-      ForEach(model.nodes) { node in
-        Button {
-          model.setSelectedNode(node.id)
-        } label: {
-          if model.selectedNodeID == node.id {
-            Label(nodeTitle(node), systemImage: "checkmark")
-          } else {
-            Text(nodeTitle(node))
+      if let automaticNode = model.automaticNode {
+        serverButton(automaticNode)
+      }
+      if !model.nodeSections.isEmpty {
+        Divider()
+        ForEach(model.nodeSections) { section in
+          Section(section.name) {
+            ForEach(section.nodes) { node in
+              serverButton(node)
+            }
           }
         }
       }
@@ -226,6 +228,19 @@ private struct MenuContentView: View {
       }
       window.makeKeyAndOrderFront(nil)
       window.orderFrontRegardless()
+    }
+  }
+
+  @ViewBuilder
+  private func serverButton(_ node: ProxyNode) -> some View {
+    Button {
+      model.setSelectedNode(node.id)
+    } label: {
+      if model.selectedNodeID == node.id {
+        Label(nodeTitle(node), systemImage: "checkmark")
+      } else {
+        Text(nodeTitle(node))
+      }
     }
   }
 }

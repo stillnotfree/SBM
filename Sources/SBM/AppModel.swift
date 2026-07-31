@@ -8,7 +8,52 @@ struct ProxyNode: Identifiable, Hashable {
   let id: ProxyNodeID
   let name: String
   let symbol: String
+  let groupID: String?
+  let groupName: String?
+  let groupOrder: Int?
+  let nodeOrder: Int?
   var delay: Int?
+}
+
+struct ProxyNodeSection: Identifiable {
+  let id: String
+  let name: String
+  let order: Int
+  let nodes: [ProxyNode]
+}
+
+enum ProxyNodeSectionBuilder {
+  static func make(from nodes: [ProxyNode]) -> [ProxyNodeSection] {
+    let proxyNodes = nodes.filter { $0.id != .auto }
+    let grouped = Dictionary(grouping: proxyNodes) { $0.groupID ?? "ungrouped" }
+    return grouped.map { id, values in
+      let first = values.first
+      let sorted = values.enumerated().sorted { leftEntry, rightEntry in
+        let left = leftEntry.element
+        let right = rightEntry.element
+        switch (left.delay, right.delay) {
+        case (.some(let leftDelay), .some(let rightDelay)) where leftDelay != rightDelay:
+          return leftDelay < rightDelay
+        case (.some, .none):
+          return true
+        case (.none, .some):
+          return false
+        default:
+          return (left.nodeOrder ?? leftEntry.offset)
+            < (right.nodeOrder ?? rightEntry.offset)
+        }
+      }.map(\.element)
+      return ProxyNodeSection(
+        id: id,
+        name: first?.groupName ?? "Servers",
+        order: first?.groupOrder ?? Int.max,
+        nodes: sorted
+      )
+    }.sorted { left, right in
+      if left.order != right.order { return left.order < right.order }
+      return left.name.localizedStandardCompare(right.name) == .orderedAscending
+    }
+  }
 }
 
 enum SubscriptionStatusLevel {
@@ -46,6 +91,7 @@ final class AppModel {
   var profileName = ""
   var selectedSourceID: UUID?
   var sourceName = ""
+  var sourceExcludeRegex = ""
   var subscriptionURL = ""
   var subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
   var subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
@@ -66,8 +112,25 @@ final class AppModel {
   private var availableUpdate: AppUpdate?
 
   var nodes: [ProxyNode] = [
-    ProxyNode(id: .auto, name: "Auto", symbol: "wand.and.stars", delay: nil)
+    ProxyNode(
+      id: .auto,
+      name: "Auto",
+      symbol: "wand.and.stars",
+      groupID: nil,
+      groupName: nil,
+      groupOrder: nil,
+      nodeOrder: nil,
+      delay: nil
+    )
   ]
+
+  var automaticNode: ProxyNode? {
+    nodes.first(where: { $0.id == .auto })
+  }
+
+  var nodeSections: [ProxyNodeSection] {
+    ProxyNodeSectionBuilder.make(from: nodes)
+  }
 
   private let helperService: any HelperServiceManaging
   private let loginItemService = SMAppService.mainApp
@@ -888,10 +951,14 @@ final class AppModel {
     }
     do {
       try SubscriptionClient.validate(headers: headers)
-      profiles[profileIndex].sources[sourceIndex].name =
+      let effectiveName = try SubscriptionClient.validateDisplayName(
         name.isEmpty ? "Subscription" : name
+      )
+      let excludeRegex = try SourceNameFilter.normalized(sourceExcludeRegex)
+      profiles[profileIndex].sources[sourceIndex].name = effectiveName
       profiles[profileIndex].sources[sourceIndex].value = value
       profiles[profileIndex].sources[sourceIndex].headers = headers
+      profiles[profileIndex].sources[sourceIndex].excludeRegex = excludeRegex
       try persistProfileLibrary()
     } catch {
       lastError = error.localizedDescription
@@ -1100,6 +1167,7 @@ final class AppModel {
       let source = selectedProfile?.sources.first(where: { $0.id == selectedSourceID })
     else {
       sourceName = ""
+      sourceExcludeRegex = ""
       subscriptionURL = ""
       subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
       subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
@@ -1107,6 +1175,7 @@ final class AppModel {
       return
     }
     sourceName = source.name
+    sourceExcludeRegex = source.excludeRegex ?? ""
     subscriptionURL = source.value
     subscriptionUserAgent = source.headers.userAgent
     subscriptionDeviceOS = source.headers.deviceOS
@@ -1162,10 +1231,15 @@ final class AppModel {
         ProxyNodeDescriptor(id: .auto, name: "Auto")
       ]
     nodes = descriptors.map { descriptor in
-      ProxyNode(
+      let metadata = groupMetadata(for: descriptor.id)
+      return ProxyNode(
         id: descriptor.id,
         name: descriptor.name,
         symbol: symbol(for: descriptor.id),
+        groupID: metadata?.id,
+        groupName: metadata?.name,
+        groupOrder: metadata?.groupOrder,
+        nodeOrder: metadata?.nodeOrder,
         delay: nil
       )
     }
@@ -1214,10 +1288,15 @@ final class AppModel {
           node.delay.map { (node.id, $0) }
         })
       nodes = response.nodes.map { descriptor in
-        ProxyNode(
+        let metadata = groupMetadata(for: descriptor.id)
+        return ProxyNode(
           id: descriptor.id,
           name: descriptor.name,
           symbol: symbol(for: descriptor.id),
+          groupID: metadata?.id,
+          groupName: metadata?.name,
+          groupOrder: metadata?.groupOrder,
+          nodeOrder: metadata?.nodeOrder,
           delay: delays[descriptor.id]
         )
       }
@@ -1237,6 +1316,18 @@ final class AppModel {
     if id.rawValue.hasPrefix("vless-") { return "shield.lefthalf.filled" }
     if id.rawValue.hasPrefix("hysteria2-") { return "bolt.horizontal.fill" }
     return "network"
+  }
+
+  private func groupMetadata(for nodeID: ProxyNodeID) -> (
+    id: String, name: String, groupOrder: Int, nodeOrder: Int
+  )? {
+    guard case .compatibility(let profile) = selectedProfile?.payload else { return nil }
+    for (groupOrder, group) in (profile.nodeGroups ?? []).enumerated() {
+      if let nodeOrder = group.nodes.firstIndex(of: nodeID) {
+        return (group.id, group.name, groupOrder, nodeOrder)
+      }
+    }
+    return nil
   }
 
   private func enableCurrentHelper() async throws -> HelperResponse {
