@@ -53,7 +53,6 @@ struct SBMApp: App {
       MenuContentView(model: model)
         .onAppear {
           model.refresh()
-          model.refreshLatencyIfNeeded()
         }
     } label: {
       Image(systemName: model.coreRunning ? "shield.fill" : "shield")
@@ -214,11 +213,6 @@ private struct MenuContentView: View {
     model.nodes.first(where: { $0.id == model.selectedNodeID })?.name ?? "Unknown"
   }
 
-  private func nodeTitle(_ node: ProxyNode) -> String {
-    guard let delay = node.delay else { return node.name }
-    return "\(node.name) — \(delay) ms"
-  }
-
   private func presentWindow(id: String, title: String) {
     NSApplication.shared.activate(ignoringOtherApps: true)
     openWindow(id: id)
@@ -233,15 +227,34 @@ private struct MenuContentView: View {
 
   @ViewBuilder
   private func serverButton(_ node: ProxyNode) -> some View {
+    let selected = model.selectedNodeID == node.id
+    let latency = ProxyNodeMenuPresentation.latencyLabel(
+      delay: node.delay,
+      testCompleted: model.latencyTestCompleted
+    )
     Button {
       model.setSelectedNode(node.id)
     } label: {
-      if model.selectedNodeID == node.id {
-        Label(nodeTitle(node), systemImage: "checkmark")
+      if selected {
+        Label(node.name, systemImage: "checkmark")
       } else {
-        Text(nodeTitle(node))
+        Label {
+          Text(node.name)
+        } icon: {
+          Image(nsImage: selectionPlaceholderImage())
+        }
       }
     }
+    .badge(latency)
+    .accessibilityLabel(selected ? "\(node.name), selected" : node.name)
+  }
+
+  private func selectionPlaceholderImage() -> NSImage {
+    let image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { _ in
+      true
+    }
+    image.isTemplate = true
+    return image
   }
 }
 

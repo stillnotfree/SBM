@@ -198,6 +198,32 @@ struct SettingsView: View {
         .foregroundStyle(.secondary)
       }
 
+      Section("Latency") {
+        HStack {
+          Text("Automatic latency checks")
+          Spacer()
+          TextField(
+            "Minutes",
+            value: Binding(
+              get: { model.latencyIntervalMinutes },
+              set: { model.setLatencyIntervalMinutes($0) }
+            ),
+            format: .number.grouping(.never)
+          )
+          .labelsHidden()
+          .textFieldStyle(.roundedBorder)
+          .multilineTextAlignment(.trailing)
+          .frame(width: 74)
+          Text("min")
+            .foregroundStyle(.secondary)
+        }
+        Text(
+          "SBM updates the latency values in the server menu automatically while the VPN is connected. sing-box uses its own urltest interval for Auto selection."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      }
+
       Section("Local SOCKS5") {
         Toggle("Enable local SOCKS5 proxy", isOn: $model.localSOCKSEnabled)
         HStack {

@@ -5,6 +5,30 @@ import Testing
 @testable import SBM
 @testable import SBMHelper
 
+@Test func profileLibraryDefaultsLatencyIntervalForOlderStores() throws {
+  let data = Data(
+    """
+    {
+      "profiles": [],
+      "selectedProfileID": null,
+      "localSOCKSEnabled": false,
+      "localSOCKSPort": 1082
+    }
+    """.utf8
+  )
+  let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: data)
+  #expect(decoded.latencyIntervalMinutes == 10)
+}
+
+@Test func profileLibraryClampsLatencyInterval() throws {
+  let library = ProfileLibrary(
+    profiles: [],
+    selectedProfileID: nil,
+    latencyIntervalMinutes: 10_000
+  )
+  #expect(library.latencyIntervalMinutes == 9_999)
+}
+
 @Test func profileStoreWritesCredentialsWithUserOnlyPermissions() throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent("SBMStoreTests-\(UUID().uuidString)", isDirectory: true)

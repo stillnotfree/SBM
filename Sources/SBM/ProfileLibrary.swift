@@ -167,17 +167,50 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
   var selectedProfileID: UUID?
   var localSOCKSEnabled: Bool
   var localSOCKSPort: UInt16
+  var latencyIntervalMinutes: Int
+
+  private enum CodingKeys: String, CodingKey {
+    case profiles
+    case selectedProfileID
+    case localSOCKSEnabled
+    case localSOCKSPort
+    case latencyIntervalMinutes
+  }
 
   init(
     profiles: [ManagedProfile],
     selectedProfileID: UUID?,
     localSOCKSEnabled: Bool = false,
-    localSOCKSPort: UInt16 = 1082
+    localSOCKSPort: UInt16 = 1082,
+    latencyIntervalMinutes: Int = 10
   ) {
     self.profiles = profiles
     self.selectedProfileID = selectedProfileID
     self.localSOCKSEnabled = localSOCKSEnabled
     self.localSOCKSPort = localSOCKSPort
+    self.latencyIntervalMinutes = min(max(latencyIntervalMinutes, 1), 9_999)
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    profiles = try container.decode([ManagedProfile].self, forKey: .profiles)
+    selectedProfileID = try container.decodeIfPresent(UUID.self, forKey: .selectedProfileID)
+    localSOCKSEnabled =
+      try container.decodeIfPresent(Bool.self, forKey: .localSOCKSEnabled) ?? false
+    localSOCKSPort =
+      try container.decodeIfPresent(UInt16.self, forKey: .localSOCKSPort) ?? 1082
+    let storedInterval =
+      try container.decodeIfPresent(Int.self, forKey: .latencyIntervalMinutes) ?? 10
+    latencyIntervalMinutes = min(max(storedInterval, 1), 9_999)
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(profiles, forKey: .profiles)
+    try container.encodeIfPresent(selectedProfileID, forKey: .selectedProfileID)
+    try container.encode(localSOCKSEnabled, forKey: .localSOCKSEnabled)
+    try container.encode(localSOCKSPort, forKey: .localSOCKSPort)
+    try container.encode(latencyIntervalMinutes, forKey: .latencyIntervalMinutes)
   }
 
   static let empty = ProfileLibrary(profiles: [], selectedProfileID: nil)

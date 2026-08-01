@@ -193,7 +193,7 @@ update.
 
 ## Current status
 
-Version 1.1.3 is not an independently audited security product.
+Version 1.1.9 is not an independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
 REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are
 covered by the test suite, including custom request headers, redirects,

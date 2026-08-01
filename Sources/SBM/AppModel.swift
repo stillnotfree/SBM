@@ -22,6 +22,13 @@ struct ProxyNodeSection: Identifiable {
   let nodes: [ProxyNode]
 }
 
+enum ProxyNodeMenuPresentation {
+  static func latencyLabel(delay: Int?, testCompleted: Bool) -> String {
+    if let delay { return "\(delay) ms" }
+    return testCompleted ? "timeout" : ""
+  }
+}
+
 enum ProxyNodeSectionBuilder {
   static func make(from nodes: [ProxyNode]) -> [ProxyNodeSection] {
     let proxyNodes = nodes.filter { $0.id != .auto }
@@ -102,11 +109,15 @@ final class AppModel {
   var profileAvailable = false
   var localSOCKSEnabled = false
   var localSOCKSPort: UInt16 = 1082
+  var latencyIntervalMinutes = 10
   private var subscriptionRefreshTask: Task<Void, Never>?
+  private var latencyRefreshTask: Task<Void, Never>?
   private var helperRepairTask: Task<Void, Never>?
   private var refreshGeneration = 0
   private var refreshInProgress = false
   private var lastLatencyTestAt: Date?
+  var latencyTestCompleted = false
+  var latencyTestInProgress = false
   private var didAttemptAutomaticConnection = false
   private var helperActiveProfileID: UUID?
   private var availableUpdate: AppUpdate?
@@ -150,6 +161,7 @@ final class AppModel {
     selectedProfileID = stored.selectedProfileID
     localSOCKSEnabled = stored.localSOCKSEnabled
     localSOCKSPort = stored.localSOCKSPort
+    latencyIntervalMinutes = stored.latencyIntervalMinutes
     if selectedProfileID == nil || !profiles.contains(where: { $0.id == selectedProfileID }) {
       selectedProfileID = profiles.first?.id
     }
@@ -164,6 +176,7 @@ final class AppModel {
     enableLaunchAtLoginIfNeeded()
     refreshRegistrationStatus()
     bootstrapHelper()
+    startLatencyRefreshLoop()
     if !profiles.isEmpty {
       profileAvailable = selectedProfile?.payload != nil
       startSubscriptionRefreshLoop()
@@ -525,10 +538,15 @@ final class AppModel {
       lastError = "Connect the VPN before testing latency."
       return
     }
-    for index in nodes.indices { nodes[index].delay = nil }
+    guard !latencyTestInProgress else { return }
+    lastLatencyTestAt = Date()
+    latencyTestInProgress = true
     beginBusyOperation()
     Task {
-      defer { endBusyOperation() }
+      defer {
+        latencyTestInProgress = false
+        endBusyOperation()
+      }
       do {
         let response = try await Task.detached {
           try HelperClient.send(.testLatency)
@@ -545,6 +563,7 @@ final class AppModel {
         {
           nodes[autoIndex].delay = measured.min()
         }
+        latencyTestCompleted = response.success
         lastError = response.success ? nil : response.message
       } catch {
         helperReachable = false
@@ -554,12 +573,18 @@ final class AppModel {
   }
 
   func refreshLatencyIfNeeded() {
-    guard coreRunning, !isBusy else { return }
-    if let lastLatencyTestAt, Date().timeIntervalSince(lastLatencyTestAt) < 30 {
+    guard coreRunning, !isBusy, !latencyTestInProgress else { return }
+    if let lastLatencyTestAt,
+      Date().timeIntervalSince(lastLatencyTestAt) < TimeInterval(latencyIntervalMinutes * 60)
+    {
       return
     }
-    lastLatencyTestAt = Date()
     testLatency()
+  }
+
+  func setLatencyIntervalMinutes(_ value: Int) {
+    latencyIntervalMinutes = min(max(value, 1), 9_999)
+    try? persistProfileLibrary()
   }
 
   func saveAndSyncSubscription() {
@@ -1050,6 +1075,17 @@ final class AppModel {
     }
   }
 
+  private func startLatencyRefreshLoop() {
+    latencyRefreshTask?.cancel()
+    latencyRefreshTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(60))
+        guard !Task.isCancelled else { return }
+        self?.refreshLatencyIfNeeded()
+      }
+    }
+  }
+
   private func validateProfile(_ profile: CoreProfile) async throws {
     guard currentHelperIsReady else {
       throw AppModelFailure.helperRequiredForValidation
@@ -1188,7 +1224,8 @@ final class AppModel {
         profiles: profiles,
         selectedProfileID: selectedProfileID,
         localSOCKSEnabled: localSOCKSEnabled,
-        localSOCKSPort: localSOCKSPort
+        localSOCKSPort: localSOCKSPort,
+        latencyIntervalMinutes: latencyIntervalMinutes
       )
     )
   }
@@ -1226,6 +1263,7 @@ final class AppModel {
 
   private func updateNodes() {
     lastLatencyTestAt = nil
+    latencyTestCompleted = false
     let descriptors =
       selectedProfile?.payload?.nodes ?? [
         ProxyNodeDescriptor(id: .auto, name: "Auto")
