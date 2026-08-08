@@ -5,6 +5,9 @@ private final class SubscriptionSessionDelegate: NSObject, URLSessionTaskDelegat
   @unchecked Sendable
 {
   private let sourceURL: URL
+  private let lock = NSLock()
+  private var redirectCount = 0
+  private var strippedSensitiveHeaders = false
 
   init(sourceURL: URL) {
     self.sourceURL = sourceURL
@@ -17,8 +20,26 @@ private final class SubscriptionSessionDelegate: NSObject, URLSessionTaskDelegat
     newRequest request: URLRequest,
     completionHandler: @escaping (URLRequest?) -> Void
   ) {
+    lock.lock()
+    redirectCount += 1
+    let exceedsLimit = redirectCount > SubscriptionClient.maximumRedirects
+    let crossesOrigin =
+      request.url.map {
+        SubscriptionOrigin(url: $0) != SubscriptionOrigin(url: sourceURL)
+      } ?? true
+    strippedSensitiveHeaders = strippedSensitiveHeaders || crossesOrigin
+    let mustStrip = strippedSensitiveHeaders
+    lock.unlock()
+    guard !exceedsLimit else {
+      completionHandler(nil)
+      return
+    }
     completionHandler(
-      SubscriptionClient.sanitizedRedirectRequest(request, from: sourceURL)
+      SubscriptionClient.sanitizedRedirectRequest(
+        request,
+        from: sourceURL,
+        sensitiveHeadersWereStripped: mustStrip
+      )
     )
   }
 }
@@ -61,6 +82,7 @@ struct SubscriptionFetchResult: Sendable {
 enum SubscriptionClient {
   static let maximumProfileSize = 1_048_576
   static let maximumConnections = 63
+  static let maximumRedirects = 5
 
   static func fetch(
     from value: String,
@@ -109,8 +131,15 @@ enum SubscriptionClient {
     let data = try Data(contentsOf: temporaryURL, options: [.mappedIfSafe])
     guard data.count <= maximumProfileSize else { throw SubscriptionFailure.tooLarge }
 
-    let body = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    let body = try decodeBody(data)
     return try parsePayloadResult(body)
+  }
+
+  static func decodeBody(_ data: Data) throws -> String {
+    guard let body = String(data: data, encoding: .utf8) else {
+      throw SubscriptionFailure.invalidEncoding
+    }
+    return body.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
   static func validate(headers: SubscriptionHeaders) throws {
@@ -145,22 +174,36 @@ enum SubscriptionClient {
 
   static func sanitizedRedirectRequest(
     _ request: URLRequest,
-    from sourceURL: URL
+    from sourceURL: URL,
+    sensitiveHeadersWereStripped: Bool = false
   ) -> URLRequest? {
     guard let destination = request.url,
       destination.scheme?.lowercased() == "https"
     else { return nil }
-    guard SubscriptionOrigin(url: destination) != SubscriptionOrigin(url: sourceURL) else {
+    guard
+      sensitiveHeadersWereStripped
+        || SubscriptionOrigin(url: destination) != SubscriptionOrigin(url: sourceURL)
+    else {
       return request
     }
     var sanitized = request
     sanitized.setValue(nil, forHTTPHeaderField: "X-HWID")
     sanitized.setValue(nil, forHTTPHeaderField: "X-Device-OS")
+    sanitized.setValue(nil, forHTTPHeaderField: "Authorization")
+    sanitized.setValue(nil, forHTTPHeaderField: "Proxy-Authorization")
+    sanitized.setValue(nil, forHTTPHeaderField: "Cookie")
     sanitized.setValue(
-      "SBM/\(HelperConstants.helperVersion)",
+      applicationUserAgent,
       forHTTPHeaderField: "User-Agent"
     )
     return sanitized
+  }
+
+  private static var applicationUserAgent: String {
+    let version =
+      Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+      ?? "development"
+    return "SBM/\(version)"
   }
 
   static func isRemoteSource(_ value: String) -> Bool {
@@ -474,6 +517,7 @@ enum NativeProfileParser {
 enum SubscriptionFailure: Equatable, LocalizedError {
   case invalidURL
   case httpFailure
+  case invalidEncoding
   case tooLarge
   case missingProtocols
   case invalidVLESS
@@ -495,6 +539,7 @@ enum SubscriptionFailure: Equatable, LocalizedError {
     switch self {
     case .invalidURL: "Enter a valid HTTPS subscription URL."
     case .httpFailure: "The subscription server returned an error."
+    case .invalidEncoding: "The subscription response is not valid UTF-8."
     case .tooLarge: "The subscription response is unexpectedly large."
     case .missingProtocols:
       "Enter an HTTPS subscription, VLESS + REALITY link, or Hysteria2 link."

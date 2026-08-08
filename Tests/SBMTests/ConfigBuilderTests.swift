@@ -775,3 +775,66 @@ import Testing
       .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
   }
 }
+
+@Test func nativeProfileRejectsExternalTorProcessCapability() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        { "type": "tor", "tag": "unsafe-tor" }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsOutboundTLSACMEWriteSurface() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080,
+          "tls": {
+            "enabled": true,
+            "acme": { "data_directory": "/Library/Application Support/SBM/unsafe" }
+          }
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsUnknownOutboundSectionFields() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080,
+          "future_root_capability": true
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}

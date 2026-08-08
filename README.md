@@ -59,6 +59,9 @@ One managed profile can combine:
 Each HTTPS source has independent editable `User-Agent`, `X-Device-OS`, and
 `X-HWID` values. Defaults are supplied for providers that require
 Shadowrocket-style content negotiation, and can be replaced before syncing.
+Resetting the request preset preserves the source HWID. Copying or explicitly
+regenerating the HWID is available separately; it is never rotated during a
+refresh or application update.
 Each source also has an optional case-sensitive `Exclude regex`; use inline
 flags such as `(?i)` for case-insensitive matching. Matching connection names
 are removed before the menu, Auto group, and sing-box configuration are built.
@@ -98,8 +101,11 @@ No geopolitical rule database is bundled or silently injected.
 The privileged helper always owns the TUN inbound, optional loopback-only SOCKS5
 listener, warning log, cache, and loopback-only Clash API. Imported local
 listeners, services, filesystem paths, system-managed endpoints, and exposed control APIs are rejected or replaced.
-Safe userspace outbounds and endpoints supported by the bundled core are kept;
-the app does not maintain a protocol allowlist. The resulting candidate must
+Safe userspace outbounds and endpoints supported by the bundled core are kept.
+Imported DNS, route, outbound, endpoint, TLS, and transport sections must use
+the explicit safe fields supported by this SBM build. Capabilities that can
+launch another process, create a listener, select a system-managed endpoint, or
+read or write arbitrary local paths are rejected. The resulting candidate must
 pass the bundled `sing-box check` before it can be activated. A failed runtime
 activation rolls back to the previous working configuration.
 
@@ -145,6 +151,10 @@ make dmg
 ```
 
 The distributable image is written to `dist/`.
+The release pins sing-box through `Core.lock`. Maintainers update it explicitly
+with `scripts/update-core.swift stable`; prerelease versions are rejected, and
+the official archive, upstream binary, signed bundled binary, and embedded
+helper digest are checked as separate build stages.
 
 ## Install and test
 
@@ -193,7 +203,8 @@ update.
 
 ## Current status
 
-Version 1.1.9 is not an independently audited security product.
+Version 1.1.10 bundles the pinned stable sing-box 1.13.16 core and is not an
+independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
 REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are
 covered by the test suite, including custom request headers, redirects,

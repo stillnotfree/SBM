@@ -112,6 +112,7 @@ final class AppModel {
   var latencyIntervalMinutes = 10
   private var subscriptionRefreshTask: Task<Void, Never>?
   private var latencyRefreshTask: Task<Void, Never>?
+  private var profileStoreLoadError: String?
   private var helperRepairTask: Task<Void, Never>?
   private var refreshGeneration = 0
   private var refreshInProgress = false
@@ -144,6 +145,7 @@ final class AppModel {
   }
 
   private let helperService: any HelperServiceManaging
+  private let subscriptionManager: SubscriptionManager
   private let loginItemService = SMAppService.mainApp
 
   private func setSubscriptionStatus(
@@ -154,9 +156,19 @@ final class AppModel {
     subscriptionStatusLevel = level
   }
 
-  init(helperService: any HelperServiceManaging = SystemHelperService()) {
+  init(
+    helperService: any HelperServiceManaging = SystemHelperService(),
+    subscriptionManager: SubscriptionManager = SubscriptionManager()
+  ) {
     self.helperService = helperService
-    let stored = ProfileStore.loadProfileLibrary() ?? .empty
+    self.subscriptionManager = subscriptionManager
+    let stored: ProfileLibrary
+    do {
+      stored = try ProfileStore.loadProfileLibrary() ?? .empty
+    } catch {
+      stored = .empty
+      profileStoreLoadError = error.localizedDescription
+    }
     profiles = stored.profiles
     selectedProfileID = stored.selectedProfileID
     localSOCKSEnabled = stored.localSOCKSEnabled
@@ -167,6 +179,9 @@ final class AppModel {
     }
     loadSelectedProfileEditor()
     updateNodes()
+    if let profileStoreLoadError {
+      lastError = profileStoreLoadError
+    }
     guard isInstalledInApplications else {
       helperStatus = "Move the app to Applications"
       lastError =
@@ -176,7 +191,6 @@ final class AppModel {
     enableLaunchAtLoginIfNeeded()
     refreshRegistrationStatus()
     bootstrapHelper()
-    startLatencyRefreshLoop()
     if !profiles.isEmpty {
       profileAvailable = selectedProfile?.payload != nil
       startSubscriptionRefreshLoop()
@@ -244,6 +258,7 @@ final class AppModel {
       "Profile: \(selectedProfileName)",
       "Profile type: \(profileKind)",
       "Profile updated: \(updated)",
+      "Profile library: \(profileStoreLoadError == nil ? "available" : "unavailable")",
       "Subscription sources: \(selectedProfile?.sources.count ?? 0)",
       "Selected server: \(selectedNodeID.rawValue)",
       "Local SOCKS5: \(localSOCKSEnabled ? "127.0.0.1:\(localSOCKSPort)" : "disabled")",
@@ -253,8 +268,11 @@ final class AppModel {
     lines.append("")
     lines.append(lastError.map { "Last error: \($0)" } ?? "No current error.")
     lines.append("")
-    lines.append("Subscription URLs are omitted. Review error text before sharing this report.")
-    return lines.joined(separator: "\n")
+    lines.append("Subscription URLs and known credentials are redacted.")
+    return SecretRedactor.redact(
+      lines.joined(separator: "\n"),
+      secrets: DiagnosticSecrets.collect(from: profiles)
+    )
   }
 
   func refresh() {
@@ -431,9 +449,22 @@ final class AppModel {
       }
       do {
         if helperEnabled {
+          if let current = try? await Task.detached(operation: {
+            try HelperClient.send(.status, receiveTimeoutSeconds: 5)
+          }).value,
+            current.helperVersion == HelperConstants.helperVersion,
+            current.helperRevision == HelperConstants.helperRevision
+          {
+            apply(current)
+            helperReachable = true
+            helperStatus = "Helper ready"
+            lastError = current.success ? nil : current.message
+            connectAutomaticallyIfNeeded()
+            return
+          }
           helperStatus = "Stopping previous helper…"
           _ = try? await Task.detached {
-            try HelperClient.send(.stop)
+            try HelperClient.send(.stop, receiveTimeoutSeconds: 5)
           }.value
         }
         helperStatus = "Replacing background helper…"
@@ -546,6 +577,7 @@ final class AppModel {
       defer {
         latencyTestInProgress = false
         endBusyOperation()
+        scheduleNextLatencyRefresh()
       }
       do {
         let response = try await Task.detached {
@@ -573,18 +605,29 @@ final class AppModel {
   }
 
   func refreshLatencyIfNeeded() {
-    guard coreRunning, !isBusy, !latencyTestInProgress else { return }
+    guard coreRunning else {
+      latencyRefreshTask?.cancel()
+      latencyRefreshTask = nil
+      return
+    }
+    guard !isBusy, !latencyTestInProgress else {
+      scheduleLatencyRefresh(after: 60)
+      return
+    }
+    let interval = TimeInterval(latencyIntervalMinutes) * 60
     if let lastLatencyTestAt,
-      Date().timeIntervalSince(lastLatencyTestAt) < TimeInterval(latencyIntervalMinutes * 60)
+      Date().timeIntervalSince(lastLatencyTestAt) < interval
     {
+      scheduleNextLatencyRefresh()
       return
     }
     testLatency()
   }
 
   func setLatencyIntervalMinutes(_ value: Int) {
-    latencyIntervalMinutes = min(max(value, 1), 9_999)
+    latencyIntervalMinutes = max(value, 1)
     try? persistProfileLibrary()
+    scheduleNextLatencyRefresh()
   }
 
   func saveAndSyncSubscription() {
@@ -672,10 +715,36 @@ final class AppModel {
     loadSelectedSourceEditor()
   }
 
-  func resetSubscriptionHeaders() {
-    subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
-    subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
-    subscriptionHWID = UUID().uuidString
+  func resetSubscriptionRequestPreset() {
+    let reset = SubscriptionHeaders(
+      userAgent: subscriptionUserAgent,
+      deviceOS: subscriptionDeviceOS,
+      hardwareID: subscriptionHWID
+    ).resettingRequestPreset()
+    subscriptionUserAgent = reset.userAgent
+    subscriptionDeviceOS = reset.deviceOS
+    subscriptionHWID = reset.hardwareID
+  }
+
+  func regenerateSubscriptionHWID() {
+    guard let selectedProfileID, let selectedSourceID,
+      let profileIndex = profiles.firstIndex(where: { $0.id == selectedProfileID }),
+      let sourceIndex = profiles[profileIndex].sources.firstIndex(where: {
+        $0.id == selectedSourceID
+      })
+    else { return }
+    let previous = profiles[profileIndex].sources[sourceIndex].headers.hardwareID
+    let replacement = UUID().uuidString
+    profiles[profileIndex].sources[sourceIndex].headers.hardwareID = replacement
+    subscriptionHWID = replacement
+    do {
+      try persistProfileLibrary()
+      lastError = nil
+    } catch {
+      profiles[profileIndex].sources[sourceIndex].headers.hardwareID = previous
+      subscriptionHWID = previous
+      lastError = error.localizedDescription
+    }
   }
 
   func applyLocalSOCKSSettings() {
@@ -998,11 +1067,12 @@ final class AppModel {
     }
     isSyncing = true
     setSubscriptionStatus("Syncing…")
+    let sourceToSync = profiles[profileIndex].sources[sourceIndex]
     Task {
       defer { isSyncing = false }
       let previousProfiles = profiles
       do {
-        let result = try await SubscriptionClient.fetch(from: value, headers: headers)
+        let result = try await subscriptionManager.synchronize(sourceToSync)
         let fetched = result.profile
         guard case .compatibility = fetched else {
           throw SubscriptionFailure.nativeProfileCannotBeMerged
@@ -1075,14 +1145,23 @@ final class AppModel {
     }
   }
 
-  private func startLatencyRefreshLoop() {
+  private func scheduleNextLatencyRefresh() {
+    latencyRefreshTask?.cancel()
+    guard coreRunning else {
+      latencyRefreshTask = nil
+      return
+    }
+    let interval = TimeInterval(latencyIntervalMinutes) * 60
+    let elapsed = lastLatencyTestAt.map { Date().timeIntervalSince($0) } ?? 0
+    scheduleLatencyRefresh(after: max(1, interval - elapsed))
+  }
+
+  private func scheduleLatencyRefresh(after seconds: TimeInterval) {
     latencyRefreshTask?.cancel()
     latencyRefreshTask = Task { [weak self] in
-      while !Task.isCancelled {
-        try? await Task.sleep(for: .seconds(60))
-        guard !Task.isCancelled else { return }
-        self?.refreshLatencyIfNeeded()
-      }
+      try? await Task.sleep(for: .seconds(seconds))
+      guard !Task.isCancelled else { return }
+      self?.refreshLatencyIfNeeded()
     }
   }
 
@@ -1122,10 +1201,7 @@ final class AppModel {
             let source = profiles[profileIndex].sources[sourceIndex]
             guard SubscriptionClient.isRemoteSource(source.value) else { continue }
             do {
-              let result = try await SubscriptionClient.fetch(
-                from: source.value,
-                headers: source.headers
-              )
+              let result = try await subscriptionManager.synchronize(source)
               let fetched = result.profile
               guard case .compatibility = fetched else {
                 throw SubscriptionFailure.nativeProfileCannotBeMerged
@@ -1219,6 +1295,9 @@ final class AppModel {
   }
 
   private func persistProfileLibrary() throws {
+    if let profileStoreLoadError {
+      throw AppModelFailure.profileLibraryUnavailable(profileStoreLoadError)
+    }
     try ProfileStore.saveProfileLibrary(
       ProfileLibrary(
         profiles: profiles,
@@ -1346,6 +1425,11 @@ final class AppModel {
         try? await Task.sleep(for: .milliseconds(250))
         self?.refreshLatencyIfNeeded()
       }
+    } else if response.coreRunning {
+      scheduleNextLatencyRefresh()
+    } else {
+      latencyRefreshTask?.cancel()
+      latencyRefreshTask = nil
     }
   }
 
@@ -1503,6 +1587,7 @@ private enum AppModelFailure: LocalizedError {
   case helperRequiredForValidation
   case helperRevisionMismatch
   case coreStopFailed(String)
+  case profileLibraryUnavailable(String)
 
   var errorDescription: String? {
     switch self {
@@ -1516,6 +1601,7 @@ private enum AppModelFailure: LocalizedError {
       "macOS is still running an older background helper. Approve the updated item in System Settings, then repair it again."
     case .coreStopFailed(let message):
       "The VPN core did not stop: \(message)"
+    case .profileLibraryUnavailable(let message): message
     }
   }
 }

@@ -8,6 +8,7 @@ enum HelperClientError: LocalizedError {
   case socketPathTooLong
   case connection(Int32)
   case write(Int32)
+  case requestTooLarge
   case emptyResponse
   case invalidResponse
   case timeout
@@ -19,6 +20,7 @@ enum HelperClientError: LocalizedError {
     case .socketPathTooLong: "Helper socket path is too long."
     case .connection(let code): "Unable to reach helper (errno \(code))."
     case .write(let code): "Unable to send helper request (errno \(code))."
+    case .requestTooLarge: "The helper request is too large."
     case .emptyResponse: "Helper returned an empty response."
     case .invalidResponse: "Helper returned an invalid response."
     case .timeout: "The background helper did not respond in time."
@@ -80,17 +82,25 @@ enum HelperClient {
     let addressLength = socklen_t(
       MemoryLayout<sa_family_t>.size + pathBytes.count
     )
-    let connectResult = withUnsafePointer(to: &address) { pointer in
-      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        connect(descriptor, $0, addressLength)
+    guard addressLength <= UInt8.max else { throw HelperClientError.socketPathTooLong }
+    address.sun_len = UInt8(addressLength)
+    var connectResult: Int32
+    repeat {
+      connectResult = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          connect(descriptor, $0, addressLength)
+        }
       }
-    }
+    } while connectResult != 0 && errno == EINTR
     guard connectResult == 0 else {
       throw HelperClientError.connection(errno)
     }
 
     var payload = try JSONEncoder().encode(request)
     payload.append(0x0A)
+    guard payload.count < 2 * 1_048_576 else {
+      throw HelperClientError.requestTooLarge
+    }
     var offset = 0
     try payload.withUnsafeBytes { bytes in
       while offset < bytes.count {
@@ -99,6 +109,10 @@ enum HelperClient {
           bytes.baseAddress?.advanced(by: offset),
           bytes.count - offset
         )
+        if written < 0, errno == EINTR { continue }
+        if written < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+          throw HelperClientError.timeout
+        }
         guard written > 0 else { throw HelperClientError.write(errno) }
         offset += written
       }
@@ -110,6 +124,7 @@ enum HelperClient {
     while response.count < maximumResponseSize {
       let count = Darwin.read(descriptor, &buffer, buffer.count)
       if count < 0 {
+        if errno == EINTR { continue }
         if errno == EAGAIN || errno == EWOULDBLOCK {
           throw HelperClientError.timeout
         }
@@ -133,6 +148,17 @@ enum HelperClient {
     _ descriptor: Int32,
     receiveTimeoutSeconds: Int
   ) throws {
+    var noSigPipe: Int32 = 1
+    let noSigPipeResult = setsockopt(
+      descriptor,
+      SOL_SOCKET,
+      SO_NOSIGPIPE,
+      &noSigPipe,
+      socklen_t(MemoryLayout<Int32>.size)
+    )
+    guard noSigPipeResult == 0 else {
+      throw HelperClientError.socketOption(errno)
+    }
     var receiveTimeout = timeval(
       tv_sec: max(1, receiveTimeoutSeconds),
       tv_usec: 0

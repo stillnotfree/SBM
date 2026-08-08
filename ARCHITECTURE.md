@@ -34,7 +34,9 @@ sing-box (root, TUN)
 The client uses a root-owned Unix socket. Requests are length-bounded JSON
 messages with an enum action; there is no command string, path, environment, or
 arbitrary argument field. The helper authenticates the peer UID and accepts
-requests only from root or members of the local `admin` group.
+requests only from root or members of the local `admin` group. Both sides apply
+send/receive timeouts, bounded framing, `SO_NOSIGPIPE`, partial-write handling,
+and `EINTR` recovery.
 
 The helper verifies the exact ad-hoc-signed bundled core by SHA-256, copies it
 atomically to a root-owned executable with mode `0500`, and never executes the
@@ -43,6 +45,13 @@ configuration with that protected core before atomically replacing the active
 configuration. Runtime state, client secrets, the local API token, the protected
 core, and warning logs are root-only under
 `/Library/Application Support/SBM`.
+
+`Core.lock` pins the stable upstream version, archive digest, and unsigned
+binary digest. Packaging verifies those inputs, ad-hoc signs one exact core,
+generates `CoreBuildInfo.swift` from its signed digest, compiles the helper, and
+bundles that same file without signing it again. Critical root files are staged
+in the protected directory, synchronized, and replaced with same-directory
+`rename`; a verified configuration backup is retained for runtime rollback.
 
 Disconnect is persisted before the process is terminated. On every helper
 bootstrap, a disconnected state also removes a verified leftover core process
@@ -53,21 +62,30 @@ shutdown request; launchd starts it again on the next local request.
 
 Imported profiles are treated as untrusted input even when they arrive over
 HTTPS. The composer ignores user-supplied inbounds, logging, and experimental
-APIs; rejects local filesystem paths, listeners, services, and system-managed
+APIs; applies per-section safe-field allowlists; rejects local filesystem paths,
+external-process capabilities, listeners, services, and system-managed
 endpoints; bounds profile and selector sizes; and then validates the composed
 candidate with the exact bundled core. Runtime activation failure restores the
 previous configuration and process.
+
+The user profile store is never interpreted as an empty library merely because
+it is malformed or has unsafe permissions. Invalid JSON is preserved unchanged
+and reported; saving remains blocked until the storage problem is resolved.
+Clipboard diagnostics redact subscription URLs, HWIDs, proxy credentials, and
+known native-profile secrets, while raw sing-box validation output is not sent
+across the helper boundary.
 
 Compact subscriptions may contain either or both supported URI protocols.
 Individual `vless://`, `hysteria2://`, and `hy2://` links use the same parser
 and validation path, but are stored locally and never treated as refreshable
 remote sources.
 
-The composer does not use a protocol allowlist. Safe userspace outbounds and
-endpoints accepted by the bundled core can pass through, while capabilities
-that would cross the privilege boundary are rejected. In Rule mode the profile
-owns DNS, routing, and remote rule-sets. Direct and Global are temporary managed
-overrides, not edits to the imported source.
+The composer does not select protocols by brand name. Safe userspace outbounds
+and endpoints accepted by both SBM's section allowlists and the bundled core
+can pass through, while capabilities that would cross the privilege boundary
+are rejected. In Rule mode the profile owns DNS, routing, and remote rule-sets.
+Direct and Global are temporary managed overrides, not edits to the imported
+source.
 
 ## Installation model
 

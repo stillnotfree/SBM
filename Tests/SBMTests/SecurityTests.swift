@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SBMShared
 import Testing
@@ -20,13 +21,114 @@ import Testing
   #expect(decoded.latencyIntervalMinutes == 10)
 }
 
-@Test func profileLibraryClampsLatencyInterval() throws {
+@Test func profileLibraryRequiresPositiveLatencyIntervalWithoutSmallUpperCap() throws {
   let library = ProfileLibrary(
     profiles: [],
     selectedProfileID: nil,
-    latencyIntervalMinutes: 10_000
+    latencyIntervalMinutes: 100_000
   )
-  #expect(library.latencyIntervalMinutes == 9_999)
+  #expect(library.latencyIntervalMinutes == 100_000)
+}
+
+@Test func resettingRequestPresetPreservesHWID() {
+  let original = SubscriptionHeaders(
+    userAgent: "Custom/1.0",
+    deviceOS: "CustomOS",
+    hardwareID: "stable-device-id"
+  )
+
+  let reset = original.resettingRequestPreset()
+
+  #expect(reset.userAgent == SubscriptionHeaders.defaultUserAgent)
+  #expect(reset.deviceOS == SubscriptionHeaders.defaultDeviceOS)
+  #expect(reset.hardwareID == "stable-device-id")
+}
+
+@Test func profileStorePreservesMalformedLibraryAndReportsFailure() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMInvalidStoreTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: directory,
+    withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700]
+  )
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o700],
+    ofItemAtPath: directory.path
+  )
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let url = directory.appendingPathComponent("profiles.json")
+  let malformed = Data("{not-json".utf8)
+  FileManager.default.createFile(
+    atPath: url.path,
+    contents: malformed,
+    attributes: [.posixPermissions: 0o600]
+  )
+
+  #expect(throws: ProfileStoreFailure.self) {
+    try ProfileStore.loadProfileLibrary(from: url, preserveInvalidCopy: true)
+  }
+  #expect(try Data(contentsOf: url) == malformed)
+  let preserved = try FileManager.default.contentsOfDirectory(
+    at: directory,
+    includingPropertiesForKeys: nil
+  ).filter { $0.lastPathComponent.hasPrefix("profiles.invalid-") }
+  #expect(preserved.count == 1)
+  #expect(try Data(contentsOf: preserved[0]) == malformed)
+}
+
+@Test func diagnosticRedactionRemovesKnownAndPatternSecrets() throws {
+  let sourceURL = "https://user:subscription-token@example.com/private"
+  let profile = try SubscriptionClient.parsePayload(
+    "hysteria2://proxy-password@vpn.example.com:443/?sni=vpn.example.com#Hysteria2"
+  )
+  let profiles = [
+    ManagedProfile(
+      name: "Private",
+      sources: [
+        ManagedSource(
+          name: "Provider",
+          value: sourceURL,
+          headers: SubscriptionHeaders(hardwareID: "private-hwid-value"),
+          payload: profile
+        )
+      ],
+      payload: profile
+    )
+  ]
+  let report = SecretRedactor.redact(
+    "URL \(sourceURL) HWID private-hwid-value password proxy-password Authorization: Bearer auth-token",
+    secrets: DiagnosticSecrets.collect(from: profiles)
+  )
+
+  for secret in [
+    sourceURL, "subscription-token", "private-hwid-value", "proxy-password", "auth-token",
+  ] {
+    #expect(!report.contains(secret))
+  }
+}
+
+@Test func pinnedCoreMatchesGeneratedBuildInformation() throws {
+  let core = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    .appendingPathComponent(".vendor/sing-box")
+  let digest = SHA256.hash(data: try Data(contentsOf: core))
+    .map { String(format: "%02x", $0) }.joined()
+  #expect(digest == CoreBuildInfo.signedSHA256)
+
+  let process = Process()
+  let output = Pipe()
+  process.executableURL = core
+  process.arguments = ["version"]
+  process.standardOutput = output
+  process.standardError = output
+  try process.run()
+  process.waitUntilExit()
+  let versionOutput = String(
+    decoding: output.fileHandleForReading.readDataToEndOfFile(),
+    as: UTF8.self
+  )
+  #expect(process.terminationStatus == 0)
+  #expect(versionOutput.hasPrefix("sing-box version \(CoreBuildInfo.version)\n"))
 }
 
 @Test func profileStoreWritesCredentialsWithUserOnlyPermissions() throws {
@@ -247,7 +349,7 @@ import Testing
         "tag": "proxy",
         "server": "203.0.113.10",
         "server_port": 1080,
-        "metadata": nested,
+        "headers": ["X-Test": nested],
       ]
     ]
   ])
@@ -267,7 +369,7 @@ import Testing
         "tag": "proxy",
         "server": "203.0.113.10",
         "server_port": 1080,
-        "metadata": Array(repeating: 0, count: 5_000),
+        "headers": ["X-Test": Array(repeating: "value", count: 5_000)],
       ]
     ]
   ])
