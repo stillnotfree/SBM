@@ -17,17 +17,7 @@ struct NativeConfigurationComposer {
 
     try validateTopLevel(source)
     try validateTopLevelTypes(source)
-    var importedValueBudget = ImportedValueBudget()
-    for key in ["dns", "outbounds", "endpoints", "route"] {
-      if let value = source[key] {
-        try validateImportedValue(
-          value,
-          path: "profile.\(key)",
-          depth: 0,
-          budget: &importedValueBudget
-        )
-      }
-    }
+    try validateImportedSections(source)
 
     var outbounds = source["outbounds"] as? [[String: Any]] ?? []
     let endpoints = source["endpoints"] as? [[String: Any]] ?? []
@@ -259,99 +249,296 @@ struct NativeConfigurationComposer {
     }
   }
 
-  private func validateImportedValue(
-    _ value: Any,
-    path: String,
-    depth: Int,
-    budget: inout ImportedValueBudget,
-    plainPathAllowed: Bool = false
-  ) throws {
-    guard depth <= ImportedValueBudget.maximumDepth else {
-      throw CoreFailure.invalidProfile(
-        "The imported profile exceeds the maximum nesting depth.")
-    }
-    budget.nodeCount += 1
-    guard budget.nodeCount <= ImportedValueBudget.maximumNodeCount else {
-      throw CoreFailure.invalidProfile(
-        "The imported profile contains too many values.")
+  private func validateImportedSections(_ source: [String: Any]) throws {
+    if let dns = source["dns"] as? [String: Any] {
+      try requireAllowedKeys(dns, allowed: Self.safeDNSKeys, path: "profile.dns")
+      guard dns["servers"] == nil || dns["servers"] is [[String: Any]],
+        dns["rules"] == nil || dns["rules"] is [[String: Any]]
+      else {
+        throw CoreFailure.invalidProfile("The imported DNS servers and rules must be arrays.")
+      }
+      for (index, server) in (dns["servers"] as? [[String: Any]] ?? []).enumerated() {
+        try validateDNSServer(server, path: "profile.dns.servers[\(index)]")
+      }
+      if let fakeIP = dns["fakeip"] as? [String: Any] {
+        try requireAllowedKeys(
+          fakeIP,
+          allowed: ["enabled", "inet4_range", "inet6_range"],
+          path: "profile.dns.fakeip"
+        )
+      } else if dns["fakeip"] != nil {
+        throw CoreFailure.invalidProfile("The imported DNS fakeip section must be an object.")
+      }
     }
 
-    if let object = value as? [String: Any] {
-      guard object.count <= ImportedValueBudget.maximumCollectionCount else {
-        throw CoreFailure.invalidProfile(
-          "The imported object at \(path) contains too many fields.")
+    for (index, outbound) in (source["outbounds"] as? [[String: Any]] ?? []).enumerated() {
+      try validateOutbound(outbound, path: "profile.outbounds[\(index)]")
+    }
+    for (index, endpoint) in (source["endpoints"] as? [[String: Any]] ?? []).enumerated() {
+      try validateEndpoint(endpoint, path: "profile.endpoints[\(index)]")
+    }
+    if let route = source["route"] as? [String: Any] {
+      try requireAllowedKeys(route, allowed: Self.safeRouteKeys, path: "profile.route")
+      guard route["rules"] == nil || route["rules"] is [[String: Any]] else {
+        throw CoreFailure.invalidProfile("The native profile route.rules field must be an array.")
       }
-      for (key, child) in object {
-        guard key.utf8.count <= ImportedValueBudget.maximumKeyBytes else {
-          throw CoreFailure.invalidProfile(
-            "The imported object at \(path) contains an oversized field name.")
-        }
-        let normalized = key.lowercased()
-        let filesystemField =
-          normalized.hasSuffix("_path")
-          || normalized == "state_directory"
-          || normalized == "data_directory"
-          || normalized.hasSuffix("_directory")
-        let dnsHTTPPathAllowed =
-          normalized == "path"
-          && isSafeDNSHTTPPath(child, in: object, at: path)
-        let plainPathIsUnsafe =
-          normalized == "path" && !plainPathAllowed && !dnsHTTPPathAllowed
-        if filesystemField || plainPathIsUnsafe
-          || [
-            "command", "commands", "script", "listen", "listen_port",
-            "certificate_provider", "certificate_providers", "acme",
-            "extra_args", "torrc", "executable", "binary",
-          ].contains(normalized)
-        {
-          throw CoreFailure.invalidProfile(
-            "The imported field \(path).\(key) is not allowed in a privileged profile.")
-        }
-        if ["system", "system_interface"].contains(normalized),
-          let enabled = child as? Bool, enabled
-        {
-          throw CoreFailure.invalidProfile(
-            "System-managed endpoints are not allowed in a privileged profile.")
-        }
-        if normalized == "relay_server_port", let port = child as? NSNumber,
-          port.intValue != 0
-        {
-          throw CoreFailure.invalidProfile(
-            "Privileged relay listeners are not allowed in imported profiles.")
-        }
-        if normalized == "ssh_server" {
-          throw CoreFailure.invalidProfile(
-            "Embedded SSH servers are not allowed in imported profiles.")
-        }
-        try validateImportedValue(
-          child,
-          path: "\(path).\(key)",
-          depth: depth + 1,
-          budget: &budget,
-          plainPathAllowed: normalized == "transport"
-        )
-      }
-    } else if let array = value as? [Any] {
-      guard array.count <= ImportedValueBudget.maximumCollectionCount else {
-        throw CoreFailure.invalidProfile(
-          "The imported array at \(path) contains too many values.")
-      }
-      for (index, child) in array.enumerated() {
-        try validateImportedValue(
-          child,
-          path: "\(path)[\(index)]",
-          depth: depth + 1,
-          budget: &budget,
-          plainPathAllowed: plainPathAllowed
-        )
-      }
-    } else if let string = value as? String {
-      guard string.utf8.count <= ImportedValueBudget.maximumStringBytes else {
-        throw CoreFailure.invalidProfile(
-          "The imported string at \(path) is too large.")
+      try validateOptionalDomainResolver(
+        route["default_domain_resolver"], path: "profile.route.default_domain_resolver")
+    }
+
+    var budget = ImportedValueBudget()
+    for key in ["dns", "outbounds", "endpoints", "route"] {
+      if let value = source[key] {
+        try validateBoundedValue(value, path: "profile.\(key)", depth: 0, budget: &budget)
       }
     }
   }
+
+  private func validateDNSServer(_ server: [String: Any], path: String) throws {
+    let type = (server["type"] as? String) ?? ""
+    var allowed = Self.safeDialKeys.union(Self.safeDNSServerKeys)
+    if ["https", "h3"].contains(type) { allowed.insert("path") }
+    try requireAllowedKeys(server, allowed: allowed, path: path)
+    if let httpPath = server["path"] as? String {
+      guard httpPath.utf8.count <= 2_048, httpPath.hasPrefix("/"),
+        !httpPath.contains("\\"),
+        !httpPath.unicodeScalars.contains(where: {
+          CharacterSet.controlCharacters.contains($0)
+        })
+      else {
+        throw CoreFailure.invalidProfile("The imported DNS HTTP path is invalid.")
+      }
+    }
+    try validateOptionalOutboundTLS(server["tls"], path: "\(path).tls")
+    try validateOptionalDomainResolver(server["domain_resolver"], path: "\(path).domain_resolver")
+  }
+
+  private func validateOutbound(_ outbound: [String: Any], path: String) throws {
+    guard let type = outbound["type"] as? String, !type.isEmpty else {
+      throw CoreFailure.invalidProfile("Every imported outbound must have a type.")
+    }
+    guard type != "tor" else {
+      throw CoreFailure.invalidProfile(
+        "Tor outbounds may execute and manage an external process and are not accepted by the privileged helper."
+      )
+    }
+    try requireAllowedKeys(outbound, allowed: Self.safeOutboundKeys, path: path)
+    try validateOptionalOutboundTLS(outbound["tls"], path: "\(path).tls")
+    try validateOptionalDomainResolver(outbound["domain_resolver"], path: "\(path).domain_resolver")
+
+    if let transport = outbound["transport"] as? [String: Any] {
+      try requireAllowedKeys(transport, allowed: Self.safeTransportKeys, path: "\(path).transport")
+    } else if outbound["transport"] != nil {
+      throw CoreFailure.invalidProfile("The imported outbound transport must be an object.")
+    }
+    if let multiplex = outbound["multiplex"] as? [String: Any] {
+      try requireAllowedKeys(
+        multiplex, allowed: Self.safeMultiplexKeys, path: "\(path).multiplex")
+      if let brutal = multiplex["brutal"] as? [String: Any] {
+        try requireAllowedKeys(
+          brutal,
+          allowed: ["enabled", "up_mbps", "down_mbps"],
+          path: "\(path).multiplex.brutal"
+        )
+      }
+    } else if outbound["multiplex"] != nil {
+      throw CoreFailure.invalidProfile("The imported outbound multiplex section must be an object.")
+    }
+    if let udpOverTCP = outbound["udp_over_tcp"], !(udpOverTCP is Bool) {
+      guard let options = udpOverTCP as? [String: Any] else {
+        throw CoreFailure.invalidProfile("The imported udp_over_tcp option is invalid.")
+      }
+      try requireAllowedKeys(
+        options, allowed: ["enabled", "version"], path: "\(path).udp_over_tcp")
+    }
+    if let obfs = outbound["obfs"] as? [String: Any] {
+      try requireAllowedKeys(obfs, allowed: ["type", "password"], path: "\(path).obfs")
+    }
+  }
+
+  private func validateEndpoint(_ endpoint: [String: Any], path: String) throws {
+    guard (endpoint["type"] as? String) == "wireguard" else {
+      throw CoreFailure.invalidProfile(
+        "Only userspace WireGuard endpoints are accepted by the privileged helper."
+      )
+    }
+    try requireAllowedKeys(
+      endpoint,
+      allowed: Self.safeDialKeys.union(Self.safeWireGuardEndpointKeys),
+      path: path
+    )
+    guard (endpoint["system"] as? Bool) != true else {
+      throw CoreFailure.invalidProfile(
+        "System-managed endpoints are not allowed in a privileged profile.")
+    }
+    guard endpoint["peers"] == nil || endpoint["peers"] is [[String: Any]] else {
+      throw CoreFailure.invalidProfile("WireGuard endpoint peers must be an array.")
+    }
+    for (index, peer) in (endpoint["peers"] as? [[String: Any]] ?? []).enumerated() {
+      try requireAllowedKeys(
+        peer, allowed: Self.safeWireGuardPeerKeys, path: "\(path).peers[\(index)]")
+    }
+    try validateOptionalDomainResolver(endpoint["domain_resolver"], path: "\(path).domain_resolver")
+  }
+
+  private func validateOptionalOutboundTLS(_ value: Any?, path: String) throws {
+    guard let value else { return }
+    guard let tls = value as? [String: Any] else {
+      throw CoreFailure.invalidProfile("The imported TLS section at \(path) must be an object.")
+    }
+    try requireAllowedKeys(tls, allowed: Self.safeOutboundTLSKeys, path: path)
+    if let ech = tls["ech"] as? [String: Any] {
+      try requireAllowedKeys(ech, allowed: Self.safeECHKeys, path: "\(path).ech")
+    }
+    if let utls = tls["utls"] as? [String: Any] {
+      try requireAllowedKeys(utls, allowed: ["enabled", "fingerprint"], path: "\(path).utls")
+    }
+    if let reality = tls["reality"] as? [String: Any] {
+      try requireAllowedKeys(
+        reality, allowed: ["enabled", "public_key", "short_id"], path: "\(path).reality")
+    }
+  }
+
+  private func validateOptionalDomainResolver(_ value: Any?, path: String) throws {
+    guard let value, !(value is String) else { return }
+    guard let resolver = value as? [String: Any] else {
+      throw CoreFailure.invalidProfile("The domain resolver at \(path) is invalid.")
+    }
+    try requireAllowedKeys(
+      resolver,
+      allowed: ["server", "strategy", "disable_cache", "rewrite_ttl", "client_subnet"],
+      path: path
+    )
+  }
+
+  private func requireAllowedKeys(
+    _ object: [String: Any],
+    allowed: Set<String>,
+    path: String
+  ) throws {
+    let unsupported = Set(object.keys).subtracting(allowed)
+    guard unsupported.isEmpty else {
+      throw CoreFailure.invalidProfile(
+        "Unsupported fields at \(path): \(unsupported.sorted().joined(separator: ", "))."
+      )
+    }
+  }
+
+  private func validateBoundedValue(
+    _ value: Any,
+    path: String,
+    depth: Int,
+    budget: inout ImportedValueBudget
+  ) throws {
+    guard depth <= ImportedValueBudget.maximumDepth else {
+      throw CoreFailure.invalidProfile("The imported profile exceeds the maximum nesting depth.")
+    }
+    budget.nodeCount += 1
+    guard budget.nodeCount <= ImportedValueBudget.maximumNodeCount else {
+      throw CoreFailure.invalidProfile("The imported profile contains too many values.")
+    }
+    if let object = value as? [String: Any] {
+      guard object.count <= ImportedValueBudget.maximumCollectionCount else {
+        throw CoreFailure.invalidProfile("The imported object at \(path) contains too many fields.")
+      }
+      for (key, child) in object {
+        guard key.utf8.count <= ImportedValueBudget.maximumKeyBytes else {
+          throw CoreFailure.invalidProfile("The imported object at \(path) has an oversized key.")
+        }
+        try validateBoundedValue(
+          child, path: "\(path).\(key)", depth: depth + 1, budget: &budget)
+      }
+    } else if let array = value as? [Any] {
+      guard array.count <= ImportedValueBudget.maximumCollectionCount else {
+        throw CoreFailure.invalidProfile("The imported array at \(path) contains too many values.")
+      }
+      for (index, child) in array.enumerated() {
+        try validateBoundedValue(
+          child, path: "\(path)[\(index)]", depth: depth + 1, budget: &budget)
+      }
+    } else if let string = value as? String,
+      string.utf8.count > ImportedValueBudget.maximumStringBytes
+    {
+      throw CoreFailure.invalidProfile("The imported string at \(path) is too large.")
+    }
+  }
+
+  private static let safeDialKeys: Set<String> = [
+    "detour", "bind_interface", "inet4_bind_address", "inet6_bind_address",
+    "bind_address_no_port", "reuse_addr", "connect_timeout", "tcp_fast_open",
+    "tcp_multi_path", "disable_tcp_keep_alive", "tcp_keep_alive",
+    "tcp_keep_alive_interval", "udp_fragment", "domain_resolver", "network_strategy",
+    "network_type", "fallback_network_type", "fallback_delay", "domain_strategy",
+  ]
+
+  private static let safeDNSKeys: Set<String> = [
+    "servers", "rules", "final", "reverse_mapping", "strategy", "disable_cache",
+    "disable_expire", "independent_cache", "cache_capacity", "client_subnet", "fakeip",
+  ]
+
+  private static let safeDNSServerKeys: Set<String> = [
+    "type", "tag", "address", "address_resolver", "address_strategy",
+    "address_fallback_delay", "strategy", "client_subnet", "server", "server_port",
+    "tls", "method", "headers", "prefer_go", "interface", "predefined", "inet4_range",
+    "inet6_range",
+  ]
+
+  private static let safeRouteKeys: Set<String> = [
+    "rules", "rule_set", "final", "auto_detect_interface", "default_domain_resolver",
+    "default_network_strategy", "default_network_type", "default_fallback_network_type",
+    "default_fallback_delay", "find_process",
+  ]
+
+  private static let safeOutboundKeys = safeDialKeys.union(
+    Set([
+      "type", "tag", "server", "server_port", "server_ports", "hop_interval", "network",
+      "username", "password", "version", "method", "udp_over_tcp", "multiplex", "tls",
+      "transport", "path", "headers", "outbounds", "default", "interrupt_exist_connections",
+      "url", "interval", "tolerance", "idle_timeout", "uuid", "flow", "security",
+      "alter_id", "alterId", "global_padding", "authenticated_length", "packet_encoding",
+      "up", "up_mbps", "down", "down_mbps", "obfs", "auth", "auth_str",
+      "recv_window_conn", "recv_window", "disable_mtu_discovery", "brutal_debug",
+      "congestion_control", "udp_relay_mode", "udp_over_stream", "zero_rtt_handshake",
+      "heartbeat", "idle_session_check_interval", "idle_session_timeout", "min_idle_session",
+      "insecure_concurrency", "extra_headers", "stream_receive_window", "quic",
+      "quic_congestion_control", "quic_session_receive_window", "padding_scheme", "user",
+      "private_key", "private_key_passphrase", "host_key", "host_key_algorithms",
+      "client_version", "obfs_param", "protocol", "protocol_param",
+    ])
+  )
+
+  private static let safeTransportKeys: Set<String> = [
+    "type", "host", "path", "method", "headers", "idle_timeout", "ping_timeout",
+    "max_early_data", "early_data_header_name", "service_name", "permit_without_stream",
+  ]
+
+  private static let safeMultiplexKeys: Set<String> = [
+    "enabled", "protocol", "max_connections", "min_streams", "max_streams", "padding",
+    "brutal",
+  ]
+
+  private static let safeWireGuardEndpointKeys: Set<String> = [
+    "type", "tag", "system", "name", "mtu", "address", "private_key", "peers",
+    "udp_timeout", "workers",
+  ]
+
+  private static let safeWireGuardPeerKeys: Set<String> = [
+    "address", "port", "public_key", "pre_shared_key", "allowed_ips",
+    "persistent_keepalive_interval", "reserved",
+  ]
+
+  private static let safeOutboundTLSKeys: Set<String> = [
+    "enabled", "disable_sni", "server_name", "insecure", "alpn", "min_version",
+    "max_version", "cipher_suites", "curve_preferences", "certificate",
+    "certificate_public_key_sha256", "client_certificate", "client_key", "fragment",
+    "fragment_fallback_delay", "record_fragment", "kernel_tx", "kernel_rx", "ech", "utls",
+    "reality",
+  ]
+
+  private static let safeECHKeys: Set<String> = [
+    "enabled", "config", "query_server_name", "pq_signature_schemes_enabled",
+    "dynamic_record_sizing_disabled",
+  ]
 
   private func validateTags(_ items: [[String: Any]], kind: String) throws -> Set<String> {
     var tags = Set<String>()
@@ -424,25 +611,6 @@ struct NativeConfigurationComposer {
         )
       }
     }
-  }
-
-  private func isSafeDNSHTTPPath(
-    _ value: Any,
-    in object: [String: Any],
-    at path: String
-  ) -> Bool {
-    guard path.hasPrefix("profile.dns."),
-      let type = object["type"] as? String,
-      ["https", "h3"].contains(type),
-      let value = value as? String,
-      value.utf8.count <= 2_048,
-      value.hasPrefix("/"),
-      !value.contains("\\"),
-      !value.unicodeScalars.contains(where: {
-        CharacterSet.controlCharacters.contains($0)
-      })
-    else { return false }
-    return true
   }
 
   private func appendManagedAuto(

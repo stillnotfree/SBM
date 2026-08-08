@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -5,6 +6,7 @@ struct SettingsView: View {
   @Bindable var model: AppModel
   @State private var isImportingProfile = false
   @State private var isImportingRouting = false
+  @State private var isConfirmingHWIDRegeneration = false
 
   var body: some View {
     Form {
@@ -127,9 +129,17 @@ struct SettingsView: View {
             TextField("X-HWID", text: $model.subscriptionHWID)
               .textFieldStyle(.roundedBorder)
             HStack {
+              Button("Copy HWID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.subscriptionHWID, forType: .string)
+              }
+              .disabled(model.subscriptionHWID.isEmpty)
+              Button("Regenerate HWID…", role: .destructive) {
+                isConfirmingHWIDRegeneration = true
+              }
               Spacer()
-              Button("Reset Defaults") {
-                model.resetSubscriptionHeaders()
+              Button("Reset Request Preset") {
+                model.resetSubscriptionRequestPreset()
               }
             }
           }
@@ -252,6 +262,20 @@ struct SettingsView: View {
     .formStyle(.grouped)
     .frame(width: 620, height: 620)
     .padding()
+    .confirmationDialog(
+      "Regenerate subscription HWID?",
+      isPresented: $isConfirmingHWIDRegeneration,
+      titleVisibility: .visible
+    ) {
+      Button("Regenerate HWID", role: .destructive) {
+        model.regenerateSubscriptionHWID()
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(
+        "Changing HWID may make providers with a device limit treat this Mac as a new device."
+      )
+    }
     .fileImporter(
       isPresented: $isImportingProfile,
       allowedContentTypes: [.json],

@@ -8,6 +8,7 @@ import Testing
 private final class FakeHelperService: HelperServiceManaging {
   var registrationState: HelperRegistrationState
   var stateAfterRegistration: HelperRegistrationState
+  var stateAfterUnregistration: HelperRegistrationState
   private(set) var registrationCount = 0
   private(set) var unregistrationCount = 0
   private(set) var openedSettingsCount = 0
@@ -16,10 +17,12 @@ private final class FakeHelperService: HelperServiceManaging {
 
   init(
     registrationState: HelperRegistrationState,
-    stateAfterRegistration: HelperRegistrationState = .enabled
+    stateAfterRegistration: HelperRegistrationState = .enabled,
+    stateAfterUnregistration: HelperRegistrationState = .notRegistered
   ) {
     self.registrationState = registrationState
     self.stateAfterRegistration = stateAfterRegistration
+    self.stateAfterUnregistration = stateAfterUnregistration
   }
 
   func register() throws {
@@ -39,12 +42,32 @@ private final class FakeHelperService: HelperServiceManaging {
 
   func unregister() async throws {
     unregistrationCount += 1
-    registrationState = .notRegistered
+    registrationState = stateAfterUnregistration
   }
 
   func openSystemSettings() {
     openedSettingsCount += 1
   }
+}
+
+@Test @MainActor func helperLifecycleRegistersReplacementWhenOldStateRemainsEnabled() async throws {
+  let service = FakeHelperService(
+    registrationState: .enabled,
+    stateAfterUnregistration: .enabled
+  )
+
+  let response = try await HelperLifecycle.replace(
+    service: service,
+    registrationTimeout: .milliseconds(100),
+    startupTimeout: .milliseconds(100),
+    pollInterval: .milliseconds(5)
+  ) {
+    HelperResponse(success: true, coreRunning: false, message: "ready")
+  }
+
+  #expect(service.unregistrationCount == 1)
+  #expect(service.registrationCount == 1)
+  #expect(response.success)
 }
 
 private actor ProbeAttemptCounter {
@@ -171,7 +194,7 @@ private actor ProbeAttemptCounter {
   let response = try await HelperLifecycle.replace(
     service: service,
     registrationTimeout: .milliseconds(800),
-    startupTimeout: .milliseconds(5),
+    startupTimeout: .milliseconds(100),
     pollInterval: .milliseconds(5),
     waiting: { waitingCount += 1 },
     probe: {
@@ -202,6 +225,27 @@ private actor ProbeAttemptCounter {
     }
   }
 
+  #expect(service.unregistrationCount == 1)
+  #expect(service.registrationCount == 1)
+}
+
+@Test @MainActor func helperLifecycleReplacementUsesOneBoundedStartupWindow() async {
+  let service = FakeHelperService(registrationState: .enabled)
+  let clock = ContinuousClock()
+  let started = clock.now
+
+  await #expect(throws: HelperLifecycleFailure.self) {
+    _ = try await HelperLifecycle.replace(
+      service: service,
+      registrationTimeout: .milliseconds(100),
+      startupTimeout: .milliseconds(40),
+      pollInterval: .milliseconds(5)
+    ) {
+      throw CocoaError(.fileReadNoSuchFile)
+    }
+  }
+
+  #expect(started.duration(to: clock.now) < .seconds(1))
   #expect(service.unregistrationCount == 1)
   #expect(service.registrationCount == 1)
 }

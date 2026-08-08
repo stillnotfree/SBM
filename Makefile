@@ -2,13 +2,13 @@ SHELL := /bin/zsh
 
 APP_NAME := SBM
 BUNDLE_NAME := SBM
-APP_VERSION := 1.1.9
-CORE_VERSION := 1.13.14
-CORE_SHA256 := 73e8967b0fc08e17bce4263ca56ebc394822401a16497a1c4e02316c888202ab
-CORE_BINARY_SHA256 := 813d8effd02a19572a8d75aef29fc073101404ca535b2496be86f21827c7684d
-SIGNED_CORE_SHA256 := a74ca72d18f7fbf5756170927f257e0a27e51ba8a590d1a8388bffd2300cee4f
+APP_VERSION := 1.1.10
+include Core.lock
 CORE_ARCHIVE := .vendor/sing-box-$(CORE_VERSION)-darwin-arm64.tar.gz
+CORE_UPSTREAM_BINARY := .vendor/sing-box-upstream
 CORE_BINARY := .vendor/sing-box
+CORE_DIGEST_FILE := .vendor/sing-box.signed.sha256
+CORE_BUILD_INFO := Sources/SBMShared/CoreBuildInfo.swift
 BUILD_DIR := .build/arm64-apple-macosx/release
 DIST_DIR := dist
 APP_BUNDLE := $(DIST_DIR)/$(BUNDLE_NAME).app
@@ -17,25 +17,44 @@ ASSET_INFO_PLIST := $(DIST_DIR)/asset-info.plist
 
 .PHONY: build core app dmg clean
 
-build:
+build: core
 	swift build -c release --arch arm64
 
 core:
 	mkdir -p .vendor
-	@if [[ ! -x "$(CORE_BINARY)" ]]; then \
+	@if [[ ! -f "$(CORE_ARCHIVE)" ]] \
+		|| ! echo "$(CORE_ARCHIVE_SHA256)  $(CORE_ARCHIVE)" | shasum -a 256 --check --status; then \
 		curl --fail --location --retry 3 --output "$(CORE_ARCHIVE).tmp" \
 			"https://github.com/SagerNet/sing-box/releases/download/v$(CORE_VERSION)/sing-box-$(CORE_VERSION)-darwin-arm64.tar.gz"; \
-		echo "$(CORE_SHA256)  $(CORE_ARCHIVE).tmp" | shasum -a 256 --check; \
+		echo "$(CORE_ARCHIVE_SHA256)  $(CORE_ARCHIVE).tmp" | shasum -a 256 --check; \
 		mv "$(CORE_ARCHIVE).tmp" "$(CORE_ARCHIVE)"; \
+	fi
+	@if [[ ! -x "$(CORE_UPSTREAM_BINARY)" ]] \
+		|| ! echo "$(CORE_BINARY_SHA256)  $(CORE_UPSTREAM_BINARY)" | shasum -a 256 --check --status; then \
 		tar -xzf "$(CORE_ARCHIVE)" --strip-components 1 -C .vendor \
 			"sing-box-$(CORE_VERSION)-darwin-arm64/sing-box"; \
-		chmod 0755 "$(CORE_BINARY)"; \
+		mv .vendor/sing-box "$(CORE_UPSTREAM_BINARY)"; \
+		chmod 0755 "$(CORE_UPSTREAM_BINARY)"; \
 	fi
-	@echo "$(CORE_BINARY_SHA256)  $(CORE_BINARY)" | shasum -a 256 --check
+	@echo "$(CORE_BINARY_SHA256)  $(CORE_UPSTREAM_BINARY)" | shasum -a 256 --check
+	cp "$(CORE_UPSTREAM_BINARY)" "$(CORE_BINARY).tmp"
+	codesign --force --sign - --identifier io.nekohasekai.sing-box "$(CORE_BINARY).tmp"
+	mv "$(CORE_BINARY).tmp" "$(CORE_BINARY)"
+	@shasum -a 256 "$(CORE_BINARY)" | awk '{print $$1}' > "$(CORE_DIGEST_FILE).tmp"
+	@mv "$(CORE_DIGEST_FILE).tmp" "$(CORE_DIGEST_FILE)"
+	@{ \
+		echo 'public enum CoreBuildInfo {'; \
+		echo '  public static let version = "$(CORE_VERSION)"'; \
+		echo '  public static let signedSHA256 ='; \
+		echo '    "'"$$(cat "$(CORE_DIGEST_FILE)")"'"'; \
+		echo '}'; \
+	} > "$(CORE_BUILD_INFO).tmp"
+	@cmp -s "$(CORE_BUILD_INFO).tmp" "$(CORE_BUILD_INFO)" \
+		&& rm "$(CORE_BUILD_INFO).tmp" \
+		|| mv "$(CORE_BUILD_INFO).tmp" "$(CORE_BUILD_INFO)"
 	@"$(CORE_BINARY)" version | head -n 1
 
-app: build core
-	@grep -Fq '"$(SIGNED_CORE_SHA256)"' Sources/SBMHelper/CoreManager.swift
+app: build
 	rm -rf "$(APP_BUNDLE)"
 	mkdir -p "$(APP_BUNDLE)/Contents/MacOS"
 	mkdir -p "$(APP_BUNDLE)/Contents/Resources"
@@ -55,8 +74,7 @@ app: build core
 		--output-partial-info-plist "$(ASSET_INFO_PLIST)" \
 		Resources/AppIcon.icon
 	/usr/libexec/PlistBuddy -c "Merge $(ASSET_INFO_PLIST)" "$(APP_BUNDLE)/Contents/Info.plist"
-	codesign --force --sign - --identifier io.nekohasekai.sing-box "$(APP_BUNDLE)/Contents/Resources/sing-box"
-	@echo "$(SIGNED_CORE_SHA256)  $(APP_BUNDLE)/Contents/Resources/sing-box" | shasum -a 256 --check
+	@echo "$$(cat "$(CORE_DIGEST_FILE)")  $(APP_BUNDLE)/Contents/Resources/sing-box" | shasum -a 256 --check
 	codesign --force --sign - --identifier com.stillnotfree.sbm.helper "$(APP_BUNDLE)/Contents/Resources/SBMHelper"
 	codesign --force --sign - "$(APP_BUNDLE)"
 	codesign --verify --deep --strict --verbose=2 "$(APP_BUNDLE)"

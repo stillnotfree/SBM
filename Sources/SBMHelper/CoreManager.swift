@@ -50,19 +50,21 @@ final class CoreManager: @unchecked Sendable {
   private let supportDirectory = URL(
     fileURLWithPath: "/Library/Application Support/SBM", isDirectory: true)
   private lazy var configURL = supportDirectory.appendingPathComponent("config.json")
+  private lazy var configBackupURL = supportDirectory.appendingPathComponent("config.json.backup")
   private lazy var stateURL = supportDirectory.appendingPathComponent("state.json")
   private lazy var pidURL = supportDirectory.appendingPathComponent("sing-box.pid")
   private lazy var logURL = supportDirectory.appendingPathComponent("sing-box.log")
   private lazy var cacheURL = supportDirectory.appendingPathComponent("cache.db")
   private lazy var coreMetadataURL = supportDirectory.appendingPathComponent("core-metadata.json")
+  private lazy var coreBackupURL = supportDirectory.appendingPathComponent("sing-box.backup")
   private let resourcesDirectory: URL
   private let bundledCoreURL: URL
   private lazy var coreURL = supportDirectory.appendingPathComponent("sing-box")
-  private let expectedCoreSHA256 =
-    "a74ca72d18f7fbf5756170927f257e0a27e51ba8a590d1a8388bffd2300cee4f"
+  private let expectedCoreSHA256 = CoreBuildInfo.signedSHA256
 
   private var state = PersistentState()
   private var coreProcess: Process?
+  private var bootstrapFailure: String?
 
   init() {
     resourcesDirectory = Self.executableURL
@@ -88,22 +90,25 @@ final class CoreManager: @unchecked Sendable {
       if !state.desiredRunning {
         terminateCore()
       }
+      bootstrapFailure = nil
     } catch {
+      bootstrapFailure = error.localizedDescription
       FileHandle.standardError.write(
         Data("Core bootstrap failed: \(error.localizedDescription)\n".utf8))
     }
   }
 
   func status(message: String = "Helper connected") -> HelperResponse {
-    HelperResponse(
-      success: true,
+    let effectiveMessage = bootstrapFailure.map { "Core bootstrap failed: \($0)" } ?? message
+    return HelperResponse(
+      success: bootstrapFailure == nil,
       coreRunning: isCoreRunning,
       coreVersion: cachedCoreVersion(),
       mode: state.mode,
       selectedNode: state.selectedNode,
       activeProfileID: state.activeProfileID,
       nodes: state.nodes,
-      message: message
+      message: effectiveMessage
     )
   }
 
@@ -325,7 +330,12 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func prepareFilesystem() throws {
-    if !fileManager.fileExists(atPath: supportDirectory.path) {
+    if pathExistsWithoutFollowingSymlinks(supportDirectory) {
+      guard isRootOwnedDirectory(supportDirectory) else {
+        throw CoreFailure.coreIntegrity(
+          "The root support path has unsafe ownership or file type.")
+      }
+    } else {
       try fileManager.createDirectory(
         at: supportDirectory,
         withIntermediateDirectories: true,
@@ -336,6 +346,12 @@ final class CoreManager: @unchecked Sendable {
     guard isSecureRootDirectory(supportDirectory) else {
       throw CoreFailure.coreIntegrity(
         "The root support directory has unsafe ownership, permissions, or file type.")
+    }
+    for url in [
+      configURL, configBackupURL, stateURL, pidURL, logURL, cacheURL, coreMetadataURL,
+      coreBackupURL,
+    ] {
+      try requireSecureManagedFileIfPresent(url)
     }
     try installBundledCoreIfNeeded()
   }
@@ -359,16 +375,33 @@ final class CoreManager: @unchecked Sendable {
     guard bundledDigest == expectedCoreSHA256 else {
       throw CoreFailure.coreIntegrity("The bundled sing-box checksum does not match this build.")
     }
-    let candidate = supportDirectory.appendingPathComponent("sing-box.candidate")
-    try? fileManager.removeItem(at: candidate)
+    let candidate = supportDirectory.appendingPathComponent(
+      "sing-box.candidate-\(UUID().uuidString)")
     try fileManager.copyItem(at: bundledCoreURL, to: candidate)
+    defer { try? fileManager.removeItem(at: candidate) }
+    try takeRootOwnershipOfCopiedRegularFile(candidate)
     try secureExecutable(candidate)
     guard try sha256(of: candidate) == expectedCoreSHA256 else {
-      try? fileManager.removeItem(at: candidate)
       throw CoreFailure.coreIntegrity("The root-owned sing-box copy failed verification.")
     }
-    try? fileManager.removeItem(at: coreURL)
-    try fileManager.moveItem(at: candidate, to: coreURL)
+    guard readCoreVersion(at: candidate) == "sing-box version \(CoreBuildInfo.version)" else {
+      throw CoreFailure.coreIntegrity("The bundled sing-box version does not match this build.")
+    }
+    if pathExistsWithoutFollowingSymlinks(coreURL) {
+      guard isRegularFileWithoutFollowingSymlinks(coreURL) else {
+        throw CoreFailure.coreIntegrity(
+          "The existing managed executable has an unsafe file type.")
+      }
+      if isSecureRootRegularFile(coreURL) {
+        let backupCandidate = supportDirectory.appendingPathComponent(
+          "sing-box.backup-\(UUID().uuidString)")
+        try fileManager.copyItem(at: coreURL, to: backupCandidate)
+        defer { try? fileManager.removeItem(at: backupCandidate) }
+        try secureExecutable(backupCandidate)
+        try atomicReplace(backupCandidate, at: coreBackupURL)
+      }
+    }
+    try atomicReplace(candidate, at: coreURL, replacingLegacyCore: true)
     try secureExecutable(coreURL)
     try saveCoreMetadata(for: coreURL)
   }
@@ -384,7 +417,14 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func secureExecutable(_ url: URL) throws {
+    guard isRootOwnedRegularFile(url) else {
+      throw CoreFailure.coreIntegrity(
+        "A managed executable has unsafe ownership or file type.")
+    }
     try fileManager.setAttributes([.posixPermissions: 0o500], ofItemAtPath: url.path)
+    guard isSecureRootRegularFile(url) else {
+      throw CoreFailure.coreIntegrity("Unable to secure a managed executable.")
+    }
   }
 
   private func cachedMetadataMatchesInstalledCore() -> Bool {
@@ -443,12 +483,90 @@ final class CoreManager: @unchecked Sendable {
       && (info.st_mode & 0o077) == 0
   }
 
+  private func isRootOwnedDirectory(_ url: URL) -> Bool {
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else { return false }
+    return (info.st_mode & S_IFMT) == S_IFDIR && info.st_uid == 0
+  }
+
+  private func isRootOwnedRegularFile(_ url: URL) -> Bool {
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else { return false }
+    return (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == 0
+  }
+
+  private func isRegularFileWithoutFollowingSymlinks(_ url: URL) -> Bool {
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else { return false }
+    return (info.st_mode & S_IFMT) == S_IFREG
+  }
+
+  private func takeRootOwnershipOfCopiedRegularFile(_ url: URL) throws {
+    guard isRegularFileWithoutFollowingSymlinks(url), lchown(url.path, 0, 0) == 0 else {
+      throw CoreFailure.coreIntegrity(
+        "Unable to take ownership of the verified sing-box copy.")
+    }
+  }
+
   private func isSecureRootRegularFile(_ url: URL) -> Bool {
     var info = stat()
     guard lstat(url.path, &info) == 0 else { return false }
     return (info.st_mode & S_IFMT) == S_IFREG
       && info.st_uid == 0
       && (info.st_mode & 0o022) == 0
+  }
+
+  private func pathExistsWithoutFollowingSymlinks(_ url: URL) -> Bool {
+    var info = stat()
+    return lstat(url.path, &info) == 0
+  }
+
+  private func requireSecureManagedFileIfPresent(_ url: URL) throws {
+    guard pathExistsWithoutFollowingSymlinks(url) else { return }
+    guard isSecureRootRegularFile(url) else {
+      throw CoreFailure.coreIntegrity(
+        "Managed file \(url.lastPathComponent) has unsafe ownership, permissions, or file type."
+      )
+    }
+  }
+
+  private func synchronizeFile(_ url: URL) throws {
+    let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+    guard descriptor >= 0 else { throw CocoaError(.fileWriteUnknown) }
+    defer { close(descriptor) }
+    guard fsync(descriptor) == 0 else { throw CocoaError(.fileWriteUnknown) }
+  }
+
+  private func synchronizeSupportDirectory() throws {
+    let descriptor = open(supportDirectory.path, O_RDONLY | O_NOFOLLOW)
+    guard descriptor >= 0 else { throw CocoaError(.fileWriteUnknown) }
+    defer { close(descriptor) }
+    guard fsync(descriptor) == 0 || errno == EINVAL else {
+      throw CocoaError(.fileWriteUnknown)
+    }
+  }
+
+  private func atomicReplace(
+    _ candidate: URL,
+    at destination: URL,
+    replacingLegacyCore: Bool = false
+  ) throws {
+    try requireSecureManagedFileIfPresent(candidate)
+    if pathExistsWithoutFollowingSymlinks(destination) {
+      if replacingLegacyCore {
+        guard isRegularFileWithoutFollowingSymlinks(destination) else {
+          throw CoreFailure.coreIntegrity(
+            "The existing managed executable has an unsafe file type.")
+        }
+      } else {
+        try requireSecureManagedFileIfPresent(destination)
+      }
+    }
+    try synchronizeFile(candidate)
+    guard rename(candidate.path, destination.path) == 0 else {
+      throw CocoaError(.fileWriteUnknown)
+    }
+    try synchronizeSupportDirectory()
   }
 
   private func validatedConfiguration(
@@ -480,30 +598,37 @@ final class CoreManager: @unchecked Sendable {
     apiSecret: String
   ) throws -> BuiltConfiguration {
     let built = try validatedConfiguration(profile: profile, apiSecret: apiSecret)
-    let candidate = supportDirectory.appendingPathComponent("config.json.candidate")
+    let candidate = supportDirectory.appendingPathComponent(
+      "config.json.candidate-\(UUID().uuidString)")
     try built.data.write(to: candidate, options: .atomic)
     try secureFile(candidate)
     defer { try? fileManager.removeItem(at: candidate) }
-    let backup = supportDirectory.appendingPathComponent("config.json.backup")
-    if fileManager.fileExists(atPath: configURL.path) {
-      try? fileManager.removeItem(at: backup)
-      try fileManager.copyItem(at: configURL, to: backup)
-      try secureFile(backup)
+    if pathExistsWithoutFollowingSymlinks(configURL) {
+      try requireSecureManagedFileIfPresent(configURL)
+      let backupCandidate = supportDirectory.appendingPathComponent(
+        "config.json.backup-\(UUID().uuidString)")
+      try fileManager.copyItem(at: configURL, to: backupCandidate)
+      defer { try? fileManager.removeItem(at: backupCandidate) }
+      try secureFile(backupCandidate)
+      try atomicReplace(backupCandidate, at: configBackupURL)
     }
-    try? fileManager.removeItem(at: configURL)
-    try fileManager.moveItem(at: candidate, to: configURL)
+    try atomicReplace(candidate, at: configURL)
     try secureFile(configURL)
     return built
   }
 
   private func restoreBackupConfiguration() throws {
-    let backup = supportDirectory.appendingPathComponent("config.json.backup")
-    guard fileManager.fileExists(atPath: backup.path) else {
+    guard pathExistsWithoutFollowingSymlinks(configBackupURL) else {
       throw CoreFailure.configurationRejected(
         "No previous configuration is available for rollback.")
     }
-    try? fileManager.removeItem(at: configURL)
-    try fileManager.copyItem(at: backup, to: configURL)
+    try requireSecureManagedFileIfPresent(configBackupURL)
+    let candidate = supportDirectory.appendingPathComponent(
+      "config.json.restore-\(UUID().uuidString)")
+    try fileManager.copyItem(at: configBackupURL, to: candidate)
+    defer { try? fileManager.removeItem(at: candidate) }
+    try secureFile(candidate)
+    try atomicReplace(candidate, at: configURL)
     try secureFile(configURL)
   }
 
@@ -525,7 +650,7 @@ final class CoreManager: @unchecked Sendable {
     guard process.isRunning else {
       process.waitUntilExit()
       try? fileManager.removeItem(at: pidURL)
-      throw CoreFailure.coreExited(process.terminationStatus, recentLog())
+      throw CoreFailure.coreExited(process.terminationStatus)
     }
   }
 
@@ -572,7 +697,13 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func secureFile(_ url: URL) throws {
+    guard isRootOwnedRegularFile(url) else {
+      throw CoreFailure.coreIntegrity("A managed file has unsafe ownership or file type.")
+    }
     try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    guard isSecureRootRegularFile(url) else {
+      throw CoreFailure.coreIntegrity("Unable to secure a managed file.")
+    }
   }
 
   private func writableLogHandle() throws -> FileHandle {
@@ -581,7 +712,7 @@ final class CoreManager: @unchecked Sendable {
         atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
     }
     try secureFile(logURL)
-    let descriptor = open(logURL.path, O_WRONLY | O_APPEND)
+    let descriptor = open(logURL.path, O_WRONLY | O_APPEND | O_NOFOLLOW)
     guard descriptor >= 0 else {
       throw CocoaError(.fileWriteUnknown)
     }
@@ -590,8 +721,9 @@ final class CoreManager: @unchecked Sendable {
 
   private func enforceLogLimit() throws {
     let limit: off_t = 5 * 1_024 * 1_024
-    guard fileManager.fileExists(atPath: logURL.path) else { return }
-    let descriptor = open(logURL.path, O_WRONLY)
+    guard pathExistsWithoutFollowingSymlinks(logURL) else { return }
+    try requireSecureManagedFileIfPresent(logURL)
+    let descriptor = open(logURL.path, O_WRONLY | O_NOFOLLOW)
     guard descriptor >= 0 else {
       throw CocoaError(.fileWriteUnknown)
     }
@@ -642,10 +774,8 @@ final class CoreManager: @unchecked Sendable {
     process.waitUntilExit()
     guard process.terminationStatus == 0 else {
       try? output.synchronize()
-      let data = (try? Data(contentsOf: outputURL)) ?? Data()
-      let message =
-        String(data: data.suffix(16 * 1_024), encoding: .utf8) ?? "Unknown sing-box error"
-      throw CoreFailure.configurationRejected(message)
+      throw CoreFailure.configurationRejected(
+        "The generated profile did not pass the bundled core check.")
     }
   }
 
@@ -657,9 +787,13 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func readCoreVersionFromProcess() -> String? {
+    readCoreVersion(at: coreURL)
+  }
+
+  private func readCoreVersion(at executable: URL) -> String? {
     let process = Process()
     let output = Pipe()
-    process.executableURL = coreURL
+    process.executableURL = executable
     process.arguments = ["version"]
     process.standardOutput = output
     process.standardError = FileHandle.nullDevice
@@ -742,11 +876,14 @@ final class CoreManager: @unchecked Sendable {
     address.sin_family = sa_family_t(AF_INET)
     address.sin_port = in_port_t(19090).bigEndian
     address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-    let result = withUnsafePointer(to: &address) { pointer in
-      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    var result: Int32
+    repeat {
+      result = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
       }
-    }
+    } while result != 0 && errno == EINTR
     guard result == 0 else { throw CoreFailure.apiUnavailable }
 
     let payload = body ?? Data()
@@ -764,6 +901,7 @@ final class CoreManager: @unchecked Sendable {
     var buffer = [UInt8](repeating: 0, count: 4096)
     while response.count < 1_048_576 {
       let count = Darwin.read(descriptor, &buffer, buffer.count)
+      if count < 0, errno == EINTR { continue }
       if count < 0 { throw CoreFailure.apiUnavailable }
       if count == 0 { break }
       response.append(contentsOf: buffer.prefix(count))
@@ -783,6 +921,7 @@ final class CoreManager: @unchecked Sendable {
       while offset < bytes.count {
         let count = Darwin.write(
           descriptor, bytes.baseAddress?.advanced(by: offset), bytes.count - offset)
+        if count < 0, errno == EINTR { continue }
         guard count > 0 else { throw CoreFailure.apiUnavailable }
         offset += count
       }
@@ -790,6 +929,18 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func configureSocketTimeouts(_ descriptor: Int32, seconds: Int) throws {
+    var noSigPipe: Int32 = 1
+    guard
+      setsockopt(
+        descriptor,
+        SOL_SOCKET,
+        SO_NOSIGPIPE,
+        &noSigPipe,
+        socklen_t(MemoryLayout<Int32>.size)
+      ) == 0
+    else {
+      throw CoreFailure.apiUnavailable
+    }
     var timeout = timeval(tv_sec: seconds, tv_usec: 0)
     let receiveResult = withUnsafePointer(to: &timeout) { pointer in
       setsockopt(
@@ -840,19 +991,6 @@ final class CoreManager: @unchecked Sendable {
       + UUID().uuidString.replacingOccurrences(of: "-", with: "")
   }
 
-  private func recentLog() -> String {
-    guard let handle = try? FileHandle(forReadingFrom: logURL) else {
-      return "No core log available."
-    }
-    defer { try? handle.close() }
-    guard let size = try? handle.seekToEnd() else { return "No core log available." }
-    let start = size > 4096 ? size - 4096 : 0
-    guard (try? handle.seek(toOffset: start)) != nil,
-      let data = try? handle.read(upToCount: 4096),
-      let text = String(data: data, encoding: .utf8)
-    else { return "No core log available." }
-    return text
-  }
 }
 
 enum CoreFailure: LocalizedError {
@@ -861,7 +999,7 @@ enum CoreFailure: LocalizedError {
   case profileMissing
   case invalidProfile(String)
   case configurationRejected(String)
-  case coreExited(Int32, String)
+  case coreExited(Int32)
   case coreNotRunning
   case coreStopFailed
   case apiUnavailable
@@ -875,7 +1013,7 @@ enum CoreFailure: LocalizedError {
     case .profileMissing: "Add a subscription before connecting."
     case .invalidProfile(let message): message
     case .configurationRejected(let message): "sing-box rejected the configuration: \(message)"
-    case .coreExited(let status, let log): "sing-box exited with status \(status): \(log)"
+    case .coreExited(let status): "sing-box exited with status \(status)."
     case .coreNotRunning: "Connect the VPN before testing latency."
     case .coreStopFailed: "sing-box did not stop after SIGTERM and SIGKILL."
     case .apiUnavailable: "The local sing-box control API is unavailable."

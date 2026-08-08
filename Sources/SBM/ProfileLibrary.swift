@@ -18,6 +18,14 @@ struct SubscriptionHeaders: Codable, Equatable, Sendable {
     self.deviceOS = deviceOS
     self.hardwareID = hardwareID
   }
+
+  func resettingRequestPreset() -> SubscriptionHeaders {
+    SubscriptionHeaders(
+      userAgent: Self.defaultUserAgent,
+      deviceOS: Self.defaultDeviceOS,
+      hardwareID: hardwareID
+    )
+  }
 }
 
 struct ManagedSource: Codable, Equatable, Identifiable, Sendable {
@@ -188,7 +196,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
     self.selectedProfileID = selectedProfileID
     self.localSOCKSEnabled = localSOCKSEnabled
     self.localSOCKSPort = localSOCKSPort
-    self.latencyIntervalMinutes = min(max(latencyIntervalMinutes, 1), 9_999)
+    self.latencyIntervalMinutes = max(latencyIntervalMinutes, 1)
   }
 
   init(from decoder: Decoder) throws {
@@ -201,7 +209,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
       try container.decodeIfPresent(UInt16.self, forKey: .localSOCKSPort) ?? 1082
     let storedInterval =
       try container.decodeIfPresent(Int.self, forKey: .latencyIntervalMinutes) ?? 10
-    latencyIntervalMinutes = min(max(storedInterval, 1), 9_999)
+    latencyIntervalMinutes = max(storedInterval, 1)
   }
 
   func encode(to encoder: Encoder) throws {

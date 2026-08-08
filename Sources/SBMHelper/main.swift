@@ -48,6 +48,18 @@ private final class HelperServer {
   }
 
   private func configureTimeouts(_ descriptor: Int32) throws {
+    var noSigPipe: Int32 = 1
+    guard
+      setsockopt(
+        descriptor,
+        SOL_SOCKET,
+        SO_NOSIGPIPE,
+        &noSigPipe,
+        socklen_t(MemoryLayout<Int32>.size)
+      ) == 0
+    else {
+      throw HelperFailure.systemCall("setsockopt(SO_NOSIGPIPE)", errno)
+    }
     var timeout = timeval(tv_sec: 1, tv_usec: 0)
     let receiveResult = withUnsafePointer(to: &timeout) { pointer in
       setsockopt(
@@ -127,6 +139,7 @@ private final class HelperServer {
 
     guard var encoded = try? JSONEncoder().encode(response) else { return }
     encoded.append(0x0A)
+    guard encoded.count < 256 * 1_024 else { return }
     var offset = 0
     encoded.withUnsafeBytes { bytes in
       while offset < bytes.count {
@@ -135,6 +148,7 @@ private final class HelperServer {
           bytes.baseAddress?.advanced(by: offset),
           bytes.count - offset
         )
+        if count < 0, errno == EINTR { continue }
         if count <= 0 { break }
         offset += count
       }

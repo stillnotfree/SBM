@@ -3,6 +3,7 @@ import SBMShared
 import Testing
 
 @testable import SBM
+@testable import SBMHelper
 
 @Test func serverSubscriptionParsesBothSupportedProtocols() throws {
   let links = """
@@ -198,6 +199,9 @@ import Testing
 
   var crossOriginRequest = original
   crossOriginRequest.url = URL(string: "https://cdn.example.net/moved")!
+  crossOriginRequest.setValue("Bearer private-token", forHTTPHeaderField: "Authorization")
+  crossOriginRequest.setValue("Basic proxy-secret", forHTTPHeaderField: "Proxy-Authorization")
+  crossOriginRequest.setValue("session=private", forHTTPHeaderField: "Cookie")
   let crossOrigin = try #require(
     SubscriptionClient.sanitizedRedirectRequest(
       crossOriginRequest,
@@ -206,7 +210,22 @@ import Testing
   )
   #expect(crossOrigin.value(forHTTPHeaderField: "X-HWID") == nil)
   #expect(crossOrigin.value(forHTTPHeaderField: "X-Device-OS") == nil)
+  #expect(crossOrigin.value(forHTTPHeaderField: "Authorization") == nil)
+  #expect(crossOrigin.value(forHTTPHeaderField: "Proxy-Authorization") == nil)
+  #expect(crossOrigin.value(forHTTPHeaderField: "Cookie") == nil)
   #expect(crossOrigin.value(forHTTPHeaderField: "User-Agent")?.hasPrefix("SBM/") == true)
+
+  var returnToOriginRequest = original
+  returnToOriginRequest.url = URL(string: "https://example.com/final")!
+  let returnToOrigin = try #require(
+    SubscriptionClient.sanitizedRedirectRequest(
+      returnToOriginRequest,
+      from: source,
+      sensitiveHeadersWereStripped: true
+    )
+  )
+  #expect(returnToOrigin.value(forHTTPHeaderField: "X-HWID") == nil)
+  #expect(returnToOrigin.value(forHTTPHeaderField: "X-Device-OS") == nil)
 
   #expect(
     SubscriptionClient.sanitizedRedirectRequest(
@@ -214,6 +233,55 @@ import Testing
       from: source
     ) == nil
   )
+}
+
+@Test func subscriptionRejectsMalformedUTF8() {
+  #expect(throws: SubscriptionFailure.invalidEncoding) {
+    try SubscriptionClient.decodeBody(Data([0xC3, 0x28]))
+  }
+}
+
+@Test func oneSubscriptionSynchronizationPerformsOneFetch() async throws {
+  let counter = SubscriptionFetchCounter()
+  let profile = try SubscriptionClient.parsePayload(
+    "hysteria2://password@vpn.example.com:443/?sni=vpn.example.com#Hysteria2"
+  )
+  let manager = SubscriptionManager { _, _ in
+    await counter.record()
+    return SubscriptionFetchResult(profile: profile, skippedTransports: [:])
+  }
+  let source = ManagedSource(
+    name: "Remote",
+    value: "https://user:secret@example.com/subscription"
+  )
+
+  _ = try await manager.synchronize(source)
+
+  #expect(await counter.value == 1)
+}
+
+@Test func generatedManagedConfigurationOmitsSubscriptionURL() throws {
+  let privateURL = "https://user:private-token@example.com/subscription"
+  let payload = try SubscriptionClient.parsePayload(
+    "hysteria2://password@vpn.example.com:443/?sni=vpn.example.com#Hysteria2"
+  )
+  let merged = try ProfileAggregator.merge(
+    sources: [ManagedSource(name: "Remote", value: privateURL, payload: payload)],
+    routingPolicy: nil
+  )
+  let built = try ConfigBuilder(cachePath: "/tmp/sbm-cache", apiSecret: "api-secret")
+    .makeConfiguration(profile: merged, mode: .rule, selectedNode: .auto)
+  let configuration = try #require(String(data: built.data, encoding: .utf8))
+  #expect(!configuration.contains(privateURL))
+  #expect(!configuration.contains("private-token"))
+}
+
+private actor SubscriptionFetchCounter {
+  private(set) var value = 0
+
+  func record() {
+    value += 1
+  }
 }
 
 @Test func profileAggregatorMergesSourcesAndRemovesExactDuplicates() throws {
