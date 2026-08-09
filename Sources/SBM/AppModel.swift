@@ -69,6 +69,22 @@ enum SubscriptionStatusLevel {
   case warning
 }
 
+enum AutomaticConnectionPolicy {
+  static func shouldConnect(
+    didAttemptAutomaticConnection: Bool,
+    automaticRecoveryExhausted: Bool,
+    helperReady: Bool,
+    profileAvailable: Bool,
+    coreRunningForSelectedProfile: Bool
+  ) -> Bool {
+    !didAttemptAutomaticConnection
+      && !automaticRecoveryExhausted
+      && helperReady
+      && profileAvailable
+      && !coreRunningForSelectedProfile
+  }
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -120,6 +136,7 @@ final class AppModel {
   var latencyTestCompleted = false
   var latencyTestInProgress = false
   private var didAttemptAutomaticConnection = false
+  private var automaticRecoveryExhausted = false
   private var helperActiveProfileID: UUID?
   private var availableUpdate: AppUpdate?
 
@@ -142,6 +159,14 @@ final class AppModel {
 
   var nodeSections: [ProxyNodeSection] {
     ProxyNodeSectionBuilder.make(from: nodes)
+  }
+
+  var profileRecoveryRequired: Bool {
+    profileStoreLoadError != nil
+  }
+
+  var profileRecoveryMessage: String {
+    profileStoreLoadError ?? "Profile library is available."
   }
 
   private let helperService: any HelperServiceManaging
@@ -200,6 +225,51 @@ final class AppModel {
 
   var selectedProfileName: String {
     selectedProfile?.name ?? (coreRunning ? "Active configuration" : "None")
+  }
+
+  func importRecoveredProfileLibrary(from url: URL) {
+    let accessed = url.startAccessingSecurityScopedResource()
+    defer {
+      if accessed { url.stopAccessingSecurityScopedResource() }
+    }
+    do {
+      let stored = try ProfileStore.importProfileLibrary(from: url)
+      profileStoreLoadError = nil
+      applyProfileLibrary(stored)
+      lastError = nil
+      setSubscriptionStatus("Profile library recovered", level: .success)
+    } catch {
+      lastError = "Profile recovery failed: \(error.localizedDescription)"
+    }
+  }
+
+  func resetCorruptProfileLibrary() {
+    guard !coreRunning else {
+      lastError = "Disconnect the VPN before starting with an empty profile library."
+      return
+    }
+    do {
+      let stored = try ProfileStore.resetProfileLibrary()
+      profileStoreLoadError = nil
+      applyProfileLibrary(stored)
+      lastError = nil
+      setSubscriptionStatus("Started with an empty profile library", level: .warning)
+    } catch {
+      lastError = "Profile recovery failed: \(error.localizedDescription)"
+    }
+  }
+
+  func revealPreservedProfileLibrary() {
+    do {
+      guard let url = try ProfileStore.latestPreservedProfileURL() else {
+        lastError = "No preserved profile-library copy was found."
+        return
+      }
+      NSWorkspace.shared.activateFileViewerSelecting([url])
+      lastError = nil
+    } catch {
+      lastError = error.localizedDescription
+    }
   }
 
   var routingPolicyStatus: String {
@@ -1274,6 +1344,26 @@ final class AppModel {
     loadSelectedSourceEditor()
   }
 
+  private func applyProfileLibrary(_ stored: ProfileLibrary) {
+    subscriptionRefreshTask?.cancel()
+    profiles = stored.profiles
+    selectedProfileID = stored.selectedProfileID
+    localSOCKSEnabled = stored.localSOCKSEnabled
+    localSOCKSPort = stored.localSOCKSPort
+    latencyIntervalMinutes = stored.latencyIntervalMinutes
+    if selectedProfileID == nil || !profiles.contains(where: { $0.id == selectedProfileID }) {
+      selectedProfileID = profiles.first?.id
+    }
+    selectedSourceID = nil
+    loadSelectedProfileEditor()
+    updateNodes()
+    profileAvailable = selectedProfile?.payload != nil
+    scheduleNextLatencyRefresh()
+    if !profiles.isEmpty {
+      startSubscriptionRefreshLoop()
+    }
+  }
+
   private func loadSelectedSourceEditor() {
     guard let selectedSourceID,
       let source = selectedProfile?.sources.first(where: { $0.id == selectedSourceID })
@@ -1392,6 +1482,7 @@ final class AppModel {
     helperRevision = response.helperRevision
     coreRunning = response.coreRunning
     coreVersion = response.coreVersion
+    automaticRecoveryExhausted = response.automaticRecoveryExhausted
     routingMode = response.mode
     helperActiveProfileID = response.activeProfileID
     let responseMatchesSelection =
@@ -1526,9 +1617,16 @@ final class AppModel {
   }
 
   private func connectAutomaticallyIfNeeded() {
-    guard !didAttemptAutomaticConnection, currentHelperIsReady else { return }
     guard let payload = selectedProfile?.payload else { return }
-    guard !coreRunning || helperActiveProfileID != selectedProfileID else { return }
+    guard
+      AutomaticConnectionPolicy.shouldConnect(
+        didAttemptAutomaticConnection: didAttemptAutomaticConnection,
+        automaticRecoveryExhausted: automaticRecoveryExhausted,
+        helperReady: currentHelperIsReady,
+        profileAvailable: true,
+        coreRunningForSelectedProfile: coreRunning && helperActiveProfileID == selectedProfileID
+      )
+    else { return }
     didAttemptAutomaticConnection = true
     beginBusyOperation()
     Task {
@@ -1544,7 +1642,6 @@ final class AppModel {
         }
         lastError = nil
       } catch {
-        didAttemptAutomaticConnection = false
         lastError = "Automatic connection failed: \(error.localizedDescription)"
       }
     }

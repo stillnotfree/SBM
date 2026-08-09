@@ -29,20 +29,115 @@ struct PersistentState: Codable {
   var selectorTag = "proxy-selector"
   var nodes: [ProxyNodeDescriptor] = []
   var desiredRunning = false
+  var automaticRecoveryAttempted = false
   var localSOCKSEnabled = false
   var localSOCKSPort: UInt16 = 1082
   var apiSecret = UUID().uuidString.replacingOccurrences(of: "-", with: "")
 
   init() {}
+
+  private enum CodingKeys: String, CodingKey {
+    case profile
+    case activeProfileID
+    case mode
+    case selectedNode
+    case selectorTag
+    case nodes
+    case desiredRunning
+    case automaticRecoveryAttempted
+    case localSOCKSEnabled
+    case localSOCKSPort
+    case apiSecret
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    profile = try container.decodeIfPresent(CoreProfile.self, forKey: .profile)
+    activeProfileID = try container.decodeIfPresent(UUID.self, forKey: .activeProfileID)
+    mode = try container.decodeIfPresent(RoutingMode.self, forKey: .mode) ?? .rule
+    selectedNode =
+      try container.decodeIfPresent(ProxyNodeID.self, forKey: .selectedNode) ?? .auto
+    selectorTag =
+      try container.decodeIfPresent(String.self, forKey: .selectorTag) ?? "proxy-selector"
+    nodes = try container.decodeIfPresent([ProxyNodeDescriptor].self, forKey: .nodes) ?? []
+    desiredRunning = try container.decodeIfPresent(Bool.self, forKey: .desiredRunning) ?? false
+    automaticRecoveryAttempted =
+      try container.decodeIfPresent(Bool.self, forKey: .automaticRecoveryAttempted) ?? false
+    localSOCKSEnabled =
+      try container.decodeIfPresent(Bool.self, forKey: .localSOCKSEnabled) ?? false
+    localSOCKSPort =
+      try container.decodeIfPresent(UInt16.self, forKey: .localSOCKSPort) ?? 1082
+    apiSecret =
+      try container.decodeIfPresent(String.self, forKey: .apiSecret)
+      ?? UUID().uuidString.replacingOccurrences(of: "-", with: "")
+  }
 }
 
-private struct CoreMetadata: Codable {
+enum DesiredRuntimeRecoveryDecision: Equatable {
+  case stop
+  case noAction
+  case attemptRecovery
+  case disableDesiredState
+}
+
+enum DesiredRuntimeRecoveryPolicy {
+  static func decision(
+    desiredRunning: Bool,
+    coreRunning: Bool,
+    profileAvailable: Bool,
+    configurationAvailable: Bool,
+    recoveryAlreadyAttempted: Bool
+  ) -> DesiredRuntimeRecoveryDecision {
+    guard desiredRunning else { return .stop }
+    guard !coreRunning else { return .noAction }
+    guard profileAvailable, configurationAvailable, !recoveryAlreadyAttempted else {
+      return .disableDesiredState
+    }
+    return .attemptRecovery
+  }
+}
+
+struct CoreFileIdentity: Equatable {
+  let size: Int64
+  let modificationSeconds: Int64
+  let modificationNanoseconds: Int64
+  let inode: UInt64
+
+  static func read(_ url: URL) -> CoreFileIdentity? {
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else { return nil }
+    return CoreFileIdentity(
+      size: info.st_size,
+      modificationSeconds: Int64(info.st_mtimespec.tv_sec),
+      modificationNanoseconds: Int64(info.st_mtimespec.tv_nsec),
+      inode: UInt64(info.st_ino)
+    )
+  }
+}
+
+struct CoreMetadata: Codable, Equatable {
   let digest: String
   let size: Int64
   let modificationSeconds: Int64
   let modificationNanoseconds: Int64
   let inode: UInt64
   let version: String
+
+  init(digest: String, identity: CoreFileIdentity, version: String) {
+    self.digest = digest
+    size = identity.size
+    modificationSeconds = identity.modificationSeconds
+    modificationNanoseconds = identity.modificationNanoseconds
+    inode = identity.inode
+    self.version = version
+  }
+
+  func matches(_ identity: CoreFileIdentity) -> Bool {
+    size == identity.size
+      && modificationSeconds == identity.modificationSeconds
+      && modificationNanoseconds == identity.modificationNanoseconds
+      && inode == identity.inode
+  }
 }
 
 final class CoreManager: @unchecked Sendable {
@@ -99,17 +194,57 @@ final class CoreManager: @unchecked Sendable {
   }
 
   func status(message: String = "Helper connected") -> HelperResponse {
-    let effectiveMessage = bootstrapFailure.map { "Core bootstrap failed: \($0)" } ?? message
+    let recoveryExhausted = state.automaticRecoveryAttempted && !state.desiredRunning
+    let effectiveMessage =
+      bootstrapFailure.map { "Core bootstrap failed: \($0)" }
+      ?? (recoveryExhausted
+        ? "Automatic VPN recovery is exhausted; connect manually to retry"
+        : message)
     return HelperResponse(
-      success: bootstrapFailure == nil,
+      success: bootstrapFailure == nil && !recoveryExhausted,
       coreRunning: isCoreRunning,
       coreVersion: cachedCoreVersion(),
       mode: state.mode,
       selectedNode: state.selectedNode,
       activeProfileID: state.activeProfileID,
       nodes: state.nodes,
+      automaticRecoveryExhausted: recoveryExhausted,
       message: effectiveMessage
     )
+  }
+
+  func reconcileDesiredRuntime() throws -> String? {
+    guard bootstrapFailure == nil else { return nil }
+    let recoveryDecision = DesiredRuntimeRecoveryPolicy.decision(
+      desiredRunning: state.desiredRunning,
+      coreRunning: isCoreRunning,
+      profileAvailable: state.profile != nil,
+      configurationAvailable: pathExistsWithoutFollowingSymlinks(configURL),
+      recoveryAlreadyAttempted: state.automaticRecoveryAttempted
+    )
+    switch recoveryDecision {
+    case .stop:
+      terminateCore()
+      return nil
+    case .noAction:
+      return nil
+    case .disableDesiredState:
+      state.desiredRunning = false
+      try saveState()
+      return "Automatic VPN recovery is exhausted; connect manually to retry"
+    case .attemptRecovery:
+      state.automaticRecoveryAttempted = true
+      try saveState()
+      do {
+        try recoverDesiredRuntime()
+        return "VPN recovered after an unexpected core exit"
+      } catch {
+        terminateCore()
+        state.desiredRunning = false
+        try? saveState()
+        return "Automatic VPN recovery failed; connect manually to retry"
+      }
+    }
   }
 
   func start(
@@ -150,6 +285,7 @@ final class CoreManager: @unchecked Sendable {
 
       if isCoreRunning, !profileChanged, !configurationChanged {
         state.desiredRunning = true
+        state.automaticRecoveryAttempted = false
         try saveState()
         return status(message: "VPN already connected")
       }
@@ -172,6 +308,7 @@ final class CoreManager: @unchecked Sendable {
       try applyMode(state.mode)
       try applyNode(state.selectedNode)
       state.desiredRunning = true
+      state.automaticRecoveryAttempted = false
       try saveState()
       return status(message: "VPN connected")
     } catch {
@@ -205,6 +342,7 @@ final class CoreManager: @unchecked Sendable {
 
   func stop() throws -> HelperResponse {
     state.desiredRunning = false
+    state.automaticRecoveryAttempted = false
     try saveState()
     terminateCore()
     guard !isCoreRunning else {
@@ -365,7 +503,22 @@ final class CoreManager: @unchecked Sendable {
       try sha256(of: coreURL) == expectedCoreSHA256
     {
       try secureExecutable(coreURL)
-      try saveCoreMetadata(for: coreURL)
+      guard readCoreVersion(at: coreURL) == "sing-box version \(CoreBuildInfo.version)" else {
+        throw CoreFailure.coreIntegrity("The installed sing-box version does not match this build.")
+      }
+      if pathExistsWithoutFollowingSymlinks(configURL) {
+        try requireSecureManagedFileIfPresent(configURL)
+        try runCore(arguments: ["check", "-c", configURL.path])
+      }
+      let wasCoreRunning = isCoreRunning
+      try saveCoreMetadata(
+        for: coreURL,
+        expectedDigest: expectedCoreSHA256,
+        expectedVersion: "sing-box version \(CoreBuildInfo.version)"
+      )
+      if wasCoreRunning {
+        terminateCore()
+      }
       return
     }
     guard fileManager.isExecutableFile(atPath: bundledCoreURL.path) else {
@@ -387,23 +540,66 @@ final class CoreManager: @unchecked Sendable {
     guard readCoreVersion(at: candidate) == "sing-box version \(CoreBuildInfo.version)" else {
       throw CoreFailure.coreIntegrity("The bundled sing-box version does not match this build.")
     }
+    if pathExistsWithoutFollowingSymlinks(configURL) {
+      try requireSecureManagedFileIfPresent(configURL)
+      try runCore(executable: candidate, arguments: ["check", "-c", configURL.path])
+    }
+    let wasCoreRunning = isCoreRunning
+    var rollbackMetadata: CoreMetadata?
     if pathExistsWithoutFollowingSymlinks(coreURL) {
       guard isRegularFileWithoutFollowingSymlinks(coreURL) else {
         throw CoreFailure.coreIntegrity(
           "The existing managed executable has an unsafe file type.")
       }
-      if isSecureRootRegularFile(coreURL) {
+      if let metadata = try verifiedInstalledCoreMetadata() {
         let backupCandidate = supportDirectory.appendingPathComponent(
           "sing-box.backup-\(UUID().uuidString)")
         try fileManager.copyItem(at: coreURL, to: backupCandidate)
         defer { try? fileManager.removeItem(at: backupCandidate) }
         try secureExecutable(backupCandidate)
         try atomicReplace(backupCandidate, at: coreBackupURL)
+        rollbackMetadata = metadata
       }
+    }
+    do {
+      try atomicReplace(candidate, at: coreURL, replacingLegacyCore: true)
+      try secureExecutable(coreURL)
+      try saveCoreMetadata(
+        for: coreURL,
+        expectedDigest: expectedCoreSHA256,
+        expectedVersion: "sing-box version \(CoreBuildInfo.version)"
+      )
+    } catch {
+      if let rollbackMetadata {
+        try restoreBackupCore(expectedMetadata: rollbackMetadata)
+      }
+      throw error
+    }
+    if wasCoreRunning {
+      terminateCore()
+    }
+  }
+
+  private func restoreBackupCore(expectedMetadata: CoreMetadata) throws {
+    try requireSecureManagedFileIfPresent(coreBackupURL)
+    let candidate = supportDirectory.appendingPathComponent(
+      "sing-box.rollback-\(UUID().uuidString)")
+    try fileManager.copyItem(at: coreBackupURL, to: candidate)
+    defer { try? fileManager.removeItem(at: candidate) }
+    try takeRootOwnershipOfCopiedRegularFile(candidate)
+    try secureExecutable(candidate)
+    guard try sha256(of: candidate) == expectedMetadata.digest,
+      readCoreVersion(at: candidate) == expectedMetadata.version
+    else {
+      throw CoreFailure.coreIntegrity("The rollback sing-box copy failed verification.")
     }
     try atomicReplace(candidate, at: coreURL, replacingLegacyCore: true)
     try secureExecutable(coreURL)
-    try saveCoreMetadata(for: coreURL)
+    try saveCoreMetadata(
+      for: coreURL,
+      expectedDigest: expectedMetadata.digest,
+      expectedVersion: expectedMetadata.version
+    )
   }
 
   private func sha256(of url: URL) throws -> String {
@@ -428,51 +624,48 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func cachedMetadataMatchesInstalledCore() -> Bool {
+    guard let metadata = cachedMetadataMatchingInstalledCoreIdentity() else { return false }
+    return metadata.digest == expectedCoreSHA256
+      && metadata.version == "sing-box version \(CoreBuildInfo.version)"
+  }
+
+  private func verifiedInstalledCoreMetadata() throws -> CoreMetadata? {
+    guard let metadata = cachedMetadataMatchingInstalledCoreIdentity() else { return nil }
+    guard try sha256(of: coreURL) == metadata.digest,
+      readCoreVersion(at: coreURL) == metadata.version
+    else { return nil }
+    return metadata
+  }
+
+  private func cachedMetadataMatchingInstalledCoreIdentity() -> CoreMetadata? {
     guard isSecureRootRegularFile(coreURL),
       isSecureRootRegularFile(coreMetadataURL),
       let data = try? Data(contentsOf: coreMetadataURL),
       let metadata = try? JSONDecoder().decode(CoreMetadata.self, from: data),
-      metadata.digest == expectedCoreSHA256,
-      let info = fileIdentity(coreURL)
-    else { return false }
-    return metadata.size == info.size
-      && metadata.modificationSeconds == info.modificationSeconds
-      && metadata.modificationNanoseconds == info.modificationNanoseconds
-      && metadata.inode == info.inode
+      let info = CoreFileIdentity.read(coreURL)
+    else { return nil }
+    guard metadata.matches(info) else { return nil }
+    return metadata
   }
 
-  private func saveCoreMetadata(for url: URL) throws {
-    guard let info = fileIdentity(url),
-      let version = readCoreVersionFromProcess()
+  private func saveCoreMetadata(
+    for url: URL,
+    expectedDigest: String,
+    expectedVersion: String
+  ) throws {
+    guard let identity = CoreFileIdentity.read(url),
+      let version = readCoreVersion(at: url)
     else {
       throw CoreFailure.coreIntegrity("Unable to identify the verified sing-box core.")
     }
-    let metadata = CoreMetadata(
-      digest: expectedCoreSHA256,
-      size: info.size,
-      modificationSeconds: info.modificationSeconds,
-      modificationNanoseconds: info.modificationNanoseconds,
-      inode: info.inode,
-      version: version
-    )
+    let digest = try sha256(of: url)
+    guard digest == expectedDigest, version == expectedVersion else {
+      throw CoreFailure.coreIntegrity(
+        "The verified sing-box core changed before metadata was saved.")
+    }
+    let metadata = CoreMetadata(digest: digest, identity: identity, version: version)
     try JSONEncoder().encode(metadata).write(to: coreMetadataURL, options: .atomic)
     try secureFile(coreMetadataURL)
-  }
-
-  private func fileIdentity(_ url: URL) -> (
-    size: Int64,
-    modificationSeconds: Int64,
-    modificationNanoseconds: Int64,
-    inode: UInt64
-  )? {
-    var info = stat()
-    guard lstat(url.path, &info) == 0 else { return nil }
-    return (
-      info.st_size,
-      Int64(info.st_mtimespec.tv_sec),
-      Int64(info.st_mtimespec.tv_nsec),
-      UInt64(info.st_ino)
-    )
   }
 
   private func isSecureRootDirectory(_ url: URL) -> Bool {
@@ -654,6 +847,22 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
+  private func recoverDesiredRuntime() throws {
+    guard state.profile != nil else { throw CoreFailure.profileMissing }
+    guard pathExistsWithoutFollowingSymlinks(configURL) else {
+      throw CoreFailure.configurationRejected(
+        "No known-good configuration is available for automatic recovery.")
+    }
+    try requireSecureManagedFileIfPresent(configURL)
+    try runCore(arguments: ["check", "-c", configURL.path])
+    try ensureAPIPortAvailable()
+    try launchCore()
+    try waitForAPI()
+    try applyMode(state.mode)
+    try applyNode(state.selectedNode)
+    try saveState()
+  }
+
   private func loadState() throws -> PersistentState {
     guard fileManager.fileExists(atPath: stateURL.path) else {
       let initial = PersistentState()
@@ -737,7 +946,10 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
-  private func runCore(arguments: [String]) throws {
+  private func runCore(
+    executable: URL? = nil,
+    arguments: [String]
+  ) throws {
     let outputURL = supportDirectory.appendingPathComponent(
       "core-check-\(UUID().uuidString).log")
     guard
@@ -753,7 +965,7 @@ final class CoreManager: @unchecked Sendable {
     let output = try FileHandle(forWritingTo: outputURL)
     defer { try? output.close() }
     let process = Process()
-    process.executableURL = coreURL
+    process.executableURL = executable ?? coreURL
     process.arguments = arguments
     process.standardOutput = output
     process.standardError = output

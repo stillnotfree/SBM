@@ -6,10 +6,37 @@ struct SettingsView: View {
   @Bindable var model: AppModel
   @State private var isImportingProfile = false
   @State private var isImportingRouting = false
+  @State private var isImportingProfileRecovery = false
   @State private var isConfirmingHWIDRegeneration = false
+  @State private var isConfirmingProfileReset = false
 
   var body: some View {
     Form {
+      if model.profileRecoveryRequired {
+        Section("Profile Library Recovery") {
+          Label(model.profileRecoveryMessage, systemImage: "exclamationmark.triangle.fill")
+            .foregroundStyle(.orange)
+          HStack {
+            Button("Import Recovered Library…") {
+              isImportingProfileRecovery = true
+            }
+            Button("Show Preserved Copy") {
+              model.revealPreservedProfileLibrary()
+            }
+            Spacer()
+            Button("Start Empty…", role: .destructive) {
+              isConfirmingProfileReset = true
+            }
+            .disabled(model.coreRunning)
+          }
+          if model.coreRunning {
+            Text("Disconnect the VPN before starting with an empty library.")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+        }
+      }
+
       Section("Profile") {
         HStack {
           Picker(
@@ -276,6 +303,20 @@ struct SettingsView: View {
         "Changing HWID may make providers with a device limit treat this Mac as a new device."
       )
     }
+    .confirmationDialog(
+      "Start with an empty profile library?",
+      isPresented: $isConfirmingProfileReset,
+      titleVisibility: .visible
+    ) {
+      Button("Preserve Current File and Start Empty", role: .destructive) {
+        model.resetCorruptProfileLibrary()
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(
+        "SBM will preserve the current profile file unchanged before creating an empty library."
+      )
+    }
     .fileImporter(
       isPresented: $isImportingProfile,
       allowedContentTypes: [.json],
@@ -295,6 +336,16 @@ struct SettingsView: View {
         return
       }
       model.importRoutingPolicy(from: url)
+    }
+    .fileImporter(
+      isPresented: $isImportingProfileRecovery,
+      allowedContentTypes: [.json],
+      allowsMultipleSelection: false
+    ) { result in
+      guard case .success(let urls) = result, let url = urls.first else {
+        return
+      }
+      model.importRecoveredProfileLibrary(from: url)
     }
   }
 }

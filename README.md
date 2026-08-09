@@ -192,6 +192,11 @@ Profile URLs and cached credentials are stored at
 This avoids Keychain prompts, at the cost of weaker protection against software
 already running as the same macOS user.
 
+If that library is malformed, SBM keeps the original and a preserved copy,
+blocks ordinary saves, and presents explicit recovery actions in Profiles:
+import a corrected library, reveal the preserved copy, or preserve it again and
+start empty after disconnecting the VPN.
+
 The app registers itself to launch when the user logs in. It checks the
 `stillnotfree/SBM` GitHub Releases feed at most once per day and can also be
 checked manually from the menu or About window. SBM accepts only the exact
@@ -203,7 +208,7 @@ update.
 
 ## Current status
 
-Version 1.1.10 bundles the pinned stable sing-box 1.13.16 core and is not an
+Version 1.1.11 bundles the pinned stable sing-box 1.13.18 core and is not an
 independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
 REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are

@@ -21,6 +21,146 @@ import Testing
   #expect(decoded.latencyIntervalMinutes == 10)
 }
 
+@Test func persistentHelperStateDefaultsRecoveryMarkerForOlderStores() throws {
+  let data = Data(
+    """
+    {
+      "mode": "Rule",
+      "selectedNode": "auto",
+      "selectorTag": "proxy-selector",
+      "nodes": [],
+      "desiredRunning": true,
+      "localSOCKSEnabled": false,
+      "localSOCKSPort": 1082,
+      "apiSecret": "test-secret"
+    }
+    """.utf8
+  )
+  let state = try JSONDecoder().decode(PersistentState.self, from: data)
+  #expect(state.desiredRunning)
+  #expect(!state.automaticRecoveryAttempted)
+}
+
+@Test func desiredRuntimeRecoveryAllowsOnlyOneAutomaticAttempt() {
+  #expect(
+    DesiredRuntimeRecoveryPolicy.decision(
+      desiredRunning: false,
+      coreRunning: true,
+      profileAvailable: true,
+      configurationAvailable: true,
+      recoveryAlreadyAttempted: false
+    ) == .stop
+  )
+  #expect(
+    DesiredRuntimeRecoveryPolicy.decision(
+      desiredRunning: true,
+      coreRunning: true,
+      profileAvailable: true,
+      configurationAvailable: true,
+      recoveryAlreadyAttempted: false
+    ) == .noAction
+  )
+  #expect(
+    DesiredRuntimeRecoveryPolicy.decision(
+      desiredRunning: true,
+      coreRunning: false,
+      profileAvailable: true,
+      configurationAvailable: true,
+      recoveryAlreadyAttempted: false
+    ) == .attemptRecovery
+  )
+  #expect(
+    DesiredRuntimeRecoveryPolicy.decision(
+      desiredRunning: true,
+      coreRunning: false,
+      profileAvailable: true,
+      configurationAvailable: true,
+      recoveryAlreadyAttempted: true
+    ) == .disableDesiredState
+  )
+  #expect(
+    DesiredRuntimeRecoveryPolicy.decision(
+      desiredRunning: true,
+      coreRunning: false,
+      profileAvailable: false,
+      configurationAvailable: true,
+      recoveryAlreadyAttempted: false
+    ) == .disableDesiredState
+  )
+}
+
+@Test func exhaustedHelperRecoveryDoesNotTriggerAutomaticConnection() {
+  #expect(
+    !AutomaticConnectionPolicy.shouldConnect(
+      didAttemptAutomaticConnection: false,
+      automaticRecoveryExhausted: true,
+      helperReady: true,
+      profileAvailable: true,
+      coreRunningForSelectedProfile: false
+    )
+  )
+  #expect(
+    !AutomaticConnectionPolicy.shouldConnect(
+      didAttemptAutomaticConnection: true,
+      automaticRecoveryExhausted: false,
+      helperReady: true,
+      profileAvailable: true,
+      coreRunningForSelectedProfile: false
+    )
+  )
+  #expect(
+    AutomaticConnectionPolicy.shouldConnect(
+      didAttemptAutomaticConnection: false,
+      automaticRecoveryExhausted: false,
+      helperReady: true,
+      profileAvailable: true,
+      coreRunningForSelectedProfile: false
+    )
+  )
+}
+
+@Test func helperResponseDefaultsMissingRecoverySignalForOlderHelpers() throws {
+  let response = HelperResponse(success: true, coreRunning: false, message: "ready")
+  var object = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(response)) as? [String: Any])
+  object.removeValue(forKey: "automaticRecoveryExhausted")
+  let legacy = try JSONSerialization.data(withJSONObject: object)
+
+  let decoded = try JSONDecoder().decode(HelperResponse.self, from: legacy)
+  #expect(!decoded.automaticRecoveryExhausted)
+}
+
+@Test func restoredCoreMetadataUsesPostRenameFileIdentity() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMCoreRollbackMetadataTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  let backup = directory.appendingPathComponent("sing-box.backup")
+  let candidate = directory.appendingPathComponent("sing-box.rollback")
+  let restored = directory.appendingPathComponent("sing-box")
+  let contents = Data("previous reviewed core".utf8)
+  try contents.write(to: backup)
+  try FileManager.default.copyItem(at: backup, to: candidate)
+  let backupIdentity = try #require(CoreFileIdentity.read(backup))
+  let candidateIdentity = try #require(CoreFileIdentity.read(candidate))
+  #expect(backupIdentity.inode != candidateIdentity.inode)
+
+  try FileManager.default.moveItem(at: candidate, to: restored)
+  let restoredIdentity = try #require(CoreFileIdentity.read(restored))
+  let digest = SHA256.hash(data: contents).map { String(format: "%02x", $0) }.joined()
+  let metadata = CoreMetadata(
+    digest: digest,
+    identity: restoredIdentity,
+    version: "sing-box version previous-reviewed"
+  )
+
+  #expect(metadata.matches(restoredIdentity))
+  #expect(!metadata.matches(backupIdentity))
+  #expect(
+    try JSONDecoder().decode(CoreMetadata.self, from: JSONEncoder().encode(metadata)) == metadata)
+}
+
 @Test func profileLibraryRequiresPositiveLatencyIntervalWithoutSmallUpperCap() throws {
   let library = ProfileLibrary(
     profiles: [],
@@ -75,6 +215,149 @@ import Testing
   ).filter { $0.lastPathComponent.hasPrefix("profiles.invalid-") }
   #expect(preserved.count == 1)
   #expect(try Data(contentsOf: preserved[0]) == malformed)
+}
+
+@Test func profileStoreImportsValidatedRecoveryWithoutLosingDestination() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMRecoveryImportTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: directory,
+    withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700]
+  )
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o700],
+    ofItemAtPath: directory.path
+  )
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  let destination = directory.appendingPathComponent("profiles.json")
+  let source = directory.appendingPathComponent("recovered.json")
+  let original = Data("{broken".utf8)
+  FileManager.default.createFile(
+    atPath: destination.path,
+    contents: original,
+    attributes: [.posixPermissions: 0o600]
+  )
+  let recovered = ProfileLibrary(
+    profiles: [ManagedProfile(name: "Recovered")],
+    selectedProfileID: nil
+  )
+  FileManager.default.createFile(
+    atPath: source.path,
+    contents: try JSONEncoder().encode(recovered),
+    attributes: [.posixPermissions: 0o600]
+  )
+
+  let imported = try ProfileStore.importProfileLibrary(from: source, to: destination)
+  #expect(imported == recovered)
+  #expect(
+    try JSONDecoder().decode(ProfileLibrary.self, from: Data(contentsOf: destination)) == recovered)
+}
+
+@Test func profileStoreRejectsMalformedRecoveryBeforeReplacingDestination() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMInvalidRecoveryTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: directory,
+    withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700]
+  )
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o700],
+    ofItemAtPath: directory.path
+  )
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  let destination = directory.appendingPathComponent("profiles.json")
+  let source = directory.appendingPathComponent("recovered.json")
+  let original = try JSONEncoder().encode(ProfileLibrary.empty)
+  FileManager.default.createFile(
+    atPath: destination.path,
+    contents: original,
+    attributes: [.posixPermissions: 0o600]
+  )
+  FileManager.default.createFile(
+    atPath: source.path,
+    contents: Data("{broken".utf8),
+    attributes: [.posixPermissions: 0o600]
+  )
+
+  #expect(throws: ProfileStoreFailure.self) {
+    try ProfileStore.importProfileLibrary(from: source, to: destination)
+  }
+  #expect(try Data(contentsOf: destination) == original)
+}
+
+@Test func profileStoreRejectsSymlinkedRecoveryBeforeReplacingDestination() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMSymlinkRecoveryTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: directory,
+    withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700]
+  )
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o700],
+    ofItemAtPath: directory.path
+  )
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  let destination = directory.appendingPathComponent("profiles.json")
+  let target = directory.appendingPathComponent("recovered-target.json")
+  let source = directory.appendingPathComponent("recovered-link.json")
+  let original = try JSONEncoder().encode(ProfileLibrary.empty)
+  FileManager.default.createFile(
+    atPath: destination.path,
+    contents: original,
+    attributes: [.posixPermissions: 0o600]
+  )
+  FileManager.default.createFile(
+    atPath: target.path,
+    contents: try JSONEncoder().encode(ProfileLibrary.empty),
+    attributes: [.posixPermissions: 0o600]
+  )
+  try FileManager.default.createSymbolicLink(at: source, withDestinationURL: target)
+
+  #expect(throws: ProfileStoreFailure.self) {
+    try ProfileStore.importProfileLibrary(from: source, to: destination)
+  }
+  #expect(try Data(contentsOf: destination) == original)
+}
+
+@Test func profileStoreResetPreservesOriginalBeforeStartingEmpty() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMRecoveryResetTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: directory,
+    withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700]
+  )
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o700],
+    ofItemAtPath: directory.path
+  )
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  let destination = directory.appendingPathComponent("profiles.json")
+  let original = Data("{broken".utf8)
+  FileManager.default.createFile(
+    atPath: destination.path,
+    contents: original,
+    attributes: [.posixPermissions: 0o600]
+  )
+
+  let reset = try ProfileStore.resetProfileLibrary(at: destination)
+  #expect(reset == .empty)
+  #expect(
+    try JSONDecoder().decode(ProfileLibrary.self, from: Data(contentsOf: destination)) == .empty
+  )
+  let preserved = try FileManager.default.contentsOfDirectory(
+    at: directory,
+    includingPropertiesForKeys: nil
+  ).filter { $0.lastPathComponent.hasPrefix("profiles.invalid-") }
+  #expect(preserved.count == 1)
+  #expect(try Data(contentsOf: preserved[0]) == original)
 }
 
 @Test func diagnosticRedactionRemovesKnownAndPatternSecrets() throws {

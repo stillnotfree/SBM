@@ -11,6 +11,7 @@ struct NativeConfigurationComposer {
     selectedNode: ProxyNodeID,
     localSOCKSPort: UInt16? = nil
   ) throws -> BuiltConfiguration {
+    try NativeCapabilityPolicy.requireReviewedCore()
     guard profile.configuration.count <= 1_048_576,
       let source = try JSONSerialization.jsonObject(with: profile.configuration) as? [String: Any]
     else { throw CoreFailure.invalidProfile("The native profile is not a valid JSON object.") }
@@ -296,7 +297,8 @@ struct NativeConfigurationComposer {
 
   private func validateDNSServer(_ server: [String: Any], path: String) throws {
     let type = (server["type"] as? String) ?? ""
-    var allowed = Self.safeDialKeys.union(Self.safeDNSServerKeys)
+    try NativeCapabilityPolicy.requireAllowedDNSServerType(type)
+    var allowed = NativeCapabilityPolicy.dialKeys.union(Self.safeDNSServerKeys)
     if ["https", "h3"].contains(type) { allowed.insert("path") }
     try requireAllowedKeys(server, allowed: allowed, path: path)
     if let httpPath = server["path"] as? String {
@@ -317,17 +319,23 @@ struct NativeConfigurationComposer {
     guard let type = outbound["type"] as? String, !type.isEmpty else {
       throw CoreFailure.invalidProfile("Every imported outbound must have a type.")
     }
-    guard type != "tor" else {
-      throw CoreFailure.invalidProfile(
-        "Tor outbounds may execute and manage an external process and are not accepted by the privileged helper."
-      )
-    }
-    try requireAllowedKeys(outbound, allowed: Self.safeOutboundKeys, path: path)
+    try requireAllowedKeys(
+      outbound,
+      allowed: try NativeCapabilityPolicy.allowedOutboundKeys(for: type),
+      path: path
+    )
     try validateOptionalOutboundTLS(outbound["tls"], path: "\(path).tls")
     try validateOptionalDomainResolver(outbound["domain_resolver"], path: "\(path).domain_resolver")
 
     if let transport = outbound["transport"] as? [String: Any] {
-      try requireAllowedKeys(transport, allowed: Self.safeTransportKeys, path: "\(path).transport")
+      guard let transportType = transport["type"] as? String, !transportType.isEmpty else {
+        throw CoreFailure.invalidProfile("The imported outbound transport has no type.")
+      }
+      try requireAllowedKeys(
+        transport,
+        allowed: try NativeCapabilityPolicy.allowedTransportKeys(for: transportType),
+        path: "\(path).transport"
+      )
     } else if outbound["transport"] != nil {
       throw CoreFailure.invalidProfile("The imported outbound transport must be an object.")
     }
@@ -364,7 +372,7 @@ struct NativeConfigurationComposer {
     }
     try requireAllowedKeys(
       endpoint,
-      allowed: Self.safeDialKeys.union(Self.safeWireGuardEndpointKeys),
+      allowed: NativeCapabilityPolicy.dialKeys.union(Self.safeWireGuardEndpointKeys),
       path: path
     )
     guard (endpoint["system"] as? Bool) != true else {
@@ -463,14 +471,6 @@ struct NativeConfigurationComposer {
     }
   }
 
-  private static let safeDialKeys: Set<String> = [
-    "detour", "bind_interface", "inet4_bind_address", "inet6_bind_address",
-    "bind_address_no_port", "reuse_addr", "connect_timeout", "tcp_fast_open",
-    "tcp_multi_path", "disable_tcp_keep_alive", "tcp_keep_alive",
-    "tcp_keep_alive_interval", "udp_fragment", "domain_resolver", "network_strategy",
-    "network_type", "fallback_network_type", "fallback_delay", "domain_strategy",
-  ]
-
   private static let safeDNSKeys: Set<String> = [
     "servers", "rules", "final", "reverse_mapping", "strategy", "disable_cache",
     "disable_expire", "independent_cache", "cache_capacity", "client_subnet", "fakeip",
@@ -487,29 +487,6 @@ struct NativeConfigurationComposer {
     "rules", "rule_set", "final", "auto_detect_interface", "default_domain_resolver",
     "default_network_strategy", "default_network_type", "default_fallback_network_type",
     "default_fallback_delay", "find_process",
-  ]
-
-  private static let safeOutboundKeys = safeDialKeys.union(
-    Set([
-      "type", "tag", "server", "server_port", "server_ports", "hop_interval", "network",
-      "username", "password", "version", "method", "udp_over_tcp", "multiplex", "tls",
-      "transport", "path", "headers", "outbounds", "default", "interrupt_exist_connections",
-      "url", "interval", "tolerance", "idle_timeout", "uuid", "flow", "security",
-      "alter_id", "alterId", "global_padding", "authenticated_length", "packet_encoding",
-      "up", "up_mbps", "down", "down_mbps", "obfs", "auth", "auth_str",
-      "recv_window_conn", "recv_window", "disable_mtu_discovery", "brutal_debug",
-      "congestion_control", "udp_relay_mode", "udp_over_stream", "zero_rtt_handshake",
-      "heartbeat", "idle_session_check_interval", "idle_session_timeout", "min_idle_session",
-      "insecure_concurrency", "extra_headers", "stream_receive_window", "quic",
-      "quic_congestion_control", "quic_session_receive_window", "padding_scheme", "user",
-      "private_key", "private_key_passphrase", "host_key", "host_key_algorithms",
-      "client_version", "obfs_param", "protocol", "protocol_param",
-    ])
-  )
-
-  private static let safeTransportKeys: Set<String> = [
-    "type", "host", "path", "method", "headers", "idle_timeout", "ping_timeout",
-    "max_early_data", "early_data_header_name", "service_name", "permit_without_stream",
   ]
 
   private static let safeMultiplexKeys: Set<String> = [

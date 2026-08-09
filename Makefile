@@ -2,7 +2,7 @@ SHELL := /bin/zsh
 
 APP_NAME := SBM
 BUNDLE_NAME := SBM
-APP_VERSION := 1.1.10
+APP_VERSION := 1.1.11
 include Core.lock
 CORE_ARCHIVE := .vendor/sing-box-$(CORE_VERSION)-darwin-arm64.tar.gz
 CORE_UPSTREAM_BINARY := .vendor/sing-box-upstream
@@ -37,6 +37,7 @@ core:
 		chmod 0755 "$(CORE_UPSTREAM_BINARY)"; \
 	fi
 	@echo "$(CORE_BINARY_SHA256)  $(CORE_UPSTREAM_BINARY)" | shasum -a 256 --check
+	@test "$$(xcrun lipo -archs "$(CORE_UPSTREAM_BINARY)")" = "arm64"
 	cp "$(CORE_UPSTREAM_BINARY)" "$(CORE_BINARY).tmp"
 	codesign --force --sign - --identifier io.nekohasekai.sing-box "$(CORE_BINARY).tmp"
 	mv "$(CORE_BINARY).tmp" "$(CORE_BINARY)"

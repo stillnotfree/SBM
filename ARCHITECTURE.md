@@ -51,7 +51,12 @@ binary digest. Packaging verifies those inputs, ad-hoc signs one exact core,
 generates `CoreBuildInfo.swift` from its signed digest, compiles the helper, and
 bundles that same file without signing it again. Critical root files are staged
 in the protected directory, synchronized, and replaced with same-directory
-`rename`; a verified configuration backup is retained for runtime rollback.
+`rename`; verified configuration and core backups are retained for rollback.
+Before replacing an installed core, the helper checks the known-good active
+configuration with the verified candidate and keeps the old process running
+until the replacement and metadata are committed. The previous core is backed
+up only when its protected metadata, content digest, and reported version agree;
+a post-replacement file or metadata failure atomically restores that backup.
 
 Disconnect is persisted before the process is terminated. On every helper
 bootstrap, a disconnected state also removes a verified leftover core process
@@ -60,9 +65,16 @@ across helper crashes and launchd restarts. The helper receives its root-owned
 Unix listener from launchd socket activation and exits after an application
 shutdown request; launchd starts it again on the next local request.
 
+An explicitly connected state arms one automatic recovery. If the protected
+core disappears unexpectedly, the next helper activation rechecks the
+known-good configuration and restarts it once. The attempt is persisted before
+launch; another failure disables desired running state until the user connects
+again, preventing a permanent crash loop or watchdog.
+
 Imported profiles are treated as untrusted input even when they arrive over
 HTTPS. The composer ignores user-supplied inbounds, logging, and experimental
-APIs; applies per-section safe-field allowlists; rejects local filesystem paths,
+APIs; applies per-section and per-outbound-type safe-field allowlists tied to
+the exact reviewed core version; rejects unknown types, local filesystem paths,
 external-process capabilities, listeners, services, and system-managed
 endpoints; bounds profile and selector sizes; and then validates the composed
 candidate with the exact bundled core. Runtime activation failure restores the
@@ -70,7 +82,8 @@ previous configuration and process.
 
 The user profile store is never interpreted as an empty library merely because
 it is malformed or has unsafe permissions. Invalid JSON is preserved unchanged
-and reported; saving remains blocked until the storage problem is resolved.
+and reported; saving remains blocked until the user imports a corrected library
+or explicitly preserves the original again and starts empty.
 Clipboard diagnostics redact subscription URLs, HWIDs, proxy credentials, and
 known native-profile secrets, while raw sing-box validation output is not sent
 across the helper boundary.
@@ -80,12 +93,11 @@ Individual `vless://`, `hysteria2://`, and `hy2://` links use the same parser
 and validation path, but are stored locally and never treated as refreshable
 remote sources.
 
-The composer does not select protocols by brand name. Safe userspace outbounds
-and endpoints accepted by both SBM's section allowlists and the bundled core
-can pass through, while capabilities that would cross the privilege boundary
-are rejected. In Rule mode the profile owns DNS, routing, and remote rule-sets.
-Direct and Global are temporary managed overrides, not edits to the imported
-source.
+Native JSON supports explicitly reviewed safe client outbound types and a
+userspace WireGuard endpoint for the pinned core. Unknown future types and
+fields fail closed until the capability policy is reviewed. In Rule mode the
+profile owns DNS, routing, and remote rule-sets. Direct and Global are temporary
+managed overrides, not edits to the imported source.
 
 ## Installation model
 

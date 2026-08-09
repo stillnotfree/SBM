@@ -838,3 +838,122 @@ import Testing
       .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
   }
 }
+
+@Test func nativeCapabilityPolicyMatchesPinnedCore() {
+  #expect(NativeCapabilityPolicy.reviewedCoreVersion == CoreBuildInfo.version)
+}
+
+@Test func nativeCapabilityPolicyRejectsAnUnreviewedCoreVersion() {
+  #expect(throws: CoreFailure.self) {
+    try NativeCapabilityPolicy.requireReviewedCore(version: "0.0.0")
+  }
+}
+
+@Test func nativeProfileRejectsUnknownFutureOutboundType() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "future-client",
+          "tag": "future",
+          "server": "203.0.113.20",
+          "server_port": 443
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsFieldAuthorizedForDifferentOutboundType() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "socks",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 1080,
+          "uuid": "00000000-0000-4000-8000-000000000000"
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsSSHPrivateKeyPath() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "ssh",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 22,
+          "private_key_path": "/var/root/.ssh/id_ed25519"
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsUnknownFutureTransportType() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        {
+          "type": "vless",
+          "tag": "proxy",
+          "server": "203.0.113.20",
+          "server_port": 443,
+          "uuid": "00000000-0000-4000-8000-000000000000",
+          "transport": { "type": "future-transport", "path": "/" }
+        }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}
+
+@Test func nativeProfileRejectsSystemIntegratedDNSServerType() throws {
+  let source = Data(
+    """
+    {
+      "dns": {
+        "servers": [
+          { "type": "resolved", "tag": "system-dns" }
+        ]
+      },
+      "outbounds": [
+        { "type": "socks", "tag": "proxy", "server": "203.0.113.20", "server_port": 1080 }
+      ]
+    }
+    """.utf8)
+  let native = try NativeProfileParser.parse(source)
+  #expect(throws: (any Error).self) {
+    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+      .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
+  }
+}

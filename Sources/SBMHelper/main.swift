@@ -97,7 +97,8 @@ private final class HelperServer {
       }
       switch request.action {
       case .status:
-        response = manager.status()
+        let recoveryMessage = try manager.reconcileDesiredRuntime()
+        response = manager.status(message: recoveryMessage ?? "Helper connected")
       case .start:
         response = try manager.start(
           profile: request.profile,

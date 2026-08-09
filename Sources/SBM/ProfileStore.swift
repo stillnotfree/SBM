@@ -14,22 +14,18 @@ enum ProfileStore {
     from url: URL,
     preserveInvalidCopy: Bool = false
   ) throws -> ProfileLibrary? {
-    var info = stat()
-    guard lstat(url.path, &info) == 0 else {
+    guard pathExistsWithoutFollowingSymlinks(url) else {
       if errno == ENOENT { return nil }
       throw ProfileStoreFailure.unreadable
     }
-    guard isSecureDirectory(url.deletingLastPathComponent()),
-      isSecureRegularFile(url)
-    else {
+    guard isSecureDirectory(url.deletingLastPathComponent()) else {
       throw ProfileStoreFailure.unsafeStorage
-    }
-    guard info.st_size >= 0, info.st_size <= maximumFileSize else {
-      throw ProfileStoreFailure.tooLarge
     }
     let data: Data
     do {
-      data = try Data(contentsOf: url, options: [.mappedIfSafe])
+      data = try readRegularFileWithoutFollowingSymlinks(url, requireSecureMode: true)
+    } catch let failure as ProfileStoreFailure {
+      throw failure
     } catch {
       throw ProfileStoreFailure.unreadable
     }
@@ -44,6 +40,58 @@ enum ProfileStore {
   static func saveProfileLibrary(_ library: ProfileLibrary) throws {
     let url = try storageURL(createDirectory: true)
     try saveProfileLibrary(library, to: url)
+  }
+
+  static func importProfileLibrary(from sourceURL: URL) throws -> ProfileLibrary {
+    let destinationURL = try storageURL(createDirectory: true)
+    return try importProfileLibrary(from: sourceURL, to: destinationURL)
+  }
+
+  static func importProfileLibrary(
+    from sourceURL: URL,
+    to destinationURL: URL
+  ) throws -> ProfileLibrary {
+    let library = try decodeImportedProfileLibrary(from: sourceURL)
+    try saveProfileLibrary(library, to: destinationURL)
+    return library
+  }
+
+  static func resetProfileLibrary() throws -> ProfileLibrary {
+    let url = try storageURL(createDirectory: true)
+    return try resetProfileLibrary(at: url)
+  }
+
+  static func resetProfileLibrary(at url: URL) throws -> ProfileLibrary {
+    try requireSecureDirectory(url.deletingLastPathComponent())
+    if pathExistsWithoutFollowingSymlinks(url) {
+      let original = try readRegularFileWithoutFollowingSymlinks(
+        url,
+        requireSecureMode: true
+      )
+      _ = try preserveInvalid(original, nextTo: url)
+    }
+    let empty = ProfileLibrary.empty
+    try saveProfileLibrary(empty, to: url)
+    return empty
+  }
+
+  static func latestPreservedProfileURL() throws -> URL? {
+    let storage = try storageURL()
+    let directory = storage.deletingLastPathComponent()
+    guard isSecureDirectory(directory) else { throw ProfileStoreFailure.unsafeStorage }
+    return try FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: [.contentModificationDateKey],
+      options: [.skipsHiddenFiles]
+    ).filter { url in
+      url.lastPathComponent.hasPrefix("profiles.invalid-") && isSecureRegularFile(url)
+    }.sorted { left, right in
+      let leftDate = try? left.resourceValues(forKeys: [.contentModificationDateKey])
+        .contentModificationDate
+      let rightDate = try? right.resourceValues(forKeys: [.contentModificationDateKey])
+        .contentModificationDate
+      return (leftDate ?? .distantPast) > (rightDate ?? .distantPast)
+    }.first
   }
 
   static func saveProfileLibrary(_ library: ProfileLibrary, to url: URL) throws {
@@ -73,6 +121,48 @@ enum ProfileStore {
       [.posixPermissions: 0o600],
       ofItemAtPath: url.path
     )
+  }
+
+  private static func decodeImportedProfileLibrary(from url: URL) throws -> ProfileLibrary {
+    let data = try readRegularFileWithoutFollowingSymlinks(url, requireSecureMode: false)
+    do {
+      return try JSONDecoder().decode(ProfileLibrary.self, from: data)
+    } catch {
+      throw ProfileStoreFailure.invalidJSON(nil)
+    }
+  }
+
+  private static func readRegularFileWithoutFollowingSymlinks(
+    _ url: URL,
+    requireSecureMode: Bool
+  ) throws -> Data {
+    let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+    guard descriptor >= 0 else { throw ProfileStoreFailure.unreadable }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer { try? handle.close() }
+
+    var info = stat()
+    guard fstat(descriptor, &info) == 0,
+      (info.st_mode & S_IFMT) == S_IFREG,
+      info.st_uid == getuid()
+    else {
+      throw ProfileStoreFailure.unreadable
+    }
+    if requireSecureMode, (info.st_mode & 0o077) != 0 {
+      throw ProfileStoreFailure.unsafeStorage
+    }
+    guard info.st_size >= 0, info.st_size <= maximumFileSize else {
+      throw ProfileStoreFailure.tooLarge
+    }
+
+    var data = Data()
+    while data.count <= maximumFileSize {
+      let remaining = maximumFileSize + 1 - data.count
+      guard let chunk = try handle.read(upToCount: min(1_048_576, remaining)), !chunk.isEmpty
+      else { return data }
+      data.append(chunk)
+    }
+    throw ProfileStoreFailure.tooLarge
   }
 
   private static func storageURL(createDirectory: Bool = false) throws -> URL {

@@ -39,6 +39,7 @@ private enum UpdateCoreFailure: LocalizedError {
   case downloadFailed
   case digestMismatch
   case extractionFailed
+  case architectureMismatch(String)
   case versionMismatch(String)
 
   var errorDescription: String? {
@@ -51,6 +52,8 @@ private enum UpdateCoreFailure: LocalizedError {
     case .downloadFailed: "The official sing-box archive download failed."
     case .digestMismatch: "The official sing-box archive failed SHA-256 verification."
     case .extractionFailed: "The sing-box archive could not be extracted."
+    case .architectureMismatch(let output):
+      "The extracted sing-box binary is not arm64: \(output)"
     case .versionMismatch(let output):
       "The extracted core reported an unexpected version: \(output)"
     }
@@ -147,6 +150,15 @@ private enum UpdateCore {
     }
     let extractedCore = extractDirectory.appendingPathComponent("sing-box")
     let binaryDigest = try sha256(of: extractedCore)
+    let architectureResult = try run(
+      URL(fileURLWithPath: "/usr/bin/xcrun"),
+      ["lipo", "-archs", extractedCore.path]
+    )
+    let architectures = architectureResult.output
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard architectureResult.status == 0, architectures == "arm64" else {
+      throw UpdateCoreFailure.architectureMismatch(architectures)
+    }
     let versionResult = try run(extractedCore, ["version"])
     let firstLine = versionResult.output.split(separator: "\n").first.map(String.init) ?? ""
     guard versionResult.status == 0, firstLine == "sing-box version \(version)" else {

@@ -3,7 +3,7 @@ import Foundation
 public enum HelperConstants {
   public static let protocolVersion = 5
   public static let helperVersion = "1.1.3"
-  public static let helperRevision = 36
+  public static let helperRevision = 38
   public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.sock"
   public static let daemonPlistName = "com.stillnotfree.sbm.helper.plist"
 }
@@ -249,6 +249,8 @@ public struct HelperResponse: Codable, Sendable {
   public let activeProfileID: UUID?
   public let nodes: [ProxyNodeDescriptor]
   public let delays: [NodeDelay]
+  /// `true` requires an explicit user connection before recovery can retry.
+  public let automaticRecoveryExhausted: Bool
   public let message: String
 
   public init(
@@ -260,6 +262,7 @@ public struct HelperResponse: Codable, Sendable {
     activeProfileID: UUID? = nil,
     nodes: [ProxyNodeDescriptor] = [],
     delays: [NodeDelay] = [],
+    automaticRecoveryExhausted: Bool = false,
     message: String
   ) {
     self.protocolVersion = HelperConstants.protocolVersion
@@ -273,6 +276,41 @@ public struct HelperResponse: Codable, Sendable {
     self.activeProfileID = activeProfileID
     self.nodes = nodes
     self.delays = delays
+    self.automaticRecoveryExhausted = automaticRecoveryExhausted
     self.message = message
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion
+    case success
+    case helperVersion
+    case helperRevision
+    case coreRunning
+    case coreVersion
+    case mode
+    case selectedNode
+    case activeProfileID
+    case nodes
+    case delays
+    case automaticRecoveryExhausted
+    case message
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(Int.self, forKey: .protocolVersion)
+    success = try container.decode(Bool.self, forKey: .success)
+    helperVersion = try container.decode(String.self, forKey: .helperVersion)
+    helperRevision = try container.decode(Int.self, forKey: .helperRevision)
+    coreRunning = try container.decode(Bool.self, forKey: .coreRunning)
+    coreVersion = try container.decodeIfPresent(String.self, forKey: .coreVersion)
+    mode = try container.decode(RoutingMode.self, forKey: .mode)
+    selectedNode = try container.decode(ProxyNodeID.self, forKey: .selectedNode)
+    activeProfileID = try container.decodeIfPresent(UUID.self, forKey: .activeProfileID)
+    nodes = try container.decode([ProxyNodeDescriptor].self, forKey: .nodes)
+    delays = try container.decode([NodeDelay].self, forKey: .delays)
+    automaticRecoveryExhausted =
+      try container.decodeIfPresent(Bool.self, forKey: .automaticRecoveryExhausted) ?? false
+    message = try container.decode(String.self, forKey: .message)
   }
 }
