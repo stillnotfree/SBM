@@ -71,17 +71,62 @@ import Testing
   }
 }
 
-@Test func duplicateQueryKeysDoNotCrashParser() throws {
-  let links = """
-    vless://5efab93b-90d0-4904-93d6-44b4f0b00000@203.0.113.10:443?flow=wrong&flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=chrome&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b
-    hysteria2://test-password@vpn.example.com:443/?sni=vpn.example.com&obfs=salamander&obfs-password=test-obfs
-    """
-  let profile = try SubscriptionClient.parsePayload(links)
-  guard case .compatibility(let compatibility) = profile else {
-    Issue.record("Expected a compatibility subscription")
-    return
+@Test func duplicateAndCaseVariantVLESSQueryKeysFailClosed() {
+  let prefix =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00000@203.0.113.10:443?"
+  let suffix =
+    "&security=reality&sni=www.debian.org&fp=chrome&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b"
+  for query in [
+    "flow=wrong&flow=xtls-rprx-vision",
+    "flow=xtls-rprx-vision&Flow=wrong",
+    "type=xhttp&type=tcp&flow=xtls-rprx-vision",
+  ] {
+    #expect(throws: SubscriptionFailure.ambiguousVLESSParameters) {
+      try SubscriptionClient.parsePayload(prefix + query + suffix)
+    }
   }
-  #expect(compatibility.vless.first?.server == "203.0.113.10")
+}
+
+@Test func vlessEncryptionDefaultsToNoneAndRejectsAmbiguousOrUnsupportedValues() throws {
+  let base =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00000@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=chrome&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b&type=tcp"
+  _ = try SubscriptionClient.parsePayload(base + "#MissingDefaultsToNone")
+  _ = try SubscriptionClient.parsePayload(base + "&encryption=none#ExplicitNone")
+
+  #expect(throws: SubscriptionFailure.invalidVLESS) {
+    try SubscriptionClient.parsePayload(base + "&encryption=#Empty")
+  }
+  #expect(throws: SubscriptionFailure.unsupportedVLESSEncryption) {
+    try SubscriptionClient.parsePayload(base + "&encryption=mlkem768x25519plus.native#Unsupported")
+  }
+  #expect(throws: SubscriptionFailure.ambiguousVLESSParameters) {
+    try SubscriptionClient.parsePayload(base + "&encryption=none&encryption=none#Duplicate")
+  }
+}
+
+@Test func vlessCompactLinkRejectsIgnoredSemanticsAndInvalidRealityFields() {
+  let prefix =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00000@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=chrome&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b&type=tcp"
+  #expect(throws: SubscriptionFailure.unsupportedVLESSParameter) {
+    try SubscriptionClient.parsePayload(prefix + "&packetEncoding=packetaddr#Unsupported")
+  }
+  #expect(throws: SubscriptionFailure.invalidVLESS) {
+    try SubscriptionClient.parsePayload(
+      prefix.replacingOccurrences(of: "fp=chrome", with: "fp=unknown"))
+  }
+  #expect(throws: SubscriptionFailure.invalidVLESS) {
+    try SubscriptionClient.parsePayload(
+      prefix.replacingOccurrences(
+        of: "pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+        with: "pbk=not-a-reality-key"
+      )
+    )
+  }
+  #expect(throws: SubscriptionFailure.invalidVLESS) {
+    try SubscriptionClient.parsePayload(
+      prefix.replacingOccurrences(of: "sid=bb6b725b", with: "sid=ABC")
+    )
+  }
 }
 
 @Test func directVLESSLinkCreatesSingleNodeProfile() throws {
@@ -106,6 +151,250 @@ import Testing
   }
   #expect(compatibility.vless.isEmpty)
   #expect(compatibility.hysteria2.count == 1)
+}
+
+@Test func strictSIP002ShadowsocksAcceptsPlainAndBase64UserInfo() throws {
+  let plain = "ss://aes-256-gcm:plain-password@ss.example.com:443/#Plain"
+  let encodedCredential = Data("chacha20-ietf-poly1305:encoded-password".utf8)
+    .base64EncodedString()
+    .replacingOccurrences(of: "+", with: "-")
+    .replacingOccurrences(of: "/", with: "_")
+    .replacingOccurrences(of: "=", with: "")
+  let profile = try SubscriptionClient.parsePayload(
+    "\(plain)\nss://\(encodedCredential)@198.51.100.2:8443/#Encoded")
+  guard case .compatibility(let compatibility) = profile else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(compatibility.connections.count == 2)
+  #expect(compatibility.connections.allSatisfy { $0.id.rawValue.hasPrefix("node-") })
+  #expect(compatibility.shadowsocks.map(\.method) == ["aes-256-gcm", "chacha20-ietf-poly1305"])
+  #expect(compatibility.shadowsocks.map(\.password) == ["plain-password", "encoded-password"])
+}
+
+@Test func strictSIP002ShadowsocksAllows2022PlainButRejectsEncodedAndUnsupportedForms() throws {
+  let psk = Data(repeating: 7, count: 16).base64EncodedString()
+  let valid = "ss://2022-blake3-aes-128-gcm:\(psk)@ss.example.com:443/#2022"
+  let encoded2022 = Data("2022-blake3-aes-128-gcm:\(psk)".utf8).base64EncodedString()
+  _ = try SubscriptionClient.parsePayload(valid)
+  for invalid in [
+    "ss://\(encoded2022)@ss.example.com:443/",
+    "ss://2022-blake3-aes-128-gcm:c2hvcnQ=@ss.example.com:443/",
+    "ss://aes-128-gcm:password@ss.example.com:443/?plugin=obfs-local",
+    "ss://YWVzLTEyOC1nY206cGFzc3dvcmRAc3MuZXhhbXBsZS5jb206NDQz",
+    "ss://rc4-md5:password@ss.example.com:443/",
+    "ss://none:password@ss.example.com:443/",
+  ] {
+    #expect(throws: SubscriptionFailure.invalidShadowsocks) {
+      try SubscriptionClient.parsePayload(invalid)
+    }
+  }
+}
+
+@Test func mixedSubscriptionIncludesVLESSHysteria2AndShadowsocks() throws {
+  let links = """
+    vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&type=tcp#Reality
+    hysteria2://password@vpn.example.com:443/?sni=vpn.example.com#Hysteria2
+    ss://aes-128-gcm:password@ss.example.com:443/#Shadowsocks
+    """
+  let profile = try SubscriptionClient.parsePayload(links)
+  guard case .compatibility(let compatibility) = profile else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(compatibility.connections.map(\.kind) == [.vless, .hysteria2, .shadowsocks])
+}
+
+@Test func reconciliationPreservesStableIDsAcrossRenameReorderAndDuplicates() throws {
+  let outbound = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "ss.example.com", port: 443, method: "aes-128-gcm", password: "same",
+      displayName: "Old"
+    ))
+  let previous = CoreProfile.compatibility(
+    VPNProfile(connections: [
+      ManagedConnection(id: ProxyNodeID(rawValue: "node-one"), outbound: outbound),
+      ManagedConnection(id: ProxyNodeID(rawValue: "node-two"), outbound: outbound),
+    ]))
+  let renamed = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "ss.example.com", port: 443, method: "aes-128-gcm", password: "same",
+      displayName: "Renamed"
+    ))
+  let fresh = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "new.example.com", port: 443, method: "aes-256-gcm", password: "new",
+      displayName: "New"
+    ))
+  let reconciled = ManagedConnectionReconciler.reconcile(
+    existing: previous,
+    fetched: .compatibility(
+      VPNProfile(connections: [
+        ManagedConnection(outbound: renamed),
+        ManagedConnection(outbound: fresh),
+        ManagedConnection(outbound: renamed),
+      ]))
+  )
+  guard case .compatibility(let result) = reconciled else { return }
+  #expect(result.connections[0].id == ProxyNodeID(rawValue: "node-one"))
+  #expect(result.connections[2].id == ProxyNodeID(rawValue: "node-two"))
+  #expect(result.connections[1].id.rawValue.hasPrefix("node-"))
+  #expect(ManagedConnectionReconciler.requiresActivation(previous: previous, next: reconciled))
+  let renamedOnly = ManagedConnectionReconciler.reconcile(
+    existing: previous,
+    fetched: .compatibility(
+      VPNProfile(connections: [
+        ManagedConnection(outbound: renamed),
+        ManagedConnection(outbound: renamed),
+      ]))
+  )
+  #expect(!ManagedConnectionReconciler.requiresActivation(previous: previous, next: renamedOnly))
+}
+
+@Test func aggregateReconciliationPreservesIDWhenDuplicateMovesBetweenSources() throws {
+  let outbound = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "shared.example.com",
+      port: 443,
+      method: "aes-128-gcm",
+      password: "shared-password",
+      displayName: "Shared"
+    ))
+  let firstID = ProxyNodeID(rawValue: "node-first")
+  let secondID = ProxyNodeID(rawValue: "node-second")
+  let firstSource = ManagedSource(
+    name: "First",
+    value: "ss://first",
+    payload: .compatibility(
+      VPNProfile(connections: [ManagedConnection(id: firstID, outbound: outbound)]))
+  )
+  let secondSource = ManagedSource(
+    name: "Second",
+    value: "ss://second",
+    payload: .compatibility(
+      VPNProfile(connections: [ManagedConnection(id: secondID, outbound: outbound)]))
+  )
+  let previous = try ProfileAggregator.merge(
+    sources: [firstSource, secondSource],
+    routingPolicy: nil
+  )
+  let fetched = try ProfileAggregator.merge(
+    sources: [
+      ManagedSource(
+        id: firstSource.id,
+        name: firstSource.name,
+        value: firstSource.value,
+        payload: .compatibility(VPNProfile())
+      ),
+      secondSource,
+    ],
+    routingPolicy: nil
+  )
+
+  let reconciled = ManagedConnectionReconciler.reconcile(
+    existing: previous,
+    fetched: fetched
+  )
+  guard case .compatibility(let profile) = reconciled else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(profile.connections.map(\.id) == [firstID])
+  #expect(profile.nodeGroups?.map(\.nodes) == [[firstID]])
+  #expect(!ManagedConnectionReconciler.requiresActivation(previous: previous, next: reconciled))
+}
+
+@Test func semanticIdentityIsUnambiguousWhenSecretsContainDelimiters() {
+  let left = ManagedOutbound.hysteria2(
+    Hysteria2Profile(
+      server: "hy.example.com", port: 443, password: "one|two", serverName: "three",
+      displayName: "Left"
+    ))
+  let right = ManagedOutbound.hysteria2(
+    Hysteria2Profile(
+      server: "hy.example.com", port: 443, password: "one", serverName: "two|three",
+      displayName: "Right"
+    ))
+  #expect(left.semanticIdentity != right.semanticIdentity)
+}
+
+@Test func newManagedConnectionIDIsDeterministicNameAndOrderIndependent() {
+  let oldName = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "Proxy.Example.COM.",
+      port: 443,
+      method: "AES-128-GCM",
+      password: "synthetic-secret",
+      displayName: "Old name"
+    )
+  )
+  let renamed = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "proxy.example.com",
+      port: 443,
+      method: "aes-128-gcm",
+      password: "synthetic-secret",
+      displayName: "Renamed"
+    )
+  )
+  let first = ManagedConnection(outbound: oldName)
+  let second = ManagedConnection(outbound: renamed)
+
+  #expect(first.id == second.id)
+  #expect(first.id.rawValue.hasPrefix("node-v1-"))
+  #expect(first.id.rawValue.count == 72)
+  #expect(first.id.rawValue.allSatisfy { $0.isASCII })
+  #expect(!first.id.rawValue.contains("synthetic-secret"))
+  #expect(!first.id.rawValue.contains("proxy.example.com"))
+
+  let reversed = [second, first].reversed().map(\.id)
+  #expect(Set(reversed) == Set([first.id]))
+}
+
+@Test func managedConnectionIDChangesWithEndpointOrCredentials() {
+  func connection(server: String = "proxy.example.com", password: String = "secret-one")
+    -> ManagedConnection
+  {
+    ManagedConnection(
+      outbound: .shadowsocks(
+        ShadowsocksProfile(
+          server: server,
+          port: 443,
+          method: "aes-128-gcm",
+          password: password,
+          displayName: "Node"
+        )
+      )
+    )
+  }
+
+  let baseline = connection()
+  #expect(connection(server: "other.example.com").id != baseline.id)
+  #expect(connection(password: "secret-two").id != baseline.id)
+}
+
+@Test func explicitLegacyManagedConnectionIDSurvivesDeterministicDefault() throws {
+  let legacyID = ProxyNodeID(rawValue: "vless-1")
+  let connection = ManagedConnection(
+    id: legacyID,
+    outbound: .vless(
+      VLESSProfile(
+        server: "203.0.113.10",
+        port: 443,
+        uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
+        serverName: "example.test",
+        fingerprint: "chrome",
+        publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+        shortID: "",
+        displayName: "Legacy"
+      )
+    )
+  )
+  let decoded = try JSONDecoder().decode(
+    ManagedConnection.self,
+    from: JSONEncoder().encode(connection)
+  )
+  #expect(decoded.id == legacyID)
 }
 
 @Test func compatibilitySubscriptionKeepsEverySupportedConnection() throws {
@@ -168,11 +457,13 @@ import Testing
     for: URL(string: "https://example.com/subscription")!,
     headers: SubscriptionHeaders(
       userAgent: "Custom Client/1.0",
+      appVersion: "5.4.0",
       deviceOS: "macOS",
       hardwareID: "test-hwid"
     )
   )
   #expect(request.value(forHTTPHeaderField: "User-Agent") == "Custom Client/1.0")
+  #expect(request.value(forHTTPHeaderField: "X-App-Version") == "5.4.0")
   #expect(request.value(forHTTPHeaderField: "X-Device-OS") == "macOS")
   #expect(request.value(forHTTPHeaderField: "X-HWID") == "test-hwid")
 }
@@ -183,6 +474,7 @@ import Testing
     for: source,
     headers: SubscriptionHeaders(
       userAgent: "Custom Client/1.0",
+      appVersion: "5.4.0",
       deviceOS: "macOS",
       hardwareID: "test-hwid"
     )
@@ -209,6 +501,7 @@ import Testing
     )
   )
   #expect(crossOrigin.value(forHTTPHeaderField: "X-HWID") == nil)
+  #expect(crossOrigin.value(forHTTPHeaderField: "X-App-Version") == nil)
   #expect(crossOrigin.value(forHTTPHeaderField: "X-Device-OS") == nil)
   #expect(crossOrigin.value(forHTTPHeaderField: "Authorization") == nil)
   #expect(crossOrigin.value(forHTTPHeaderField: "Proxy-Authorization") == nil)
@@ -225,6 +518,7 @@ import Testing
     )
   )
   #expect(returnToOrigin.value(forHTTPHeaderField: "X-HWID") == nil)
+  #expect(returnToOrigin.value(forHTTPHeaderField: "X-App-Version") == nil)
   #expect(returnToOrigin.value(forHTTPHeaderField: "X-Device-OS") == nil)
 
   #expect(
@@ -310,9 +604,9 @@ private actor SubscriptionFetchCounter {
   let groups = compatibility.nodeGroups ?? []
   #expect(groups.count == 2)
   #expect(groups[0].name == "First")
-  #expect(groups[0].nodes == [ProxyNodeID(rawValue: "vless-1")])
+  #expect(groups[0].nodes == [compatibility.connections[0].id])
   #expect(groups[1].name == "Second")
-  #expect(groups[1].nodes == [ProxyNodeID(rawValue: "hysteria2-1")])
+  #expect(groups[1].nodes == [compatibility.connections[1].id])
 }
 
 @Test func profileAggregatorAppliesPerSourceExcludeRegex() throws {
@@ -340,7 +634,7 @@ private actor SubscriptionFetchCounter {
   }
   #expect(compatibility.vless.map(\.displayName) == ["Netherlands"])
   #expect(compatibility.hysteria2.isEmpty)
-  #expect(compatibility.nodeGroups?.first?.nodes == [ProxyNodeID(rawValue: "vless-1")])
+  #expect(compatibility.nodeGroups?.first?.nodes == [compatibility.connections[0].id])
 }
 
 @Test func sourceExcludeRegexRejectsInvalidPatterns() {

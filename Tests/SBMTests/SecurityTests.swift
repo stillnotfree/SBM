@@ -41,6 +41,253 @@ import Testing
   #expect(!state.automaticRecoveryAttempted)
 }
 
+@Test func legacyManagedLibraryMigratesExactAggregateIDsAndAtomicallyRewrites() throws {
+  let profileID = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+  let sourceAID = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
+  let sourceBID = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
+  let realityA = VLESSProfile(
+    server: "203.0.113.1", port: 443,
+    uuid: "5efab93b-90d0-4904-93d6-44b4f0b00001", serverName: "a.example.com",
+    fingerprint: "chrome", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+    shortID: "", displayName: "Reality A"
+  )
+  let realityB = VLESSProfile(
+    server: "203.0.113.2", port: 443,
+    uuid: "5efab93b-90d0-4904-93d6-44b4f0b00002", serverName: "b.example.com",
+    fingerprint: "firefox", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+    shortID: "", displayName: "Reality B"
+  )
+  let hysteria = Hysteria2Profile(
+    server: "hy.example.com", port: 443, password: "hy-password",
+    serverName: "hy.example.com", displayName: "Hysteria A"
+  )
+  let sourceA = CoreProfile.compatibility(VPNProfile(vless: [realityA], hysteria2: [hysteria]))
+  let sourceB = CoreProfile.compatibility(VPNProfile(vless: [realityA, realityB]))
+  let aggregate = CoreProfile.compatibility(
+    VPNProfile(
+      vless: [realityA], hysteria2: [hysteria],
+      nodeGroups: [
+        ProxyNodeGroup(
+          id: sourceAID.uuidString, name: "First",
+          nodes: [ProxyNodeID(rawValue: "vless-1"), ProxyNodeID(rawValue: "hysteria2-1")]
+        )
+      ]
+    ))
+  let modern = ProfileLibrary(
+    profiles: [
+      ManagedProfile(
+        id: profileID, name: "Legacy",
+        sources: [
+          ManagedSource(id: sourceAID, name: "First", value: "vless://first", payload: sourceA),
+          ManagedSource(
+            id: sourceBID, name: "Second", value: "vless://second", excludeRegex: "Reality B",
+            payload: sourceB
+          ),
+        ], payload: aggregate
+      )
+    ],
+    selectedProfileID: profileID
+  )
+  var root = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(modern)) as? [String: Any])
+  var profiles = try #require(root["profiles"] as? [[String: Any]])
+  var entry = profiles[0]
+  entry["payload"] = try legacyCompatibilityPayload(aggregate)
+  var sources = try #require(entry["sources"] as? [[String: Any]])
+  sources[0]["payload"] = try legacyCompatibilityPayload(sourceA)
+  sources[1]["payload"] = try legacyCompatibilityPayload(sourceB)
+  entry["sources"] = sources
+  profiles[0] = entry
+  root["profiles"] = profiles
+  root.removeValue(forKey: "schemaVersion")
+  let legacyData = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+
+  let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: legacyData)
+  #expect(decoded.requiresMigration)
+  let migrated = try #require(decoded.profiles.first)
+  let aggregateProfile: VPNProfile
+  if case .compatibility(let value) = try #require(migrated.payload) {
+    aggregateProfile = value
+  } else {
+    fatalError()
+  }
+  #expect(aggregateProfile.connections.map(\.id.rawValue) == ["vless-1", "hysteria2-1"])
+  #expect(
+    aggregateProfile.nodeGroups?.map(\.nodes) == [
+      [ProxyNodeID(rawValue: "vless-1"), ProxyNodeID(rawValue: "hysteria2-1")]
+    ])
+  guard case .compatibility(let migratedSourceB) = try #require(migrated.sources.last?.payload)
+  else {
+    Issue.record("Expected a compatibility source")
+    return
+  }
+  #expect(migratedSourceB.connections.map(\.id.rawValue).first == "vless-1")
+  #expect(migratedSourceB.connections.map(\.id.rawValue).last?.hasPrefix("node-") == true)
+
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMLegacyMigration-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: directory, withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700])
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let url = directory.appendingPathComponent("profiles.json")
+  FileManager.default.createFile(
+    atPath: url.path, contents: legacyData,
+    attributes: [.posixPermissions: 0o600])
+  let loaded = try ProfileStore.loadProfileLibrary(from: url)
+  let persisted = try #require(loaded)
+  #expect(!persisted.requiresMigration)
+  let rewritten = try #require(
+    JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+  #expect(rewritten["schemaVersion"] as? Int == ProfileLibrary.currentSchemaVersion)
+  let rewrittenProfiles = try #require(rewritten["profiles"] as? [[String: Any]])
+  let rewrittenPayload = try #require(rewrittenProfiles[0]["payload"] as? [String: Any])
+  let compatibility = try #require(rewrittenPayload["compatibility"] as? [String: Any])
+  let value = try #require(compatibility["_0"] as? [String: Any])
+  #expect(value["connections"] != nil)
+  #expect(value["vless"] == nil)
+}
+
+@Test func persistentStateMigratesLegacySelectionAndFallsBackForCorruptMapping() throws {
+  let profile = CoreProfile.compatibility(
+    VPNProfile(vless: [
+      VLESSProfile(
+        server: "203.0.113.1", port: 443,
+        uuid: "5efab93b-90d0-4904-93d6-44b4f0b00001", serverName: "a.example.com",
+        fingerprint: "chrome", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+        shortID: "", displayName: "Reality"
+      )
+    ]))
+  var root = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)) as? [String: Any])
+  root = try legacyCompatibilityPayload(profile)
+  let state: [String: Any] = [
+    "profile": root,
+    "selectedNode": "vless-1",
+    "nodes": [["id": "vless-1", "name": "Reality"]],
+    "apiSecret": "test-secret",
+  ]
+  let preserved = try JSONDecoder().decode(
+    PersistentState.self, from: JSONSerialization.data(withJSONObject: state))
+  #expect(preserved.selectedNode == ProxyNodeID(rawValue: "vless-1"))
+  #expect(preserved.nodes.first?.kind == .vless)
+  var corrupt = state
+  corrupt["selectedNode"] = "vless-99"
+  let recovered = try JSONDecoder().decode(
+    PersistentState.self, from: JSONSerialization.data(withJSONObject: corrupt))
+  #expect(recovered.selectedNode == .auto)
+}
+
+@Test func persistentStateDuplicateManagedIDsFailClosedWithoutTrapping() throws {
+  let outbound = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "ss.example.com",
+      port: 443,
+      method: "aes-128-gcm",
+      password: "password",
+      displayName: "Shadowsocks"
+    ))
+  let duplicateID = ProxyNodeID(rawValue: "node-duplicate")
+  let profile = CoreProfile.compatibility(
+    VPNProfile(connections: [
+      ManagedConnection(id: duplicateID, outbound: outbound),
+      ManagedConnection(id: duplicateID, outbound: outbound),
+    ]))
+  let state: [String: Any] = [
+    "profile": try JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)),
+    "selectedNode": duplicateID.rawValue,
+    "nodes": [["id": duplicateID.rawValue, "name": "Duplicate"]],
+    "apiSecret": "test-secret",
+  ]
+
+  let decoded = try JSONDecoder().decode(
+    PersistentState.self,
+    from: JSONSerialization.data(withJSONObject: state)
+  )
+  #expect(decoded.selectedNode == .auto)
+}
+
+@Test func failedLegacyMigrationWriteDoesNotQuarantineValidJSONAsCorrupt() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMMigrationWriteFailure-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: directory, withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700])
+  defer {
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    try? FileManager.default.removeItem(at: directory)
+  }
+  let url = directory.appendingPathComponent("profiles.json")
+  let validLegacy = Data(
+    """
+    {"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
+    """.utf8)
+  FileManager.default.createFile(
+    atPath: url.path, contents: validLegacy,
+    attributes: [.posixPermissions: 0o600])
+  try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+  do {
+    _ = try ProfileStore.loadProfileLibrary(from: url, preserveInvalidCopy: true)
+    Issue.record("Expected the atomic migration write to fail")
+  } catch let failure as ProfileStoreFailure {
+    if case .invalidJSON = failure {
+      Issue.record("Valid legacy JSON was misclassified as invalid")
+    }
+  } catch {
+    // The underlying write failure is the expected fail-closed outcome.
+  }
+  let preserved = try FileManager.default.contentsOfDirectory(
+    at: directory, includingPropertiesForKeys: nil
+  )
+  .filter { $0.lastPathComponent.hasPrefix("profiles.invalid-") }
+  #expect(preserved.isEmpty)
+  #expect(try Data(contentsOf: url) == validLegacy)
+}
+
+@Test func profileLibraryRejectsUnknownOrSchemaMismatchedManagedConnectionEncoding() throws {
+  let future = Data(
+    """
+    {"schemaVersion":4,"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
+    """.utf8)
+  #expect(throws: DecodingError.self) {
+    try JSONDecoder().decode(ProfileLibrary.self, from: future)
+  }
+  let vless = VLESSProfile(
+    server: "203.0.113.1", port: 443,
+    uuid: "5efab93b-90d0-4904-93d6-44b4f0b00001", serverName: "a.example.com",
+    fingerprint: "chrome", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+    shortID: "", displayName: "Reality"
+  )
+  let payload = CoreProfile.compatibility(VPNProfile(vless: [vless]))
+  let current = ProfileLibrary(
+    profiles: [ManagedProfile(name: "Current", payload: payload)], selectedProfileID: nil)
+  var root = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(current)) as? [String: Any])
+  var profiles = try #require(root["profiles"] as? [[String: Any]])
+  profiles[0]["payload"] = try legacyCompatibilityPayload(payload)
+  root["profiles"] = profiles
+  #expect(throws: DecodingError.self) {
+    try JSONDecoder().decode(
+      ProfileLibrary.self, from: JSONSerialization.data(withJSONObject: root))
+  }
+}
+
+private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [String: Any] {
+  guard case .compatibility(let compatibilityProfile) = profile else { fatalError() }
+  var root = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)) as? [String: Any])
+  var wrapper = try #require(root["compatibility"] as? [String: Any])
+  var value = try #require(wrapper["_0"] as? [String: Any])
+  value.removeValue(forKey: "connections")
+  value["vless"] = try JSONSerialization.jsonObject(
+    with: JSONEncoder().encode(compatibilityProfile.vless))
+  value["hysteria2"] = try JSONSerialization.jsonObject(
+    with: JSONEncoder().encode(compatibilityProfile.hysteria2))
+  wrapper["_0"] = value
+  root["compatibility"] = wrapper
+  return root
+}
+
 @Test func desiredRuntimeRecoveryAllowsOnlyOneAutomaticAttempt() {
   #expect(
     DesiredRuntimeRecoveryPolicy.decision(
@@ -173,6 +420,7 @@ import Testing
 @Test func resettingRequestPresetPreservesHWID() {
   let original = SubscriptionHeaders(
     userAgent: "Custom/1.0",
+    appVersion: nil,
     deviceOS: "CustomOS",
     hardwareID: "stable-device-id"
   )
@@ -180,8 +428,39 @@ import Testing
   let reset = original.resettingRequestPreset()
 
   #expect(reset.userAgent == SubscriptionHeaders.defaultUserAgent)
+  #expect(reset.appVersion == SubscriptionHeaders.defaultAppVersion)
   #expect(reset.deviceOS == SubscriptionHeaders.defaultDeviceOS)
   #expect(reset.hardwareID == "stable-device-id")
+}
+
+@Test func newSourcesUseCapturedHappPresetWithoutMigratingStoredHeaders() throws {
+  let fresh = ManagedSource()
+  #expect(fresh.headers.userAgent == "Happ/5.4.0/ios/2607311456556")
+  #expect(fresh.headers.appVersion == "5.4.0")
+  #expect(fresh.headers.deviceOS == "iOS")
+  #expect(fresh.headers.hardwareID.count == 16)
+  #expect(
+    fresh.headers.hardwareID.allSatisfy {
+      $0.isLowercase || $0.isNumber
+    })
+
+  let stored = ManagedSource(
+    name: "Existing",
+    headers: SubscriptionHeaders(
+      userAgent: "Custom Existing Client/7.0",
+      appVersion: nil,
+      deviceOS: "CustomOS",
+      hardwareID: "existing-hwid"
+    )
+  )
+  let restored = try JSONDecoder().decode(
+    ManagedSource.self,
+    from: JSONEncoder().encode(stored)
+  )
+  #expect(restored.headers.userAgent == "Custom Existing Client/7.0")
+  #expect(restored.headers.appVersion == nil)
+  #expect(restored.headers.deviceOS == "CustomOS")
+  #expect(restored.headers.hardwareID == "existing-hwid")
 }
 
 @Test func profileStorePreservesMalformedLibraryAndReportsFailure() throws {

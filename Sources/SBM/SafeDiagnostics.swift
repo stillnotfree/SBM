@@ -29,8 +29,9 @@ enum SecretRedactor {
   }
 
   private static let patterns = [
-    #"\b(?:https?|vless|hysteria2|hy2)://[^\s\]\[\)\(\}"']+"#,
+    #"\b(?:https?|vless|hysteria2|hy2|ss)://[^\s\]\[\)\(\}"']+"#,
     #"\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*[^\r\n]+"#,
+    #"\b(?:password|pass|secret|token|hwid|x[-_]?hwid|uuid|public[-_]?key|private[-_]?key|short[-_]?id)\s*[:=]\s*[^\s,;]+"#,
     #"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b"#,
   ]
 }
@@ -53,12 +54,16 @@ enum DiagnosticSecrets {
   private static func collect(from profile: CoreProfile, into values: inout [String]) {
     switch profile {
     case .compatibility(let profile):
-      for connection in profile.vless {
-        values.append(contentsOf: [connection.uuid, connection.publicKey, connection.shortID])
-      }
-      for connection in profile.hysteria2 {
-        values.append(connection.password)
-        if let obfsPassword = connection.obfsPassword { values.append(obfsPassword) }
+      for connection in profile.connections {
+        switch connection.outbound {
+        case .vless(let value):
+          values.append(contentsOf: [value.uuid, value.publicKey, value.shortID])
+        case .hysteria2(let value):
+          values.append(value.password)
+          if let obfsPassword = value.obfsPassword { values.append(obfsPassword) }
+        case .shadowsocks(let value):
+          values.append(value.password)
+        }
       }
     case .native(let profile):
       guard let object = try? JSONSerialization.jsonObject(with: profile.configuration) else {

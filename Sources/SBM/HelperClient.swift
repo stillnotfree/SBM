@@ -30,6 +30,8 @@ enum HelperClientError: LocalizedError {
 
 enum HelperClient {
   private static let requestLock = NSLock()
+  // A start may include one bounded core check plus a failed transition and rollback.
+  static let runtimeMutationReceiveTimeoutSeconds = 60
 
   static func send(_ action: HelperAction) throws -> HelperResponse {
     try send(HelperRequest(action: action))

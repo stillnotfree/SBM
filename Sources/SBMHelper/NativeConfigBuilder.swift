@@ -9,8 +9,10 @@ struct NativeConfigurationComposer {
     profile: NativeProfile,
     mode: RoutingMode,
     selectedNode: ProxyNodeID,
-    localSOCKSPort: UInt16? = nil
+    localSOCKSPort: UInt16? = nil,
+    latencyTestURL: String = LatencyTargetPolicy.defaultURL
   ) throws -> BuiltConfiguration {
+    let latencyTestURL = try LatencyTargetPolicy.normalized(latencyTestURL)
     try NativeCapabilityPolicy.requireReviewedCore()
     guard profile.configuration.count <= 1_048_576,
       let source = try JSONSerialization.jsonObject(with: profile.configuration) as? [String: Any]
@@ -75,7 +77,8 @@ struct NativeConfigurationComposer {
           try appendManagedAuto(
             candidates: candidates,
             tags: tags,
-            outbounds: &outbounds
+            outbounds: &outbounds,
+            latencyTestURL: latencyTestURL
           )
           selectableTags.insert("sbm-auto", at: 0)
           outbounds[selectorIndex]["outbounds"] = selectableTags
@@ -98,7 +101,12 @@ struct NativeConfigurationComposer {
       guard !allCandidates.isEmpty else {
         throw CoreFailure.invalidProfile("The native profile has no selectable proxy outbounds.")
       }
-      try appendManagedAuto(candidates: allCandidates, tags: tags, outbounds: &outbounds)
+      try appendManagedAuto(
+        candidates: allCandidates,
+        tags: tags,
+        outbounds: &outbounds,
+        latencyTestURL: latencyTestURL
+      )
       selectableTags = ["sbm-auto"] + allCandidates
       outbounds.insert(
         [
@@ -140,8 +148,21 @@ struct NativeConfigurationComposer {
     guard rules.count <= 4096 else {
       throw CoreFailure.invalidProfile("The native profile contains too many routing rules.")
     }
+    let applicationRules = try ProfileValidator.applicationRouteRules(
+      profile.applicationRoutingRules,
+      directOutbound: directTag,
+      proxyOutbound: selectorTag,
+      allowedNodeIDs: Set(
+        selectableTags.filter { tag in
+          tag != "sbm-auto"
+            && !["direct", "block", "dns", "selector", "urltest"].contains(typesByTag[tag])
+        })
+    )
     rules.insert(
-      contentsOf: managedRouteRules(selectorTag: selectorTag, directTag: directTag), at: 0)
+      contentsOf: managedRouteRules(selectorTag: selectorTag, directTag: directTag)
+        + applicationRules,
+      at: 0
+    )
     route["rules"] = rules
     route["auto_detect_interface"] = true
     // Rule mode preserves every imported rule, while unmatched traffic must
@@ -212,8 +233,14 @@ struct NativeConfigurationComposer {
         )
       }
     }
+    let metadataByID = Dictionary(uniqueKeysWithValues: profile.nodes.map { ($0.id.rawValue, $0) })
     let nodes = selectableTags.map { tag in
-      ProxyNodeDescriptor(id: ProxyNodeID(rawValue: tag), name: names[tag] ?? tag)
+      ProxyNodeDescriptor(
+        id: ProxyNodeID(rawValue: tag),
+        name: names[tag] ?? tag,
+        kind: tag == "sbm-auto" || typesByTag[tag] == "urltest"
+          ? .automatic : metadataByID[tag]?.kind ?? .native
+      )
     }
     let data = try JSONSerialization.data(
       withJSONObject: root,
@@ -593,7 +620,8 @@ struct NativeConfigurationComposer {
   private func appendManagedAuto(
     candidates: [String],
     tags: Set<String>,
-    outbounds: inout [[String: Any]]
+    outbounds: inout [[String: Any]],
+    latencyTestURL: String
   ) throws {
     guard !tags.contains("sbm-auto") else {
       throw CoreFailure.invalidProfile("The profile uses the reserved tag sbm-auto.")
@@ -602,7 +630,7 @@ struct NativeConfigurationComposer {
       "type": "urltest",
       "tag": "sbm-auto",
       "outbounds": candidates,
-      "url": "https://www.gstatic.com/generate_204",
+      "url": latencyTestURL,
       "interval": "10m",
       "tolerance": 50,
       "idle_timeout": "30m",

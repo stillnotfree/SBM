@@ -29,12 +29,21 @@ enum ProfileStore {
     } catch {
       throw ProfileStoreFailure.unreadable
     }
+    var library: ProfileLibrary
     do {
-      return try JSONDecoder().decode(ProfileLibrary.self, from: data)
+      library = try JSONDecoder().decode(ProfileLibrary.self, from: data)
     } catch {
       let preservedName = preserveInvalidCopy ? try preserveInvalid(data, nextTo: url) : nil
       throw ProfileStoreFailure.invalidJSON(preservedName)
     }
+    if library.requiresMigration {
+      // Do not allow an auto-refresh or helper request to observe a transient
+      // legacy schema: atomically persist stable IDs first. A write failure is
+      // deliberately propagated as such; valid legacy data is not quarantined.
+      library.requiresMigration = false
+      try saveProfileLibrary(library, to: url)
+    }
+    return library
   }
 
   static func saveProfileLibrary(_ library: ProfileLibrary) throws {
@@ -51,7 +60,8 @@ enum ProfileStore {
     from sourceURL: URL,
     to destinationURL: URL
   ) throws -> ProfileLibrary {
-    let library = try decodeImportedProfileLibrary(from: sourceURL)
+    var library = try decodeImportedProfileLibrary(from: sourceURL)
+    library.requiresMigration = false
     try saveProfileLibrary(library, to: destinationURL)
     return library
   }

@@ -1,14 +1,24 @@
 import AppKit
+import SBMShared
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+  private enum JSONImportKind {
+    case nativeProfile
+    case routing
+    case profileRecovery
+  }
+
   @Bindable var model: AppModel
-  @State private var isImportingProfile = false
-  @State private var isImportingRouting = false
-  @State private var isImportingProfileRecovery = false
+  @State private var isImportingJSON = false
+  @State private var jsonImportKind = JSONImportKind.nativeProfile
   @State private var isConfirmingHWIDRegeneration = false
   @State private var isConfirmingProfileReset = false
+  @State private var latencySavedIndicatorVisible = false
+  @State private var localSOCKSSavedIndicatorVisible = false
+  @State private var latencySavedIndicatorTask: Task<Void, Never>?
+  @State private var localSOCKSSavedIndicatorTask: Task<Void, Never>?
 
   var body: some View {
     Form {
@@ -18,7 +28,8 @@ struct SettingsView: View {
             .foregroundStyle(.orange)
           HStack {
             Button("Import Recovered Library…") {
-              isImportingProfileRecovery = true
+              jsonImportKind = .profileRecovery
+              isImportingJSON = true
             }
             Button("Show Preserved Copy") {
               model.revealPreservedProfileLibrary()
@@ -138,9 +149,17 @@ struct SettingsView: View {
           .textFieldStyle(.roundedBorder)
           .disabled(model.selectedSourceID == nil)
 
-          TextField("Exclude regex (optional)", text: $model.sourceExcludeRegex)
+          LabeledContent("Exclude regex (optional)") {
+            TextField(
+              text: $model.sourceExcludeRegex,
+              prompt: Text("(?i)lte|russia")
+            ) {
+              Text("Exclude regex (optional)")
+            }
+            .labelsHidden()
             .textFieldStyle(.roundedBorder)
             .disabled(model.selectedSourceID == nil)
+          }
 
           Text(
             "Connections whose names match this regular expression are omitted from the menu, Auto, and the generated sing-box configuration."
@@ -150,6 +169,8 @@ struct SettingsView: View {
 
           DisclosureGroup("Request headers") {
             TextField("User-Agent", text: $model.subscriptionUserAgent)
+              .textFieldStyle(.roundedBorder)
+            TextField("X-App-Version", text: $model.subscriptionAppVersion)
               .textFieldStyle(.roundedBorder)
             TextField("X-Device-OS", text: $model.subscriptionDeviceOS)
               .textFieldStyle(.roundedBorder)
@@ -203,7 +224,8 @@ struct SettingsView: View {
         }
 
         Button("Import Full JSON as New Profile…") {
-          isImportingProfile = true
+          jsonImportKind = .nativeProfile
+          isImportingJSON = true
         }
         .disabled(model.helperSetupInProgress)
       }
@@ -211,15 +233,27 @@ struct SettingsView: View {
       Section("Routing") {
         HStack {
           Text(model.routingPolicyStatus)
-            .foregroundStyle(model.hasRoutingPolicy ? .green : .secondary)
+            .foregroundStyle(
+              model.routingPolicyStatusLevel == .warning
+                ? Color.orange
+                : model.routingPolicyStatusLevel == .success ? Color.green : Color.secondary
+            )
           Spacer()
           Button("Import Routing…") {
-            isImportingRouting = true
+            jsonImportKind = .routing
+            isImportingJSON = true
           }
           .disabled(
             !model.canManageRoutingPolicy || model.isSyncing
               || model.helperSetupInProgress
           )
+          Button("Open Current…") {
+            model.openCurrentRoutingPolicy()
+          }
+          .help(
+            "Open a temporary copy in the default app for JSON files. Changes are not imported automatically."
+          )
+          .disabled(!model.hasRoutingPolicy || model.isSyncing)
           Button("Remove") {
             model.clearRoutingPolicy()
           }
@@ -230,6 +264,137 @@ struct SettingsView: View {
         }
         Text(
           "Optional routing JSON is stored with this profile and survives remote subscription updates. The file may contain only route rules and remote rule sets."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+        VStack(alignment: .leading, spacing: 8) {
+          HStack {
+            Text("Traffic from")
+              .frame(width: 90, alignment: .leading)
+            Spacer(minLength: 12)
+            Picker("Traffic from", selection: $model.routingInspectorApplicationID) {
+              Text("Default traffic").tag(UUID?.none)
+              ForEach(model.applicationRoutingRules) { rule in
+                Text(rule.displayName).tag(Optional(rule.id))
+              }
+            }
+            .labelsHidden()
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
+          }
+          HStack {
+            Text("Domain or IP")
+              .frame(width: 90, alignment: .leading)
+            TextField(
+              text: $model.routingInspectorInput,
+              prompt: Text("gosuslugi.ru")
+            ) {
+              Text("Domain or IP")
+            }
+            .labelsHidden()
+            .textFieldStyle(.roundedBorder)
+            .layoutPriority(1)
+            .onSubmit { model.inspectRouting() }
+            Button("Explain") {
+              model.inspectRouting()
+            }
+            .buttonStyle(.bordered)
+            .fixedSize()
+            .disabled(model.selectedProfileID == nil || model.routingInspectorInput.isEmpty)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        Text(model.routingInspectorOutput)
+          .font(.callout.weight(.medium))
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .textSelection(.enabled)
+        if !model.routingInspectorDetails.isEmpty {
+          DisclosureGroup {
+            Text(model.routingInspectorDetails)
+              .font(.system(.caption, design: .monospaced))
+              .foregroundStyle(.secondary)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .textSelection(.enabled)
+          } label: {
+            Text("Details")
+              .frame(maxWidth: .infinity, alignment: .leading)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        Text(
+          "Default traffic means no configured application override matches. Proxy uses the selected SBM server. Explain makes no DNS, network, process, or persistence probes; remote rule sets are checked against the active helper cache."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      }
+
+      Section("Application Routing") {
+        HStack {
+          Text("Route an application's traffic by its exact main executable.")
+            .foregroundStyle(.secondary)
+          Spacer()
+          Button("Add Application…") {
+            selectRoutedApplication()
+          }
+          .disabled(
+            model.selectedProfileID == nil || model.isSyncing || model.helperSetupInProgress
+          )
+        }
+
+        ForEach(model.applicationRoutingRules) { rule in
+          HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+              Text(rule.displayName)
+              Text(
+                model.applicationRoutingRuleIsResolved(rule)
+                  ? "Resolved" : "Unresolved — select the application again"
+              )
+              .font(.caption)
+              .foregroundStyle(
+                model.applicationRoutingRuleIsResolved(rule) ? .green : .orange
+              )
+            }
+            Spacer()
+            Picker(
+              "Route",
+              selection: Binding(
+                get: { rule.target },
+                set: { model.setApplicationRoutingTarget(rule.id, target: $0) }
+              )
+            ) {
+              Text("Direct").tag(ApplicationRoutingTarget.direct)
+              Text("Proxy").tag(ApplicationRoutingTarget.selectedProxy)
+              Text("Reject").tag(ApplicationRoutingTarget.reject)
+              if !model.fixedApplicationRoutingNodes.isEmpty {
+                Divider()
+                ForEach(model.fixedApplicationRoutingNodes) { node in
+                  Text(node.name).tag(ApplicationRoutingTarget.node(node.id))
+                }
+              }
+              if case .node(let nodeID) = rule.target,
+                !model.fixedApplicationRoutingNodes.contains(where: { $0.id == nodeID })
+              {
+                Divider()
+                Text("Missing server").tag(rule.target)
+              }
+            }
+            .labelsHidden()
+            .frame(width: 210)
+            .disabled(model.isSyncing || model.helperSetupInProgress)
+            Button(role: .destructive) {
+              model.removeApplicationRoutingRule(rule.id)
+            } label: {
+              Label("Remove", systemImage: "trash")
+                .labelStyle(.iconOnly)
+            }
+            .help("Remove application rule")
+            .disabled(model.isSyncing || model.helperSetupInProgress)
+          }
+        }
+
+        Text(
+          "Reject blocks the selected application's network connections through SBM. Moved or deleted applications stay visible but inactive until selected again. SBM does not guess processes by name; DNS continues to use the same system-wide VPN policy."
         )
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -254,8 +419,36 @@ struct SettingsView: View {
           Text("min")
             .foregroundStyle(.secondary)
         }
+        VStack(alignment: .leading, spacing: 8) {
+          Text("HTTPS test target")
+          TextField("HTTPS test target", text: $model.latencyTestURLDraft)
+            .labelsHidden()
+            .textFieldStyle(.roundedBorder)
+            .frame(maxWidth: .infinity)
+          HStack(spacing: 8) {
+            Spacer(minLength: 0)
+            Button("Apply") {
+              latencySavedIndicatorTask?.cancel()
+              latencySavedIndicatorVisible = false
+              if model.applyLatencyTestURL() {
+                showLatencySavedIndicator()
+              }
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .disabled(model.helperSetupInProgress)
+            if latencySavedIndicatorVisible {
+              savedIndicator
+            }
+            Button("Reset to default") {
+              model.resetLatencyTestURL()
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .disabled(model.helperSetupInProgress)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
         Text(
-          "SBM updates the latency values in the server menu automatically while the VPN is connected. sing-box uses its own urltest interval for Auto selection."
+          "SBM updates latency values while the VPN is connected. The HTTPS target receives a test request through each proxy; it is saved only when you apply it. Manual tests use it immediately; Auto uses it after the next normal connection."
         )
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -275,9 +468,16 @@ struct SettingsView: View {
           .multilineTextAlignment(.trailing)
           .frame(width: 90)
           Button("Apply") {
-            model.applyLocalSOCKSSettings()
+            localSOCKSSavedIndicatorTask?.cancel()
+            localSOCKSSavedIndicatorVisible = false
+            if model.applyLocalSOCKSSettings() {
+              showLocalSOCKSSavedIndicator()
+            }
           }
           .disabled(model.helperSetupInProgress)
+          if localSOCKSSavedIndicatorVisible {
+            savedIndicator
+          }
         }
         Text(
           "The listener is available only on this Mac while the VPN is connected."
@@ -318,34 +518,79 @@ struct SettingsView: View {
       )
     }
     .fileImporter(
-      isPresented: $isImportingProfile,
+      isPresented: $isImportingJSON,
       allowedContentTypes: [.json],
       allowsMultipleSelection: false
     ) { result in
       guard case .success(let urls) = result, let url = urls.first else {
         return
       }
-      model.importNativeProfile(from: url)
-    }
-    .fileImporter(
-      isPresented: $isImportingRouting,
-      allowedContentTypes: [.json],
-      allowsMultipleSelection: false
-    ) { result in
-      guard case .success(let urls) = result, let url = urls.first else {
-        return
+      switch jsonImportKind {
+      case .nativeProfile:
+        model.importNativeProfile(from: url)
+      case .routing:
+        model.importRoutingPolicy(from: url)
+      case .profileRecovery:
+        model.importRecoveredProfileLibrary(from: url)
       }
-      model.importRoutingPolicy(from: url)
     }
-    .fileImporter(
-      isPresented: $isImportingProfileRecovery,
-      allowedContentTypes: [.json],
-      allowsMultipleSelection: false
-    ) { result in
-      guard case .success(let urls) = result, let url = urls.first else {
-        return
+    .onDisappear {
+      latencySavedIndicatorTask?.cancel()
+      localSOCKSSavedIndicatorTask?.cancel()
+    }
+  }
+
+  private var savedIndicator: some View {
+    Image(systemName: "circle.fill")
+      .font(.system(size: 8))
+      .foregroundStyle(.green)
+      .accessibilityLabel("Saved")
+      .help("Saved")
+  }
+
+  private func showLatencySavedIndicator() {
+    latencySavedIndicatorTask?.cancel()
+    latencySavedIndicatorVisible = true
+    latencySavedIndicatorTask = Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(2_500))
+      guard !Task.isCancelled else { return }
+      latencySavedIndicatorVisible = false
+    }
+  }
+
+  private func showLocalSOCKSSavedIndicator() {
+    localSOCKSSavedIndicatorTask?.cancel()
+    localSOCKSSavedIndicatorVisible = true
+    localSOCKSSavedIndicatorTask = Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(2_500))
+      guard !Task.isCancelled else { return }
+      localSOCKSSavedIndicatorVisible = false
+    }
+  }
+
+  private func selectRoutedApplication() {
+    let panel = NSOpenPanel()
+    panel.title = "Choose an Application"
+    panel.prompt = "Add"
+    panel.message = "Choose a macOS application. SBM will use its declared main executable."
+    panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+    panel.allowedContentTypes = [.applicationBundle]
+    panel.allowsMultipleSelection = false
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.treatsFilePackagesAsDirectories = false
+    panel.resolvesAliases = true
+    if let window = NSApplication.shared.keyWindow {
+      panel.beginSheetModal(for: window) { response in
+        guard response == .OK, let url = panel.url else { return }
+        Task { @MainActor in
+          model.addApplicationRoutingRule(from: url)
+        }
       }
-      model.importRecoveredProfileLibrary(from: url)
+      return
     }
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    model.addApplicationRoutingRule(from: url)
   }
 }

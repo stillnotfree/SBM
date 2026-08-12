@@ -71,14 +71,24 @@ known-good configuration and restarts it once. The attempt is persisted before
 launch; another failure disables desired running state until the user connects
 again, preventing a permanent crash loop or watchdog.
 
+The UI serializes runtime-changing requests through a generation-ordered apply
+coordinator. A stale response may update observations but cannot overwrite the
+new desired profile, mode, or node. If profile, routing, mode, or node changes
+while `start` is in flight, the pending operation is replaced by one complete
+start snapshot containing the latest profile, mode, and node. The UI reports
+saved, applying, active, and failed states separately.
+
 Imported profiles are treated as untrusted input even when they arrive over
 HTTPS. The composer ignores user-supplied inbounds, logging, and experimental
 APIs; applies per-section and per-outbound-type safe-field allowlists tied to
 the exact reviewed core version; rejects unknown types, local filesystem paths,
 external-process capabilities, listeners, services, and system-managed
 endpoints; bounds profile and selector sizes; and then validates the composed
-candidate with the exact bundled core. Runtime activation failure restores the
-previous configuration and process.
+candidate with the exact bundled core. The helper validates the complete
+candidate with its new API secret and stages the current configuration backup
+before stopping a healthy core. Every failure after the transition begins
+restores the previous configuration and process; a PID is removed only after
+the old process is confirmed stopped.
 
 The user profile store is never interpreted as an empty library merely because
 it is malformed or has unsafe permissions. Invalid JSON is preserved unchanged
@@ -88,10 +98,85 @@ Clipboard diagnostics redact subscription URLs, HWIDs, proxy credentials, and
 known native-profile secrets, while raw sing-box validation output is not sent
 across the helper boundary.
 
-Compact subscriptions may contain either or both supported URI protocols.
-Individual `vless://`, `hysteria2://`, and `hy2://` links use the same parser
-and validation path, but are stored locally and never treated as refreshable
-remote sources.
+The Diagnostics window creates a bounded versioned support snapshot from state
+the UI already holds. Text and sorted-key JSON copies contain observations, not
+DNS or network-health results: they never start a latency test, read logs,
+discover processes, contact the network, or export profiles/configuration.
+The snapshot omits profile/source/node names and IDs, URLs, request headers,
+HWIDs, credentials, and raw native JSON; protocol counts and summary delay
+observations are retained only in capped aggregate form.
+
+The latency target is one user-configurable absolute HTTPS URL. It is limited,
+validated without credentials, fragments, or control characters, and persisted
+by both the user library and root helper state. Applying it sends no VPN
+lifecycle action: manual delay tests use it immediately through each selected
+proxy, while SBM-created `urltest` groups use it on the next normal start.
+Imported native `urltest` outbounds remain profile-owned and unchanged. The
+target host therefore sees a request through every tested proxy; no latency
+telemetry is collected or exported.
+
+Managed compatibility profiles store one typed connection list. Each connection
+has a persistent node ID, a UI name, and a VLESS+REALITY, Hysteria2, or
+Shadowsocks outbound. Source refreshes reconcile IDs by endpoint and credential
+semantics, not by a mutable display name; duplicate connections consume prior
+IDs in source order. Source groups and helper selector tags use those IDs
+directly. A renamed source therefore does not restart a running core by itself.
+
+The profile-store schema-1 migration reconstructs the v1.1.11 aggregate order and
+preserves its `vless-N` / `hysteria2-N` IDs for active legacy nodes before the
+rewritten library is used. Entries which were excluded from the old aggregate
+receive fresh `node-UUID` IDs, so a later filter change cannot alias a live
+node. Newly parsed connections use `node-v1-` plus SHA-256 over a versioned,
+length-delimited canonical semantic identity. The digest hides readable
+credentials while changing when endpoint or credential semantics change;
+display name and source order are excluded. Schema 3 adds application rules to
+schema 2 without rewriting managed IDs. The helper validates every managed
+tag as unique ASCII `[A-Za-z0-9._-]`, bounded, and non-`auto`; groups must have
+unique IDs and refer only to those validated node IDs.
+
+Per-application routing stores the selected `.app` bundle and its exact main
+executable path. The app never scans a bundle or matches a process by display
+name. Moved, deleted, or changed bundles remain visible but unresolved; fixed
+node targets also become inactive when their stable node disappears. The
+helper validates bounded absolute paths and requires the executable path to be
+lexically inside the `.app`, then emits exact `process_path` rules after SBM's
+safety rules and before imported routing. DIRECT and PROXY targets use a route
+outbound; REJECT emits the native terminal `action: reject` without a fake
+outbound. The feature changes traffic routing, not DNS policy. Routing
+Inspector treats configured application rules as not
+matched for `Default traffic`, or evaluates them against the exact path of the
+selected configured application. Unrelated imported process conditions remain
+unresolved when the selected context cannot determine them.
+Remote rule-set explanations use a bounded helper request against the active
+profile only. The helper reads one tag from sing-box's root-owned bbolt cache
+with strict page, checksum, key, and size bounds, writes a root-only temporary
+copy, and invokes the verified core's `rule-set match` command. Rule-set bytes
+and core output never cross IPC; a missing, changing, malformed, or inactive
+cache fails closed.
+
+New subscription sources reproduce the exact `User-Agent`, `X-App-Version`, and
+`X-Device-OS` client-identification fields from a user-captured Happ 5.4.0 iOS
+request. Per-device model, OS version, locale, and transport headers are not
+invented. New HWIDs use the observed 16-character lowercase-alphanumeric shape,
+without claiming the same internal generator. Existing or custom headers are
+not migrated. Reset changes only the request preset and preserves the source
+HWID. Provider-identification and sensitive headers are stripped after a
+cross-origin redirect.
+
+Compact subscriptions may contain any mix of supported URI protocols.
+Individual `vless://`, `hysteria2://`, `hy2://`, and strict plugin-free
+SIP002 `ss://` links use the same parser and validation path, but are stored
+locally and never treated as refreshable remote sources. Shadowsocks accepts
+only the reviewed AEAD/2022 cipher allowlist, no query or plugin, and no
+whole-URI legacy Base64 form. 2022 credentials are plain URI userinfo carrying
+a canonical Base64 PSK of the method's required decoded size; encoded userinfo
+is rejected for that family.
+
+`ManagedConnection.displayName` is the authoritative UI name. VLESS and
+Hysteria2 payload types still retain a duplicate legacy name field solely for
+old JSON decoding and source compatibility; configuration, groups, and menus
+use the wrapper name. It is a bounded compatibility compromise, not a second
+identity key.
 
 Native JSON supports explicitly reviewed safe client outbound types and a
 userspace WireGuard endpoint for the pinned core. Unknown future types and
@@ -104,7 +189,13 @@ managed overrides, not edits to the imported source.
 The distributed artifact is a drag-and-drop DMG. The app and helper are signed
 ad-hoc. On first run the app registers its bundled launch daemon with
 `SMAppService`; macOS remains responsible for explicit administrator approval.
-No installation command or shell script is exposed to the user.
+No installation command or shell script is exposed to the user. While an
+explicitly initiated approval flow is pending, SBM persists only that intent,
+rechecks `SMAppService.status` when the app becomes active, and uses a bounded
+temporary status poll. Once macOS reports the service enabled, SBM verifies the
+exact helper version and revision over authenticated IPC and invokes the
+existing verified replacement flow only when the installed helper is not
+current. Approval is never inferred from elapsed time or process existence.
 
 ## Update model
 

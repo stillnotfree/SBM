@@ -1,7 +1,46 @@
 import CryptoKit
 import Darwin
 import Foundation
+import OSLog
 import SBMShared
+
+private let runtimeLogger = Logger(
+  subsystem: "com.stillnotfree.sbm.helper",
+  category: "runtime-activation"
+)
+
+enum LocalTCPPortProbe {
+  static func isAvailable(_ port: UInt16) -> Bool {
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { return false }
+    defer { close(descriptor) }
+
+    // Go's TCP listener enables SO_REUSEADDR on Darwin. Mirror that behavior
+    // so a connection from the just-stopped Clash API cannot leave a TIME_WAIT
+    // socket that is mistaken for a conflicting listener.
+    var reuseAddress: Int32 = 1
+    guard
+      setsockopt(
+        descriptor,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &reuseAddress,
+        socklen_t(MemoryLayout<Int32>.size)
+      ) == 0
+    else { return false }
+
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(port).bigEndian
+    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    return withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    } == 0
+  }
+}
 
 private final class DelayResults: @unchecked Sendable {
   private let lock = NSLock()
@@ -21,6 +60,23 @@ private final class DelayResults: @unchecked Sendable {
   }
 }
 
+enum LatencyDelayRequest {
+  static func path(for node: ProxyNodeID, target: String) -> String {
+    var components = URLComponents()
+    components.queryItems = [
+      URLQueryItem(name: "timeout", value: "5000"),
+      URLQueryItem(name: "url", value: target),
+    ]
+    let unreserved = Set(
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~".utf8
+    )
+    let component = node.rawValue.utf8.map { byte in
+      unreserved.contains(byte) ? String(UnicodeScalar(byte)) : String(format: "%%%02X", byte)
+    }.joined()
+    return "/proxies/\(component)/delay?\(components.percentEncodedQuery ?? "")"
+  }
+}
+
 struct PersistentState: Codable {
   var profile: CoreProfile?
   var activeProfileID: UUID?
@@ -32,6 +88,7 @@ struct PersistentState: Codable {
   var automaticRecoveryAttempted = false
   var localSOCKSEnabled = false
   var localSOCKSPort: UInt16 = 1082
+  var latencyTestURL = LatencyTargetPolicy.defaultURL
   var apiSecret = UUID().uuidString.replacingOccurrences(of: "-", with: "")
 
   init() {}
@@ -47,6 +104,7 @@ struct PersistentState: Codable {
     case automaticRecoveryAttempted
     case localSOCKSEnabled
     case localSOCKSPort
+    case latencyTestURL
     case apiSecret
   }
 
@@ -59,7 +117,29 @@ struct PersistentState: Codable {
       try container.decodeIfPresent(ProxyNodeID.self, forKey: .selectedNode) ?? .auto
     selectorTag =
       try container.decodeIfPresent(String.self, forKey: .selectorTag) ?? "proxy-selector"
-    nodes = try container.decodeIfPresent([ProxyNodeDescriptor].self, forKey: .nodes) ?? []
+    let storedNodes =
+      try container.decodeIfPresent([ProxyNodeDescriptor].self, forKey: .nodes) ?? []
+    if let profile {
+      let kinds = Dictionary(grouping: profile.nodes, by: \ProxyNodeDescriptor.id)
+        .compactMapValues { descriptors in
+          descriptors.count == 1 ? descriptors[0].kind : nil
+        }
+      nodes = storedNodes.map { descriptor in
+        ProxyNodeDescriptor(
+          id: descriptor.id,
+          name: descriptor.name,
+          kind: kinds[descriptor.id] ?? descriptor.kind
+        )
+      }
+      if selectedNode != .auto, kinds[selectedNode] == nil {
+        selectedNode = .auto
+      }
+    } else {
+      nodes = storedNodes
+      if selectedNode != .auto, !nodes.contains(where: { $0.id == selectedNode }) {
+        selectedNode = .auto
+      }
+    }
     desiredRunning = try container.decodeIfPresent(Bool.self, forKey: .desiredRunning) ?? false
     automaticRecoveryAttempted =
       try container.decodeIfPresent(Bool.self, forKey: .automaticRecoveryAttempted) ?? false
@@ -67,9 +147,17 @@ struct PersistentState: Codable {
       try container.decodeIfPresent(Bool.self, forKey: .localSOCKSEnabled) ?? false
     localSOCKSPort =
       try container.decodeIfPresent(UInt16.self, forKey: .localSOCKSPort) ?? 1082
+    let storedTarget =
+      try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
+      ?? LatencyTargetPolicy.defaultURL
+    latencyTestURL = try LatencyTargetPolicy.normalized(storedTarget)
     apiSecret =
       try container.decodeIfPresent(String.self, forKey: .apiSecret)
       ?? UUID().uuidString.replacingOccurrences(of: "-", with: "")
+  }
+
+  mutating func setLatencyTestURL(_ value: String) throws {
+    latencyTestURL = try LatencyTargetPolicy.normalized(value)
   }
 }
 
@@ -94,6 +182,53 @@ enum DesiredRuntimeRecoveryPolicy {
       return .disableDesiredState
     }
     return .attemptRecovery
+  }
+}
+
+struct CoreActivationTransactionFailure: Error, LocalizedError {
+  let activationError: any Error
+  let recoveryError: (any Error)?
+
+  var errorDescription: String? {
+    guard let recoveryError else { return activationError.localizedDescription }
+    let activationDescription = activationError.localizedDescription
+    let recoveryDescription = recoveryError.localizedDescription
+    return "\(activationDescription) Runtime cleanup also failed: \(recoveryDescription)"
+  }
+}
+
+struct CoreActivationTransaction<Candidate> {
+  let prepare: () throws -> Candidate
+  let stopKnownGood: () throws -> Void
+  let commit: (Candidate) throws -> Void
+  let startCandidate: () throws -> Void
+  let restoreKnownGood: () throws -> Void
+  let restoreDisconnected: (_ candidateLaunchAttempted: Bool) throws -> Void
+
+  func run(wasRunning: Bool) throws {
+    let candidate = try prepare()
+    var candidateLaunchAttempted = false
+    do {
+      if wasRunning { try stopKnownGood() }
+      try commit(candidate)
+      candidateLaunchAttempted = true
+      try startCandidate()
+    } catch {
+      var recoveryError: (any Error)?
+      do {
+        if wasRunning {
+          try restoreKnownGood()
+        } else {
+          try restoreDisconnected(candidateLaunchAttempted)
+        }
+      } catch {
+        recoveryError = error
+      }
+      throw CoreActivationTransactionFailure(
+        activationError: error,
+        recoveryError: recoveryError
+      )
+    }
   }
 }
 
@@ -193,7 +328,10 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
-  func status(message: String = "Helper connected") -> HelperResponse {
+  func status(
+    message: String = "Helper connected",
+    ruleSetMatches: [RuleSetMatch] = []
+  ) -> HelperResponse {
     let recoveryExhausted = state.automaticRecoveryAttempted && !state.desiredRunning
     let effectiveMessage =
       bootstrapFailure.map { "Core bootstrap failed: \($0)" }
@@ -209,6 +347,7 @@ final class CoreManager: @unchecked Sendable {
       activeProfileID: state.activeProfileID,
       nodes: state.nodes,
       automaticRecoveryExhausted: recoveryExhausted,
+      ruleSetMatches: ruleSetMatches,
       message: effectiveMessage
     )
   }
@@ -250,17 +389,25 @@ final class CoreManager: @unchecked Sendable {
   func start(
     profile: CoreProfile?,
     profileID: UUID? = nil,
+    mode: RoutingMode? = nil,
+    selectedNode: ProxyNodeID? = nil,
     localSOCKSEnabled: Bool? = nil,
-    localSOCKSPort: UInt16? = nil
+    localSOCKSPort: UInt16? = nil,
+    latencyTestURL: String? = nil
   ) throws -> HelperResponse {
+    let normalizedLatencyTestURL = try latencyTestURL.map(LatencyTargetPolicy.normalized)
     let previousState = state
     let wasRunning = isCoreRunning
-    var configurationReplaced = false
-    let profileChanged = profile.map { $0 != state.profile } ?? false
     do {
       if let profile {
         state.profile = profile
         state.activeProfileID = profileID
+      }
+      if let mode {
+        state.mode = mode
+      }
+      if let selectedNode {
+        state.selectedNode = selectedNode
       }
       if let localSOCKSEnabled {
         state.localSOCKSEnabled = localSOCKSEnabled
@@ -271,70 +418,105 @@ final class CoreManager: @unchecked Sendable {
         }
         state.localSOCKSPort = localSOCKSPort
       }
+      if let normalizedLatencyTestURL {
+        state.latencyTestURL = normalizedLatencyTestURL
+      }
       guard let activeProfile = state.profile else {
         throw CoreFailure.profileMissing
       }
 
       try prepareFilesystem()
-      let previousConfiguration = try? Data(contentsOf: configURL)
-      let preview = try validatedConfiguration(
+      let previousConfiguration = try configurationSnapshot()
+      let preview = try configuration(
         profile: activeProfile,
         apiSecret: state.apiSecret
       )
       let configurationChanged = previousConfiguration != preview.data
 
-      if isCoreRunning, !profileChanged, !configurationChanged {
+      if isCoreRunning, !configurationChanged {
         state.desiredRunning = true
         state.automaticRecoveryAttempted = false
         try saveState()
         return status(message: "VPN already connected")
       }
-      if isCoreRunning {
-        terminateCore()
-      }
-
-      try ensureAPIPortAvailable()
-      state.apiSecret = Self.makeAPISecret()
-      let built = try writeValidatedConfiguration(
-        profile: activeProfile,
-        apiSecret: state.apiSecret
-      )
-      configurationReplaced = true
-      state.selectorTag = built.selectorTag
-      state.nodes = built.nodes
-      state.selectedNode = built.selectedNode
-      try launchCore()
-      try waitForAPI()
-      try applyMode(state.mode)
-      try applyNode(state.selectedNode)
-      state.desiredRunning = true
-      state.automaticRecoveryAttempted = false
-      try saveState()
-      return status(message: "VPN connected")
-    } catch {
-      if !configurationReplaced {
-        state = previousState
-        if !fileManager.fileExists(atPath: configURL.path) {
-          try? restoreBackupConfiguration()
-        }
-        try? saveState()
-        throw error
-      }
-      terminateCore()
-      state = previousState
-      if wasRunning {
-        do {
-          try restoreBackupConfiguration()
+      let candidateSecret = Self.makeAPISecret()
+      var knownGoodWasStopped = false
+      let transaction = CoreActivationTransaction<BuiltConfiguration>(
+        prepare: { [self] in
+          let candidate = try validatedConfiguration(
+            profile: activeProfile,
+            apiSecret: candidateSecret
+          )
+          if wasRunning { try backupActiveConfiguration() }
+          runtimeLogger.info("Runtime candidate validated before transition")
+          return candidate
+        },
+        stopKnownGood: { [self] in
+          runtimeLogger.notice("Runtime activation transition starting")
+          guard terminateCore() else { throw CoreFailure.coreStopFailed }
+          knownGoodWasStopped = true
+          try ensureAPIPortAvailable()
+        },
+        commit: { [self] built in
+          state.apiSecret = candidateSecret
+          try writeValidatedConfiguration(built)
+          state.selectorTag = built.selectorTag
+          state.nodes = built.nodes
+          state.selectedNode = built.selectedNode
+        },
+        startCandidate: { [self] in
           try launchCore()
           try waitForAPI()
           try applyMode(state.mode)
           try applyNode(state.selectedNode)
           state.desiredRunning = true
-        } catch {
-          terminateCore()
-          state.desiredRunning = false
+          state.automaticRecoveryAttempted = false
+          try saveState()
+          runtimeLogger.notice("Runtime activation succeeded")
+        },
+        restoreKnownGood: { [self] in
+          state = previousState
+          if knownGoodWasStopped {
+            guard terminateCore() else { throw CoreFailure.coreStopFailed }
+            try restoreBackupConfiguration()
+            try ensureAPIPortAvailable()
+            try launchCore()
+            try waitForAPI()
+            try applyMode(state.mode)
+            try applyNode(state.selectedNode)
+          }
+          state.desiredRunning = true
+          try saveState()
+        },
+        restoreDisconnected: { [self] candidateLaunchAttempted in
+          state = previousState
+          if candidateLaunchAttempted {
+            guard terminateCore() else { throw CoreFailure.coreStopFailed }
+          }
+          try restoreConfigurationSnapshot(previousConfiguration)
+          try saveState()
         }
+      )
+      try transaction.run(wasRunning: wasRunning)
+      return status(message: "VPN connected")
+    } catch let failure as CoreActivationTransactionFailure {
+      if failure.recoveryError != nil {
+        runtimeLogger.error("Runtime activation and known-good recovery failed")
+        _ = terminateCore()
+        state = previousState
+        state.desiredRunning = false
+      } else if !wasRunning {
+        runtimeLogger.error("Runtime activation failed without a prior active core")
+        state = previousState
+      } else {
+        runtimeLogger.notice("Runtime activation failed; known-good runtime restored")
       }
+      try? saveState()
+      if failure.recoveryError != nil { throw failure }
+      throw failure.activationError
+    } catch {
+      runtimeLogger.error("Runtime candidate preparation failed before transition")
+      state = previousState
       try? saveState()
       throw error
     }
@@ -344,8 +526,7 @@ final class CoreManager: @unchecked Sendable {
     state.desiredRunning = false
     state.automaticRecoveryAttempted = false
     try saveState()
-    terminateCore()
-    guard !isCoreRunning else {
+    guard terminateCore(), !isCoreRunning else {
       throw CoreFailure.coreStopFailed
     }
     return status(message: "VPN disconnected")
@@ -392,6 +573,19 @@ final class CoreManager: @unchecked Sendable {
     return status(message: "Server: \(node.rawValue)")
   }
 
+  func setLatencyTarget(_ value: String) throws -> HelperResponse {
+    let previous = state.latencyTestURL
+    do {
+      try state.setLatencyTestURL(value)
+      try saveState()
+    } catch {
+      state.latencyTestURL = previous
+      try? saveState()
+      throw error
+    }
+    return status(message: "Latency target updated")
+  }
+
   func testLatency() throws -> HelperResponse {
     guard isCoreRunning else { throw CoreFailure.coreNotRunning }
     let descriptors = state.nodes
@@ -401,9 +595,7 @@ final class CoreManager: @unchecked Sendable {
       for index in stride(from: worker, to: descriptors.count, by: workerCount) {
         let descriptor = descriptors[index]
         let node = descriptor.id
-        let encodedURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
-        let component = apiPathComponent(node.rawValue)
-        let path = "/proxies/\(component)/delay?timeout=5000&url=\(encodedURL)"
+        let path = LatencyDelayRequest.path(for: node, target: state.latencyTestURL)
         let data = try? apiRequest(method: "GET", path: path, body: nil)
         let object = data.flatMap {
           try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
@@ -443,6 +635,66 @@ final class CoreManager: @unchecked Sendable {
       nodes: built.nodes,
       message: "Profile validated"
     )
+  }
+
+  func matchRuleSets(tags: [String], destination: String) throws -> HelperResponse {
+    guard isCoreRunning, state.profile != nil,
+      !tags.isEmpty, tags.count <= 8, Set(tags).count == tags.count,
+      !destination.isEmpty, destination.utf8.count <= 512,
+      !destination.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+    else { throw CoreFailure.invalidRuleSetQuery }
+    try requireSecureManagedFileIfPresent(cacheURL)
+    try requireSecureManagedFileIfPresent(configURL)
+    let attributes = try fileManager.attributesOfItem(atPath: configURL.path)
+    guard let size = attributes[.size] as? NSNumber,
+      size.intValue > 0, size.intValue <= 2 * 1_048_576
+    else { throw CoreFailure.invalidRuleSetQuery }
+    let activeConfiguration = try Data(contentsOf: configURL)
+    guard activeConfiguration.count <= 2 * 1_048_576 else {
+      throw CoreFailure.invalidRuleSetQuery
+    }
+    guard
+      let root = try JSONSerialization.jsonObject(with: activeConfiguration) as? [String: Any],
+      let route = root["route"] as? [String: Any]
+    else { throw CoreFailure.invalidRuleSetQuery }
+    let definitions: [String: String] = Dictionary(
+      uniqueKeysWithValues: (route["rule_set"] as? [[String: Any]] ?? []).compactMap { item in
+        guard (item["type"] as? String) == "remote",
+          let tag = item["tag"] as? String,
+          let format = item["format"] as? String,
+          ["source", "binary"].contains(format)
+        else { return nil }
+        return (tag, format)
+      }
+    )
+    let temporaryDirectory = supportDirectory.appendingPathComponent(
+      "rule-set-match-\(UUID().uuidString)", isDirectory: true)
+    try fileManager.createDirectory(
+      at: temporaryDirectory,
+      withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700]
+    )
+    defer { try? fileManager.removeItem(at: temporaryDirectory) }
+    var matches: [RuleSetMatch] = []
+    for (index, tag) in tags.enumerated() {
+      guard let format = definitions[tag] else { throw CoreFailure.invalidRuleSetQuery }
+      let content: Data
+      do {
+        content = try RuleSetCacheReader.content(at: cacheURL, tag: tag)
+      } catch {
+        throw CoreFailure.ruleSetUnavailable(tag)
+      }
+      let ruleSetURL = temporaryDirectory.appendingPathComponent(
+        "rule-set-\(index).\(format == "binary" ? "srs" : "json")")
+      try content.write(to: ruleSetURL, options: .atomic)
+      try secureFile(ruleSetURL)
+      let matched = try runCore(
+        arguments: [
+          "rule-set", "match", "-f", format, ruleSetURL.path, destination,
+        ], timeoutSeconds: 5)
+      matches.append(RuleSetMatch(tag: tag, matches: matched))
+    }
+    return status(message: "Routing rule sets matched", ruleSetMatches: matches)
   }
 
   private var isCoreRunning: Bool {
@@ -766,16 +1018,29 @@ final class CoreManager: @unchecked Sendable {
     profile: CoreProfile,
     apiSecret: String
   ) throws -> BuiltConfiguration {
+    let built = try configuration(profile: profile, apiSecret: apiSecret)
+    try validateConfiguration(built)
+    return built
+  }
+
+  private func configuration(
+    profile: CoreProfile,
+    apiSecret: String
+  ) throws -> BuiltConfiguration {
     let builder = ConfigBuilder(
       cachePath: cacheURL.path,
       apiSecret: apiSecret
     )
-    let built = try builder.makeConfiguration(
+    return try builder.makeConfiguration(
       profile: profile,
       mode: state.mode,
       selectedNode: state.selectedNode,
-      localSOCKSPort: state.localSOCKSEnabled ? state.localSOCKSPort : nil
+      localSOCKSPort: state.localSOCKSEnabled ? state.localSOCKSPort : nil,
+      latencyTestURL: state.latencyTestURL
     )
+  }
+
+  private func validateConfiguration(_ built: BuiltConfiguration) throws {
     let candidate = supportDirectory.appendingPathComponent(
       "validation-\(UUID().uuidString).json"
     )
@@ -783,31 +1048,52 @@ final class CoreManager: @unchecked Sendable {
     try secureFile(candidate)
     defer { try? fileManager.removeItem(at: candidate) }
     try runCore(arguments: ["check", "-c", candidate.path])
-    return built
   }
 
-  private func writeValidatedConfiguration(
-    profile: CoreProfile,
-    apiSecret: String
-  ) throws -> BuiltConfiguration {
-    let built = try validatedConfiguration(profile: profile, apiSecret: apiSecret)
+  private func backupActiveConfiguration() throws {
+    guard pathExistsWithoutFollowingSymlinks(configURL) else {
+      throw CoreFailure.configurationRejected(
+        "No active configuration is available for rollback.")
+    }
+    try requireSecureManagedFileIfPresent(configURL)
+    let backupCandidate = supportDirectory.appendingPathComponent(
+      "config.json.backup-\(UUID().uuidString)")
+    try fileManager.copyItem(at: configURL, to: backupCandidate)
+    defer { try? fileManager.removeItem(at: backupCandidate) }
+    try secureFile(backupCandidate)
+    try atomicReplace(backupCandidate, at: configBackupURL)
+  }
+
+  private func configurationSnapshot() throws -> Data? {
+    guard pathExistsWithoutFollowingSymlinks(configURL) else { return nil }
+    try requireSecureManagedFileIfPresent(configURL)
+    return try Data(contentsOf: configURL)
+  }
+
+  private func restoreConfigurationSnapshot(_ snapshot: Data?) throws {
+    guard let snapshot else {
+      guard pathExistsWithoutFollowingSymlinks(configURL) else { return }
+      try requireSecureManagedFileIfPresent(configURL)
+      try fileManager.removeItem(at: configURL)
+      return
+    }
+    let candidate = supportDirectory.appendingPathComponent(
+      "config.json.restore-\(UUID().uuidString)")
+    try snapshot.write(to: candidate, options: .atomic)
+    defer { try? fileManager.removeItem(at: candidate) }
+    try secureFile(candidate)
+    try atomicReplace(candidate, at: configURL)
+    try secureFile(configURL)
+  }
+
+  private func writeValidatedConfiguration(_ built: BuiltConfiguration) throws {
     let candidate = supportDirectory.appendingPathComponent(
       "config.json.candidate-\(UUID().uuidString)")
     try built.data.write(to: candidate, options: .atomic)
     try secureFile(candidate)
     defer { try? fileManager.removeItem(at: candidate) }
-    if pathExistsWithoutFollowingSymlinks(configURL) {
-      try requireSecureManagedFileIfPresent(configURL)
-      let backupCandidate = supportDirectory.appendingPathComponent(
-        "config.json.backup-\(UUID().uuidString)")
-      try fileManager.copyItem(at: configURL, to: backupCandidate)
-      defer { try? fileManager.removeItem(at: backupCandidate) }
-      try secureFile(backupCandidate)
-      try atomicReplace(backupCandidate, at: configBackupURL)
-    }
     try atomicReplace(candidate, at: configURL)
     try secureFile(configURL)
-    return built
   }
 
   private func restoreBackupConfiguration() throws {
@@ -946,10 +1232,12 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
+  @discardableResult
   private func runCore(
     executable: URL? = nil,
-    arguments: [String]
-  ) throws {
+    arguments: [String],
+    timeoutSeconds: TimeInterval = 10
+  ) throws -> Bool {
     let outputURL = supportDirectory.appendingPathComponent(
       "core-check-\(UUID().uuidString).log")
     guard
@@ -970,7 +1258,7 @@ final class CoreManager: @unchecked Sendable {
     process.standardOutput = output
     process.standardError = output
     try process.run()
-    let deadline = Date().addingTimeInterval(10)
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
     while process.isRunning, Date() < deadline {
       usleep(50_000)
     }
@@ -989,6 +1277,9 @@ final class CoreManager: @unchecked Sendable {
       throw CoreFailure.configurationRejected(
         "The generated profile did not pass the bundled core check.")
     }
+    try? output.synchronize()
+    let attributes = try? fileManager.attributesOfItem(atPath: outputURL.path)
+    return (attributes?[.size] as? NSNumber)?.intValue ?? 0 > 0
   }
 
   private func cachedCoreVersion() -> String? {
@@ -1043,7 +1334,8 @@ final class CoreManager: @unchecked Sendable {
     throw CoreFailure.apiUnavailable
   }
 
-  private func terminateCore() {
+  @discardableResult
+  private func terminateCore() -> Bool {
     if let pid = currentPID(), isProcessRunning(pid) {
       _ = kill(pid, SIGTERM)
       for _ in 0..<30 where isProcessRunning(pid) {
@@ -1051,10 +1343,15 @@ final class CoreManager: @unchecked Sendable {
       }
       if isProcessRunning(pid) {
         _ = kill(pid, SIGKILL)
+        for _ in 0..<10 where isProcessRunning(pid) {
+          usleep(100_000)
+        }
       }
+      guard !isProcessRunning(pid) else { return false }
     }
     coreProcess = nil
     try? fileManager.removeItem(at: pidURL)
+    return true
   }
 
   private func applyNode(_ node: ProxyNodeID) throws {
@@ -1181,21 +1478,9 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func ensureAPIPortAvailable() throws {
-    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
-    guard descriptor >= 0 else { throw CoreFailure.apiPortUnavailable }
-    defer { close(descriptor) }
-
-    var address = sockaddr_in()
-    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    address.sin_family = sa_family_t(AF_INET)
-    address.sin_port = in_port_t(19090).bigEndian
-    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-    let result = withUnsafePointer(to: &address) { pointer in
-      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
+    guard LocalTCPPortProbe.isAvailable(19090) else {
+      throw CoreFailure.apiPortUnavailable
     }
-    guard result == 0 else { throw CoreFailure.apiPortUnavailable }
   }
 
   private static func makeAPISecret() -> String {
@@ -1216,6 +1501,8 @@ enum CoreFailure: LocalizedError {
   case coreStopFailed
   case apiUnavailable
   case apiPortUnavailable
+  case invalidRuleSetQuery
+  case ruleSetUnavailable(String)
   case configurationCheckTimedOut
 
   var errorDescription: String? {
@@ -1231,6 +1518,10 @@ enum CoreFailure: LocalizedError {
     case .apiUnavailable: "The local sing-box control API is unavailable."
     case .apiPortUnavailable:
       "Local control port 19090 is already in use. Stop the conflicting process and try again."
+    case .invalidRuleSetQuery:
+      "The routing rule-set query is unavailable for the active profile."
+    case .ruleSetUnavailable(let tag):
+      "The active rule-set cache does not contain a usable \(tag) entry."
     case .configurationCheckTimedOut: "sing-box configuration validation timed out."
     }
   }

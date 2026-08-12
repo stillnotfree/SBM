@@ -10,6 +10,10 @@ enum HelperRegistrationState: Equatable {
   case unknown
 }
 
+enum HelperApprovalPersistence {
+  static let pendingKey = "HelperApprovalFlowPending"
+}
+
 @MainActor
 protocol HelperServiceManaging: AnyObject {
   var registrationState: HelperRegistrationState { get }

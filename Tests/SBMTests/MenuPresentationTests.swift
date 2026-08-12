@@ -1,3 +1,4 @@
+import AppKit
 import SBMShared
 import Testing
 
@@ -25,4 +26,11 @@ import Testing
     testCompleted: true
   )
   #expect(title == "timeout")
+}
+
+@Test func onlyProfilesWindowUsesFloatingLevelAndStableIdentifier() {
+  #expect(SBMWindow.profiles.level == .floating)
+  #expect(SBMWindow.diagnostics.level == .normal)
+  #expect(SBMWindow.about.level == .normal)
+  #expect(Set(SBMWindow.allCases.map(\.identifier)).count == SBMWindow.allCases.count)
 }

@@ -22,7 +22,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidBecomeActive(_ notification: Notification) {
-    model?.refresh()
+    model?.applicationDidBecomeActive()
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -78,6 +78,28 @@ struct SBMApp: App {
     }
     .defaultSize(width: 440, height: 330)
     .windowResizability(.contentSize)
+  }
+}
+
+enum SBMWindow: String, CaseIterable {
+  case profiles
+  case diagnostics
+  case about
+
+  var title: String {
+    switch self {
+    case .profiles: "Profiles"
+    case .diagnostics: "Diagnostics"
+    case .about: "About SBM"
+    }
+  }
+
+  var level: NSWindow.Level {
+    self == .profiles ? .floating : .normal
+  }
+
+  var identifier: NSUserInterfaceItemIdentifier {
+    NSUserInterfaceItemIdentifier("sbm.\(rawValue)")
   }
 }
 
@@ -148,14 +170,14 @@ private struct MenuContentView: View {
     Divider()
 
     Button {
-      presentWindow(id: "profiles", title: "Profiles")
+      presentWindow(.profiles)
     } label: {
       Label("Profiles…", systemImage: "rectangle.stack")
     }
 
     if model.lastError != nil {
       Button {
-        presentWindow(id: "diagnostics", title: "Diagnostics")
+        presentWindow(.diagnostics)
       } label: {
         Label("Error…", systemImage: "exclamationmark.triangle.fill")
       }
@@ -163,8 +185,11 @@ private struct MenuContentView: View {
 
     if !model.helperEnabled {
       if model.helperRequiresApproval {
-        Button("Approve Background Helper…") {
-          model.openBackgroundItems()
+        Button(
+          model.helperApprovalPending
+            ? model.helperStatus : "Approve Background Helper…"
+        ) {
+          model.enableHelper()
         }
       } else {
         Button(
@@ -195,12 +220,12 @@ private struct MenuContentView: View {
     Divider()
 
     Button("About SBM…") {
-      presentWindow(id: "about", title: "About SBM")
+      presentWindow(.about)
     }
 
     Button("Check for Updates…") {
       model.checkForUpdates()
-      presentWindow(id: "about", title: "About SBM")
+      presentWindow(.about)
     }
 
     Button(model.coreRunning ? "Disconnect & Quit" : "Quit") {
@@ -213,15 +238,21 @@ private struct MenuContentView: View {
     model.nodes.first(where: { $0.id == model.selectedNodeID })?.name ?? "Unknown"
   }
 
-  private func presentWindow(id: String, title: String) {
+  private func presentWindow(_ target: SBMWindow) {
     NSApplication.shared.activate(ignoringOtherApps: true)
-    openWindow(id: id)
+    openWindow(id: target.rawValue)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-      guard let window = NSApplication.shared.windows.first(where: { $0.title == title }) else {
+      guard
+        let window = NSApplication.shared.windows.first(where: {
+          $0.identifier == target.identifier
+        })
+          ?? NSApplication.shared.windows.first(where: { $0.title == target.title })
+      else {
         return
       }
+      window.identifier = target.identifier
+      window.level = target.level
       window.makeKeyAndOrderFront(nil)
-      window.orderFrontRegardless()
     }
   }
 
@@ -326,25 +357,27 @@ private struct DiagnosticsView: View {
   @Bindable var model: AppModel
 
   var body: some View {
+    let snapshot = model.supportSnapshot
     VStack(alignment: .leading, spacing: 12) {
       HStack {
         Label("Diagnostics", systemImage: "stethoscope")
           .font(.title2.weight(.semibold))
         Spacer()
-        Button("Copy") {
+        Button("Copy Text") {
           NSPasteboard.general.clearContents()
-          NSPasteboard.general.setString(model.diagnosticReport, forType: .string)
+          NSPasteboard.general.setString(snapshot.text, forType: .string)
+        }
+        Button("Copy JSON") {
+          NSPasteboard.general.clearContents()
+          NSPasteboard.general.setString(snapshot.jsonText(), forType: .string)
         }
         Button("Refresh") {
           model.refresh()
-          if model.coreRunning {
-            model.testLatency()
-          }
         }
       }
 
       ScrollView {
-        Text(model.diagnosticReport)
+        Text(snapshot.text)
           .font(.system(.body, design: .monospaced))
           .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading)

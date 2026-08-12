@@ -32,6 +32,15 @@ import Testing
         obfsPassword: "test-obfs-password",
         displayName: "Hysteria2"
       )
+    ],
+    shadowsocks: [
+      ShadowsocksProfile(
+        server: "ss.example.com",
+        port: 443,
+        method: "aes-256-gcm",
+        password: "test-password",
+        displayName: "Shadowsocks"
+      )
     ]
   )
   let temporary = FileManager.default.temporaryDirectory
@@ -87,6 +96,94 @@ import Testing
   let message =
     String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
   #expect(process.terminationStatus == 0, Comment(rawValue: message))
+}
+
+@Test func managedShadowsocksConfigurationUsesStableTagAndExactOutbound() throws {
+  let profile = VPNProfile(connections: [
+    ManagedConnection(
+      id: ProxyNodeID(rawValue: "node-stable-ss"),
+      outbound: .shadowsocks(
+        ShadowsocksProfile(
+          server: "ss.example.com", port: 8443, method: "aes-256-gcm",
+          password: "test-password", displayName: "SS"
+        ))
+    )
+  ])
+  let built = try ConfigBuilder(cachePath: "/tmp/cache.db", apiSecret: "test-secret")
+    .makeConfiguration(profile: .compatibility(profile), mode: .rule, selectedNode: .auto)
+  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
+  let outbounds = try #require(root["outbounds"] as? [[String: Any]])
+  let shadowsocks = try #require(outbounds.first { ($0["tag"] as? String) == "node-stable-ss" })
+  #expect(shadowsocks["type"] as? String == "shadowsocks")
+  #expect(shadowsocks["tag"] as? String == "node-stable-ss")
+  #expect(shadowsocks["server"] as? String == "ss.example.com")
+  #expect(shadowsocks["server_port"] as? Int == 8443)
+  #expect(shadowsocks["method"] as? String == "aes-256-gcm")
+  #expect(shadowsocks["password"] as? String == "test-password")
+  #expect(shadowsocks["domain_resolver"] as? String == "dns-local")
+  let selector = try #require(outbounds.first { ($0["tag"] as? String) == "proxy-selector" })
+  #expect(selector["outbounds"] as? [String] == ["auto", "node-stable-ss"])
+  #expect(built.nodes.map(\.id.rawValue) == ["auto", "node-stable-ss"])
+  #expect(built.nodes.map(\.kind) == [.automatic, .shadowsocks])
+}
+
+@Test func managedConfigurationRejectsUnsafeIDsGroupsAndInvalid2022PSKs() {
+  func build(_ profile: VPNProfile) throws {
+    _ = try ConfigBuilder(cachePath: "/tmp/cache.db", apiSecret: "test-secret")
+      .makeConfiguration(profile: .compatibility(profile), mode: .rule, selectedNode: .auto)
+  }
+  let validOutbound = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "ss.example.com", port: 443, method: "aes-128-gcm", password: "password",
+      displayName: "SS"
+    ))
+  #expect(throws: CoreFailure.self) {
+    try build(
+      VPNProfile(connections: [
+        ManagedConnection(
+          id: ProxyNodeID(rawValue: "node-кириллица"), outbound: validOutbound
+        )
+      ]))
+  }
+  #expect(throws: CoreFailure.self) {
+    try build(
+      VPNProfile(
+        connections: [
+          ManagedConnection(id: ProxyNodeID(rawValue: "node-one"), outbound: validOutbound)
+        ],
+        nodeGroups: [
+          ProxyNodeGroup(
+            id: "group-two", name: "Invalid nodes",
+            nodes: [ProxyNodeID(rawValue: "node-one"), ProxyNodeID(rawValue: "node-one")]
+          )
+        ]
+      ))
+  }
+  #expect(throws: CoreFailure.self) {
+    try build(
+      VPNProfile(
+        connections: [
+          ManagedConnection(id: ProxyNodeID(rawValue: "node-one"), outbound: validOutbound)
+        ],
+        nodeGroups: [
+          ProxyNodeGroup(id: "group", name: "One", nodes: [ProxyNodeID(rawValue: "node-one")]),
+          ProxyNodeGroup(id: "group", name: "Two", nodes: [ProxyNodeID(rawValue: "node-one")]),
+        ]
+      ))
+  }
+  let invalid2022 = ManagedOutbound.shadowsocks(
+    ShadowsocksProfile(
+      server: "ss.example.com", port: 443, method: "2022-blake3-aes-128-gcm",
+      password: "c2hvcnQ=", displayName: "SS 2022"
+    ))
+  #expect(throws: CoreFailure.self) {
+    try build(
+      VPNProfile(connections: [
+        ManagedConnection(
+          id: ProxyNodeID(rawValue: "node-2022"), outbound: invalid2022
+        )
+      ]))
+  }
 }
 
 @Test func singleProtocolConfigurationsAreAcceptedByBundledCore() throws {
@@ -956,4 +1053,92 @@ import Testing
     try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
       .makeConfiguration(profile: .native(native), mode: .rule, selectedNode: .auto)
   }
+}
+
+@Test func managedURLTestGroupsUseTheConfiguredLatencyTarget() throws {
+  let target = "https://latency.example.test:8443/check?region=eu"
+  let compatibility = VPNProfile(
+    vless: [
+      VLESSProfile(
+        server: "203.0.113.10",
+        port: 443,
+        uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
+        serverName: "www.debian.org",
+        fingerprint: "chrome",
+        publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+        shortID: "",
+        displayName: "Reality"
+      )
+    ]
+  )
+  let compatibilityBuilt = try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+    .makeConfiguration(
+      profile: .compatibility(compatibility),
+      mode: .rule,
+      selectedNode: .auto,
+      latencyTestURL: target
+    )
+  let compatibilityRoot = try #require(
+    JSONSerialization.jsonObject(with: compatibilityBuilt.data) as? [String: Any])
+  let compatibilityOutbounds = try #require(compatibilityRoot["outbounds"] as? [[String: Any]])
+  let compatibilityAuto = try #require(
+    compatibilityOutbounds.first { ($0["tag"] as? String) == "auto" })
+  #expect(compatibilityAuto["url"] as? String == target)
+
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        { "type": "socks", "tag": "proxy", "server": "203.0.113.10", "server_port": 1080 }
+      ]
+    }
+    """.utf8
+  )
+  let native = try NativeProfileParser.parse(source)
+  let nativeBuilt = try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+    .makeConfiguration(
+      profile: .native(native),
+      mode: .rule,
+      selectedNode: .auto,
+      latencyTestURL: target
+    )
+  let nativeRoot = try #require(
+    JSONSerialization.jsonObject(with: nativeBuilt.data) as? [String: Any])
+  let nativeOutbounds = try #require(nativeRoot["outbounds"] as? [[String: Any]])
+  let nativeAuto = try #require(
+    nativeOutbounds.first { ($0["tag"] as? String) == "sbm-auto" })
+  #expect(nativeAuto["url"] as? String == target)
+}
+
+@Test func importedNativeURLTestRemainsProfileOwned() throws {
+  let source = Data(
+    """
+    {
+      "outbounds": [
+        { "type": "selector", "tag": "proxy", "outbounds": ["provided-auto", "manual"] },
+        {
+          "type": "urltest",
+          "tag": "provided-auto",
+          "outbounds": ["manual"],
+          "url": "https://profile.example.test/own-target"
+        },
+        { "type": "socks", "tag": "manual", "server": "203.0.113.10", "server_port": 1080 }
+      ]
+    }
+    """.utf8
+  )
+  let native = try NativeProfileParser.parse(source)
+  let built = try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
+    .makeConfiguration(
+      profile: .native(native),
+      mode: .rule,
+      selectedNode: .auto,
+      latencyTestURL: "https://latency.example.test/new-target"
+    )
+  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
+  let outbounds = try #require(root["outbounds"] as? [[String: Any]])
+  let imported = try #require(
+    outbounds.first { ($0["tag"] as? String) == "provided-auto" })
+  #expect(imported["url"] as? String == "https://profile.example.test/own-target")
+  #expect(!outbounds.contains { ($0["tag"] as? String) == "sbm-auto" })
 }

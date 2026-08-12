@@ -9,15 +9,18 @@ struct ConfigBuilder {
     profile: CoreProfile,
     mode: RoutingMode,
     selectedNode: ProxyNodeID,
-    localSOCKSPort: UInt16? = nil
+    localSOCKSPort: UInt16? = nil,
+    latencyTestURL: String = LatencyTargetPolicy.defaultURL
   ) throws -> BuiltConfiguration {
+    let latencyTestURL = try LatencyTargetPolicy.normalized(latencyTestURL)
     switch profile {
     case .compatibility(let compatibility):
       return try makeCompatibilityConfiguration(
         profile: compatibility,
         mode: mode,
         selectedNode: selectedNode,
-        localSOCKSPort: localSOCKSPort
+        localSOCKSPort: localSOCKSPort,
+        latencyTestURL: latencyTestURL
       )
     case .native(let native):
       return try NativeConfigurationComposer(
@@ -27,7 +30,8 @@ struct ConfigBuilder {
         profile: native,
         mode: mode,
         selectedNode: selectedNode,
-        localSOCKSPort: localSOCKSPort
+        localSOCKSPort: localSOCKSPort,
+        latencyTestURL: latencyTestURL
       )
     }
   }
@@ -36,13 +40,15 @@ struct ConfigBuilder {
     profile: VPNProfile,
     mode: RoutingMode,
     selectedNode: ProxyNodeID,
-    localSOCKSPort: UInt16?
+    localSOCKSPort: UInt16?,
+    latencyTestURL: String
   ) throws -> BuiltConfiguration {
     try ProfileValidator.validate(profile)
 
-    let vlessTags = profile.vless.indices.map { "vless-\($0 + 1)" }
-    let hysteria2Tags = profile.hysteria2.indices.map { "hysteria2-\($0 + 1)" }
-    let proxyTags = vlessTags + hysteria2Tags
+    let proxyTags = profile.connections.map(\.id.rawValue)
+    guard Set(proxyTags).count == proxyTags.count,
+      proxyTags.allSatisfy(ProfileValidator.isValidManagedNodeID)
+    else { throw CoreFailure.invalidProfile("Managed connection IDs are invalid.") }
     let allowedNodes = [ProxyNodeID.auto] + proxyTags.map(ProxyNodeID.init(rawValue:))
     let selectedTag = allowedNodes.contains(selectedNode) ? selectedNode.rawValue : "auto"
 
@@ -68,51 +74,63 @@ struct ConfigBuilder {
     }
 
     var proxyOutbounds: [[String: Any]] = []
-    for (index, vless) in profile.vless.enumerated() {
-      proxyOutbounds.append([
-        "type": "vless",
-        "tag": vlessTags[index],
-        "server": vless.server,
-        "server_port": Int(vless.port),
-        "uuid": vless.uuid,
-        "flow": "xtls-rprx-vision",
-        "network": "tcp",
-        "packet_encoding": "xudp",
-        "tls": [
-          "enabled": true,
-          "server_name": vless.serverName,
-          "utls": [
+    for connection in profile.connections {
+      switch connection.outbound {
+      case .vless(let vless):
+        proxyOutbounds.append([
+          "type": "vless",
+          "tag": connection.id.rawValue,
+          "server": vless.server,
+          "server_port": Int(vless.port),
+          "uuid": vless.uuid,
+          "flow": "xtls-rprx-vision",
+          "network": "tcp",
+          "packet_encoding": "xudp",
+          "tls": [
             "enabled": true,
-            "fingerprint": vless.fingerprint,
+            "server_name": vless.serverName,
+            "utls": [
+              "enabled": true,
+              "fingerprint": vless.fingerprint,
+            ],
+            "reality": [
+              "enabled": true,
+              "public_key": vless.publicKey,
+              "short_id": vless.shortID,
+            ],
           ],
-          "reality": [
+        ])
+      case .hysteria2(let hysteria2):
+        var outbound: [String: Any] = [
+          "type": "hysteria2",
+          "tag": connection.id.rawValue,
+          "server": hysteria2.server,
+          "server_port": Int(hysteria2.port),
+          "password": hysteria2.password,
+          "tls": [
             "enabled": true,
-            "public_key": vless.publicKey,
-            "short_id": vless.shortID,
+            "server_name": hysteria2.serverName,
           ],
-        ],
-      ])
-    }
-    for (index, hysteria2) in profile.hysteria2.enumerated() {
-      var outbound: [String: Any] = [
-        "type": "hysteria2",
-        "tag": hysteria2Tags[index],
-        "server": hysteria2.server,
-        "server_port": Int(hysteria2.port),
-        "password": hysteria2.password,
-        "tls": [
-          "enabled": true,
-          "server_name": hysteria2.serverName,
-        ],
-        "domain_resolver": "dns-local",
-      ]
-      if let obfsPassword = hysteria2.obfsPassword {
-        outbound["obfs"] = [
-          "type": "salamander",
-          "password": obfsPassword,
+          "domain_resolver": "dns-local",
         ]
+        if let obfsPassword = hysteria2.obfsPassword {
+          outbound["obfs"] = [
+            "type": "salamander",
+            "password": obfsPassword,
+          ]
+        }
+        proxyOutbounds.append(outbound)
+      case .shadowsocks(let shadowsocks):
+        proxyOutbounds.append([
+          "type": "shadowsocks",
+          "tag": connection.id.rawValue,
+          "server": shadowsocks.server,
+          "server_port": Int(shadowsocks.port),
+          "method": shadowsocks.method,
+          "password": shadowsocks.password,
+          "domain_resolver": "dns-local",
+        ])
       }
-      proxyOutbounds.append(outbound)
     }
 
     var route: [String: Any] = [
@@ -140,6 +158,16 @@ struct ConfigBuilder {
       "final": "proxy-selector",
     ]
     var directDNSRules: [[String: Any]] = []
+    var managedRules = route["rules"] as? [[String: Any]] ?? []
+    managedRules.append(
+      contentsOf: try ProfileValidator.applicationRouteRules(
+        profile.applicationRoutingRules,
+        directOutbound: "direct",
+        proxyOutbound: "proxy-selector",
+        allowedNodeIDs: Set(proxyTags)
+      )
+    )
+    route["rules"] = managedRules
     if let policy = profile.routingPolicy {
       let composer = RoutingPolicyComposer()
       route = try composer.merge(policy, into: route)
@@ -200,7 +228,7 @@ struct ConfigBuilder {
           "type": "urltest",
           "tag": "auto",
           "outbounds": proxyTags,
-          "url": "https://www.gstatic.com/generate_204",
+          "url": latencyTestURL,
           "interval": "10m",
           "tolerance": 50,
           "idle_timeout": "30m",
@@ -238,20 +266,13 @@ struct ConfigBuilder {
   }
 
   private func profileNodes(_ profile: VPNProfile) -> [ProxyNodeDescriptor] {
-    var nodes = [ProxyNodeDescriptor(id: .auto, name: "Auto")]
-    for (index, vless) in profile.vless.enumerated() {
+    var nodes = [ProxyNodeDescriptor(id: .auto, name: "Auto", kind: .automatic)]
+    for connection in profile.connections {
       nodes.append(
         ProxyNodeDescriptor(
-          id: ProxyNodeID(rawValue: "vless-\(index + 1)"),
-          name: vless.displayName
-        )
-      )
-    }
-    for (index, hysteria2) in profile.hysteria2.enumerated() {
-      nodes.append(
-        ProxyNodeDescriptor(
-          id: ProxyNodeID(rawValue: "hysteria2-\(index + 1)"),
-          name: hysteria2.displayName
+          id: connection.id,
+          name: connection.displayName,
+          kind: connection.kind
         )
       )
     }
@@ -268,34 +289,164 @@ struct BuiltConfiguration {
 
 enum ProfileValidator {
   static func validate(_ profile: VPNProfile) throws {
-    guard !profile.vless.isEmpty || !profile.hysteria2.isEmpty else {
+    guard !profile.connections.isEmpty else {
       throw CoreFailure.invalidProfile("The profile has no supported proxy connection.")
     }
-    guard profile.vless.count + profile.hysteria2.count <= SubscriptionClientMaximum.connections
+    guard profile.connections.count <= SubscriptionClientMaximum.connections
     else {
       throw CoreFailure.invalidProfile("The profile has more than 63 proxy connections.")
     }
-    for vless in profile.vless {
-      guard vless.port > 0 else { throw CoreFailure.invalidProfile("Server port is invalid.") }
-      try validateHost(vless.server, field: "VLESS server")
-      try validateHost(vless.serverName, field: "REALITY server name")
-      guard UUID(uuidString: vless.uuid) != nil else {
-        throw CoreFailure.invalidProfile("VLESS UUID is invalid.")
-      }
-      try validateToken(vless.fingerprint, field: "fingerprint", maximum: 32)
-      try validateBase64URL(vless.publicKey, field: "REALITY public key")
-      try validateHex(vless.shortID, field: "REALITY short ID")
+    let nodeIDs = profile.connections.map(\.id.rawValue)
+    guard Set(nodeIDs).count == nodeIDs.count,
+      nodeIDs.allSatisfy(isValidManagedNodeID)
+    else {
+      throw CoreFailure.invalidProfile("Managed connection IDs are invalid.")
     }
-    for hysteria2 in profile.hysteria2 {
-      guard hysteria2.port > 0 else {
-        throw CoreFailure.invalidProfile("Server port is invalid.")
+    let allowedNodeIDs = Set(nodeIDs)
+    var groupIDs = Set<String>()
+    for group in profile.nodeGroups ?? [] {
+      guard isValidGroupID(group.id), groupIDs.insert(group.id).inserted,
+        !group.name.isEmpty, group.name.utf8.count <= 96,
+        !group.name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+        Set(group.nodes).count == group.nodes.count,
+        group.nodes.allSatisfy({ allowedNodeIDs.contains($0.rawValue) })
+      else {
+        throw CoreFailure.invalidProfile("Managed connection group references invalid nodes.")
       }
-      try validateHost(hysteria2.server, field: "Hysteria2 server")
-      try validateHost(hysteria2.serverName, field: "Hysteria2 server name")
-      try validateSecret(hysteria2.password, field: "Hysteria2 password")
-      if let obfsPassword = hysteria2.obfsPassword {
-        try validateSecret(obfsPassword, field: "Hysteria2 obfuscation password")
+    }
+    for connection in profile.connections {
+      guard !connection.displayName.isEmpty, connection.displayName.utf8.count <= 96 else {
+        throw CoreFailure.invalidProfile("Managed connection name is invalid.")
       }
+      switch connection.outbound {
+      case .vless(let vless):
+        guard vless.port > 0 else { throw CoreFailure.invalidProfile("Server port is invalid.") }
+        try validateHost(vless.server, field: "VLESS server")
+        try validateHost(vless.serverName, field: "REALITY server name")
+        guard UUID(uuidString: vless.uuid) != nil else {
+          throw CoreFailure.invalidProfile("VLESS UUID is invalid.")
+        }
+        try validateToken(vless.fingerprint, field: "fingerprint", maximum: 32)
+        try validateBase64URL(vless.publicKey, field: "REALITY public key")
+        try validateHex(vless.shortID, field: "REALITY short ID")
+      case .hysteria2(let hysteria2):
+        guard hysteria2.port > 0 else {
+          throw CoreFailure.invalidProfile("Server port is invalid.")
+        }
+        try validateHost(hysteria2.server, field: "Hysteria2 server")
+        try validateHost(hysteria2.serverName, field: "Hysteria2 server name")
+        try validateSecret(hysteria2.password, field: "Hysteria2 password")
+        if let obfsPassword = hysteria2.obfsPassword {
+          try validateSecret(obfsPassword, field: "Hysteria2 obfuscation password")
+        }
+      case .shadowsocks(let shadowsocks):
+        guard shadowsocks.port > 0 else {
+          throw CoreFailure.invalidProfile("Server port is invalid.")
+        }
+        try validateHost(shadowsocks.server, field: "Shadowsocks server")
+        guard
+          [
+            "aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+            "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+            "2022-blake3-chacha20-poly1305",
+          ].contains(shadowsocks.method)
+        else {
+          throw CoreFailure.invalidProfile("Shadowsocks cipher is invalid.")
+        }
+        try validateSecret(shadowsocks.password, field: "Shadowsocks password")
+        try validateShadowsocks2022PSK(method: shadowsocks.method, password: shadowsocks.password)
+      }
+    }
+    _ = try applicationRouteRules(
+      profile.applicationRoutingRules,
+      directOutbound: "direct",
+      proxyOutbound: "proxy-selector",
+      allowedNodeIDs: allowedNodeIDs
+    )
+  }
+
+  static func applicationRouteRules(
+    _ rules: [ApplicationRoutingRule],
+    directOutbound: String,
+    proxyOutbound: String,
+    allowedNodeIDs: Set<String>
+  ) throws -> [[String: Any]] {
+    guard rules.count <= 32 else {
+      throw CoreFailure.invalidProfile("A profile may contain at most 32 application rules.")
+    }
+    var ids = Set<UUID>()
+    var executablePaths = Set<String>()
+    return try rules.compactMap { rule -> [String: Any]? in
+      let bundleURL = URL(fileURLWithPath: rule.bundlePath).standardizedFileURL
+      let executableURL = URL(fileURLWithPath: rule.executablePath).standardizedFileURL
+      let bundlePrefix = bundleURL.path.hasSuffix("/") ? bundleURL.path : bundleURL.path + "/"
+      guard ids.insert(rule.id).inserted,
+        executablePaths.insert(executableURL.path).inserted,
+        !rule.displayName.isEmpty,
+        rule.displayName.utf8.count <= 96,
+        !rule.displayName.unicodeScalars.contains(where: {
+          CharacterSet.controlCharacters.contains($0)
+        }),
+        bundleURL.path.hasPrefix("/"),
+        bundleURL.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
+        bundleURL.path.utf8.count <= 4096,
+        executableURL.path.hasPrefix(bundlePrefix),
+        executableURL.path.utf8.count <= 4096,
+        !rule.bundlePath.unicodeScalars.contains(where: {
+          CharacterSet.controlCharacters.contains($0)
+        }),
+        !rule.executablePath.unicodeScalars.contains(where: {
+          CharacterSet.controlCharacters.contains($0)
+        })
+      else {
+        throw CoreFailure.invalidProfile("An application routing rule is invalid.")
+      }
+      let action: [String: Any]
+      switch rule.target {
+      case .direct:
+        action = ["action": "route", "outbound": directOutbound]
+      case .selectedProxy:
+        action = ["action": "route", "outbound": proxyOutbound]
+      case .reject:
+        action = ["action": "reject"]
+      case .node(let node):
+        guard allowedNodeIDs.contains(node.rawValue) else { return nil }
+        action = ["action": "route", "outbound": node.rawValue]
+      }
+      var composed = action
+      composed["process_path"] = [executableURL.path]
+      return composed
+    }
+  }
+
+  static func isValidManagedNodeID(_ value: String) -> Bool {
+    return value != ProxyNodeID.auto.rawValue
+      && !value.isEmpty
+      && value.utf8.count <= 128
+      && value.utf8.allSatisfy(isASCIIManagedTagByte)
+  }
+
+  private static func isValidGroupID(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy(isASCIIManagedTagByte)
+  }
+
+  private static func isASCIIManagedTagByte(_ byte: UInt8) -> Bool {
+    (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+      || byte == 45 || byte == 46 || byte == 95
+  }
+
+  private static func validateShadowsocks2022PSK(method: String, password: String) throws {
+    let expectedBytes: Int
+    switch method {
+    case "2022-blake3-aes-128-gcm": expectedBytes = 16
+    case "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305": expectedBytes = 32
+    default: return
+    }
+    guard let decoded = Data(base64Encoded: password), decoded.count == expectedBytes,
+      decoded.base64EncodedString() == password
+    else {
+      throw CoreFailure.invalidProfile(
+        "Shadowsocks 2022 PSK is not the required Base64 key length.")
     }
   }
 

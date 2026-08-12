@@ -2,7 +2,7 @@ SHELL := /bin/zsh
 
 APP_NAME := SBM
 BUNDLE_NAME := SBM
-APP_VERSION := 1.1.11
+APP_VERSION := 1.1.12
 include Core.lock
 CORE_ARCHIVE := .vendor/sing-box-$(CORE_VERSION)-darwin-arm64.tar.gz
 CORE_UPSTREAM_BINARY := .vendor/sing-box-upstream
@@ -15,7 +15,14 @@ APP_BUNDLE := $(DIST_DIR)/$(BUNDLE_NAME).app
 DMG := $(DIST_DIR)/$(APP_NAME)-$(APP_VERSION)-arm64.dmg
 ASSET_INFO_PLIST := $(DIST_DIR)/asset-info.plist
 
-.PHONY: build core app dmg clean
+.PHONY: build core app dmg clean release-check
+
+release-check:
+	@if [[ -z "$${TAG:-}" ]]; then \
+		echo "TAG is required (for example: make release-check TAG=v$(APP_VERSION))" >&2; \
+		exit 2; \
+	fi
+	swift scripts/release-preflight.swift --root . --tag "$$TAG"
 
 build: core
 	swift build -c release --arch arm64

@@ -65,7 +65,7 @@ struct SubscriptionFetchResult: Sendable {
     let importedCount: Int
     switch profile {
     case .compatibility(let profile):
-      importedCount = profile.vless.count + profile.hysteria2.count
+      importedCount = profile.connections.count
     case .native:
       importedCount = 1
     }
@@ -144,6 +144,9 @@ enum SubscriptionClient {
 
   static func validate(headers: SubscriptionHeaders) throws {
     try validateHeader(headers.userAgent, name: "User-Agent", maximum: 512)
+    if let appVersion = headers.appVersion {
+      try validateHeader(appVersion, name: "X-App-Version", maximum: 64)
+    }
     try validateHeader(headers.deviceOS, name: "X-Device-OS", maximum: 64)
     try validateHeader(headers.hardwareID, name: "X-HWID", maximum: 128)
   }
@@ -167,6 +170,9 @@ enum SubscriptionClient {
     request.timeoutInterval = 15
     request.cachePolicy = .reloadIgnoringLocalCacheData
     request.setValue(headers.userAgent, forHTTPHeaderField: "User-Agent")
+    if let appVersion = headers.appVersion {
+      request.setValue(appVersion, forHTTPHeaderField: "X-App-Version")
+    }
     request.setValue(headers.deviceOS, forHTTPHeaderField: "X-Device-OS")
     request.setValue(headers.hardwareID, forHTTPHeaderField: "X-HWID")
     return request
@@ -188,6 +194,7 @@ enum SubscriptionClient {
     }
     var sanitized = request
     sanitized.setValue(nil, forHTTPHeaderField: "X-HWID")
+    sanitized.setValue(nil, forHTTPHeaderField: "X-App-Version")
     sanitized.setValue(nil, forHTTPHeaderField: "X-Device-OS")
     sanitized.setValue(nil, forHTTPHeaderField: "Authorization")
     sanitized.setValue(nil, forHTTPHeaderField: "Proxy-Authorization")
@@ -216,6 +223,7 @@ enum SubscriptionClient {
     return lowercased.hasPrefix("vless://")
       || lowercased.hasPrefix("hysteria2://")
       || lowercased.hasPrefix("hy2://")
+      || lowercased.hasPrefix("ss://")
   }
 
   static func parsePayload(_ body: String) throws -> CoreProfile {
@@ -249,10 +257,12 @@ enum SubscriptionClient {
     let hysteriaLinks = links.filter {
       $0.lowercased().hasPrefix("hysteria2://") || $0.lowercased().hasPrefix("hy2://")
     }
-    guard !vlessLinks.isEmpty || !hysteriaLinks.isEmpty else {
+    let shadowsocksLinks = links.filter { $0.lowercased().hasPrefix("ss://") }
+    guard !vlessLinks.isEmpty || !hysteriaLinks.isEmpty || !shadowsocksLinks.isEmpty else {
       throw SubscriptionFailure.missingProtocols
     }
-    guard vlessLinks.count + hysteriaLinks.count <= maximumConnections else {
+    guard vlessLinks.count + hysteriaLinks.count + shadowsocksLinks.count <= maximumConnections
+    else {
       throw SubscriptionFailure.tooManyConnections
     }
 
@@ -267,7 +277,8 @@ enum SubscriptionClient {
       vlessProfiles.append(try parseVLESS(link))
     }
     let hysteriaProfiles = try hysteriaLinks.map(parseHysteria2)
-    guard !vlessProfiles.isEmpty || !hysteriaProfiles.isEmpty else {
+    let shadowsocksProfiles = try shadowsocksLinks.map(parseShadowsocks)
+    guard !vlessProfiles.isEmpty || !hysteriaProfiles.isEmpty || !shadowsocksProfiles.isEmpty else {
       if let transport = skippedTransports.keys.sorted().first {
         throw SubscriptionFailure.unsupportedVLESSTransport(transport)
       }
@@ -277,8 +288,9 @@ enum SubscriptionClient {
     return SubscriptionFetchResult(
       profile: .compatibility(
         VPNProfile(
-          vless: vlessProfiles,
-          hysteria2: hysteriaProfiles
+          connections: vlessProfiles.map { ManagedConnection(outbound: .vless($0)) }
+            + hysteriaProfiles.map { ManagedConnection(outbound: .hysteria2($0)) }
+            + shadowsocksProfiles.map { ManagedConnection(outbound: .shadowsocks($0)) }
         )
       ),
       skippedTransports: skippedTransports
@@ -301,16 +313,39 @@ enum SubscriptionClient {
     guard let components = URLComponents(string: link),
       components.scheme?.lowercased() == "vless",
       let server = components.host,
-      let uuid = components.user
+      let encodedUUID = components.user,
+      components.password == nil,
+      components.path.isEmpty || components.path == "/"
     else { throw SubscriptionFailure.invalidVLESS }
 
-    let query = queryMap(components.queryItems)
-    guard query["security"]?.lowercased() == "reality",
-      query["flow"]?.lowercased() == "xtls-rprx-vision",
+    let query = try strictVLESSQuery(components.queryItems)
+    let allowedParameters: Set<String> = [
+      "encryption", "flow", "security", "type", "sni", "fp", "pbk", "sid", "headerType",
+    ]
+    guard Set(query.keys).isSubset(of: allowedParameters) else {
+      throw SubscriptionFailure.unsupportedVLESSParameter
+    }
+    let encryption = query["encryption"] ?? "none"
+    guard !encryption.isEmpty else { throw SubscriptionFailure.invalidVLESS }
+    guard encryption == "none" else {
+      throw SubscriptionFailure.unsupportedVLESSEncryption
+    }
+    guard query["security"] == "reality",
+      query["flow"] == "xtls-rprx-vision",
+      query["type"] == nil || query["type"] == "tcp",
+      query["headerType"] == nil || query["headerType"] == "none",
       let serverName = query["sni"], !serverName.isEmpty,
-      let publicKey = query["pbk"], !publicKey.isEmpty
+      validServerName(serverName),
+      let publicKey = query["pbk"], validRealityPublicKey(publicKey)
     else { throw SubscriptionFailure.invalidVLESS }
     let shortID = query["sid"] ?? ""
+    guard validRealityShortID(shortID) else { throw SubscriptionFailure.invalidVLESS }
+    let fingerprint = query["fp"].flatMap { $0.isEmpty ? nil : $0 } ?? "chrome"
+    guard supportedVLESSFingerprints.contains(fingerprint) else {
+      throw SubscriptionFailure.invalidVLESS
+    }
+    let uuid = encodedUUID.removingPercentEncoding ?? encodedUUID
+    guard UUID(uuidString: uuid) != nil else { throw SubscriptionFailure.invalidVLESS }
 
     guard let port = UInt16(exactly: components.port ?? 443), port > 0 else {
       throw SubscriptionFailure.invalidVLESS
@@ -318,9 +353,9 @@ enum SubscriptionClient {
     return VLESSProfile(
       server: server,
       port: port,
-      uuid: uuid.removingPercentEncoding ?? uuid,
+      uuid: uuid.lowercased(),
       serverName: serverName,
-      fingerprint: query["fp"].flatMap { $0.isEmpty ? nil : $0 } ?? "chrome",
+      fingerprint: fingerprint,
       publicKey: publicKey,
       shortID: shortID,
       displayName: try displayName(components.fragment, fallback: "Reality")
@@ -331,8 +366,9 @@ enum SubscriptionClient {
     guard let components = URLComponents(string: link),
       components.scheme?.lowercased() == "vless"
     else { throw SubscriptionFailure.invalidVLESS }
+    let query = try strictVLESSQuery(components.queryItems)
     let transport =
-      queryMap(components.queryItems)["type"]?
+      query["type"]?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased() ?? "tcp"
     guard !transport.isEmpty,
@@ -342,6 +378,58 @@ enum SubscriptionClient {
       })
     else { throw SubscriptionFailure.invalidVLESS }
     return transport
+  }
+
+  private static let supportedVLESSFingerprints: Set<String> = [
+    "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random",
+    "randomized",
+  ]
+
+  private static func strictVLESSQuery(_ items: [URLQueryItem]?) throws -> [String: String] {
+    var result: [String: String] = [:]
+    var caseInsensitiveNames: [String: String] = [:]
+    for item in items ?? [] {
+      guard item.name.utf8.count <= 64, !item.name.isEmpty else {
+        throw SubscriptionFailure.invalidVLESS
+      }
+      guard result[item.name] == nil else {
+        throw SubscriptionFailure.ambiguousVLESSParameters
+      }
+      let folded = item.name.lowercased()
+      if let previous = caseInsensitiveNames[folded], previous != item.name {
+        throw SubscriptionFailure.ambiguousVLESSParameters
+      }
+      caseInsensitiveNames[folded] = item.name
+      result[item.name] = item.value ?? ""
+    }
+    return result
+  }
+
+  private static func validServerName(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 253
+      && !value.unicodeScalars.contains(where: {
+        CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0)
+      })
+      && !value.contains(where: { "/\\?#@".contains($0) })
+  }
+
+  private static func validRealityPublicKey(_ value: String) -> Bool {
+    guard value.utf8.count == 43,
+      value.unicodeScalars.allSatisfy({
+        CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0)
+      })
+    else { return false }
+    let base64 =
+      value.replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/") + "="
+    return Data(base64Encoded: base64)?.count == 32
+  }
+
+  private static func validRealityShortID(_ value: String) -> Bool {
+    value.utf8.count <= 16 && value.utf8.count.isMultiple(of: 2)
+      && value.unicodeScalars.allSatisfy({
+        CharacterSet(charactersIn: "0123456789abcdef").contains($0)
+      })
   }
 
   private static func parseHysteria2(_ link: String) throws -> Hysteria2Profile {
@@ -382,6 +470,113 @@ enum SubscriptionClient {
       obfsPassword: obfsPassword,
       displayName: try displayName(components.fragment, fallback: "Hysteria2")
     )
+  }
+
+  private static let shadowsocksMethods: Set<String> = [
+    "aes-128-gcm",
+    "aes-256-gcm",
+    "chacha20-ietf-poly1305",
+    "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+  ]
+
+  /// Strict SIP002 without plugin support. In particular, this deliberately
+  /// rejects the pre-SIP002 whole-URI Base64 form and every query parameter.
+  private static func parseShadowsocks(_ link: String) throws -> ShadowsocksProfile {
+    guard link.utf8.count <= 4096,
+      let components = URLComponents(string: link),
+      components.scheme?.lowercased() == "ss",
+      components.query == nil,
+      components.path.isEmpty || components.path == "/",
+      let host = components.host,
+      let port = UInt16(exactly: components.port ?? 0), port > 0
+    else { throw SubscriptionFailure.invalidShadowsocks }
+    try validateShadowsocksHost(host)
+
+    let withoutFragment = link.split(
+      separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+    guard let schemeRange = withoutFragment.range(of: "://") else {
+      throw SubscriptionFailure.invalidShadowsocks
+    }
+    let afterScheme = withoutFragment[schemeRange.upperBound...]
+    let authorityEnd = afterScheme.firstIndex(of: "/") ?? afterScheme.endIndex
+    let authority = afterScheme[..<authorityEnd]
+    guard authority.filter({ $0 == "@" }).count == 1,
+      let at = authority.firstIndex(of: "@")
+    else { throw SubscriptionFailure.invalidShadowsocks }
+    let rawUserInfo = String(authority[..<at])
+    guard !rawUserInfo.isEmpty,
+      rawUserInfo.utf8.count <= 1024,
+      let percentDecoded = rawUserInfo.removingPercentEncoding
+    else { throw SubscriptionFailure.invalidShadowsocks }
+
+    let credential: String
+    let encoded: Bool
+    if percentDecoded.contains(":") {
+      credential = percentDecoded
+      encoded = false
+    } else {
+      guard let decoded = decodeBase64URL(percentDecoded) else {
+        throw SubscriptionFailure.invalidShadowsocks
+      }
+      credential = decoded
+      encoded = true
+    }
+    guard let separator = credential.firstIndex(of: ":") else {
+      throw SubscriptionFailure.invalidShadowsocks
+    }
+    let method = String(credential[..<separator]).lowercased()
+    let password = String(credential[credential.index(after: separator)...])
+    guard shadowsocksMethods.contains(method), !password.isEmpty,
+      credential.utf8.count <= 1024,
+      !credential.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+      !(encoded && method.hasPrefix("2022-")),
+      validShadowsocks2022PSK(method: method, password: password)
+    else { throw SubscriptionFailure.invalidShadowsocks }
+    return ShadowsocksProfile(
+      server: host,
+      port: port,
+      method: method,
+      password: password,
+      displayName: try displayName(components.fragment, fallback: "Shadowsocks")
+    )
+  }
+
+  private static func decodeBase64URL(_ value: String) -> String? {
+    guard !value.isEmpty,
+      value.unicodeScalars.allSatisfy({
+        CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_=")).contains($0)
+      })
+    else { return nil }
+    let base64 = value.replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    let padding = String(repeating: "=", count: (4 - base64.count % 4) % 4)
+    guard let data = Data(base64Encoded: base64 + padding),
+      let decoded = String(data: data, encoding: .utf8)
+    else { return nil }
+    return decoded
+  }
+
+  private static func validateShadowsocksHost(_ value: String) throws {
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-:"))
+    guard !value.isEmpty, value.utf8.count <= 253,
+      value.unicodeScalars.allSatisfy(allowed.contains),
+      !value.hasPrefix("."), !value.hasSuffix(".")
+    else { throw SubscriptionFailure.invalidShadowsocks }
+  }
+
+  private static func validShadowsocks2022PSK(method: String, password: String) -> Bool {
+    let expectedBytes: Int
+    switch method {
+    case "2022-blake3-aes-128-gcm": expectedBytes = 16
+    case "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305": expectedBytes = 32
+    default: return true
+    }
+    guard let data = Data(base64Encoded: password), data.count == expectedBytes else {
+      return false
+    }
+    return data.base64EncodedString() == password
   }
 
   private static func displayName(_ fragment: String?, fallback: String) throws -> String {
@@ -503,7 +698,8 @@ enum NativeProfileParser {
       ProxyNodeDescriptor(
         id: ProxyNodeID(rawValue: tag),
         name: try SubscriptionClient.validateDisplayName(
-          displayNames[tag] ?? (tag == "sbm-auto" ? "Auto" : tag))
+          displayNames[tag] ?? (tag == "sbm-auto" ? "Auto" : tag)),
+        kind: tag == "sbm-auto" || typeByTag[tag] == "urltest" ? .automatic : .native
       )
     }
     return NativeProfile(
@@ -521,8 +717,12 @@ enum SubscriptionFailure: Equatable, LocalizedError {
   case tooLarge
   case missingProtocols
   case invalidVLESS
+  case ambiguousVLESSParameters
+  case unsupportedVLESSParameter
+  case unsupportedVLESSEncryption
   case unsupportedVLESSTransport(String)
   case invalidHysteria2
+  case invalidShadowsocks
   case invalidRoutingPolicy
   case invalidNativeProfile
   case missingSelectableOutbounds
@@ -542,11 +742,19 @@ enum SubscriptionFailure: Equatable, LocalizedError {
     case .invalidEncoding: "The subscription response is not valid UTF-8."
     case .tooLarge: "The subscription response is unexpectedly large."
     case .missingProtocols:
-      "Enter an HTTPS subscription, VLESS + REALITY link, or Hysteria2 link."
+      "Enter an HTTPS subscription, VLESS + REALITY, Hysteria2, or strict SIP002 Shadowsocks link."
     case .invalidVLESS: "The VLESS + REALITY link is invalid or unsupported."
+    case .ambiguousVLESSParameters:
+      "The VLESS link repeats a query parameter or uses ambiguous parameter casing."
+    case .unsupportedVLESSParameter:
+      "The VLESS link contains a parameter that SBM does not support."
+    case .unsupportedVLESSEncryption:
+      "VLESS Encryption is not supported by SBM compact links."
     case .unsupportedVLESSTransport(let transport):
       "VLESS transport \(transport.uppercased()) is not supported by sing-box."
     case .invalidHysteria2: "The Hysteria2 link is invalid or uses unsupported obfuscation."
+    case .invalidShadowsocks:
+      "The Shadowsocks link must be a plugin-free SIP002 URI with an approved modern cipher."
     case .invalidRoutingPolicy:
       "The routing JSON may contain only route.rules and remote route.rule_set entries."
     case .invalidNativeProfile:

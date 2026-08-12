@@ -103,8 +103,11 @@ private final class HelperServer {
         response = try manager.start(
           profile: request.profile,
           profileID: request.profileID,
+          mode: request.mode,
+          selectedNode: request.node,
           localSOCKSEnabled: request.localSOCKSEnabled,
-          localSOCKSPort: request.localSOCKSPort
+          localSOCKSPort: request.localSOCKSPort,
+          latencyTestURL: request.latencyTestURL
         )
       case .stop:
         response = try manager.stop()
@@ -114,11 +117,24 @@ private final class HelperServer {
       case .setNode:
         guard let node = request.node else { throw HelperFailure.missingParameter("node") }
         response = try manager.setNode(node)
+      case .setLatencyTarget:
+        guard let target = request.latencyTestURL else {
+          throw HelperFailure.missingParameter("latencyTestURL")
+        }
+        response = try manager.setLatencyTarget(target)
       case .testLatency:
         response = try manager.testLatency()
       case .validateProfile:
         guard let profile = request.profile else { throw HelperFailure.missingParameter("profile") }
         response = try manager.validate(profile: profile)
+      case .matchRuleSets:
+        guard let tags = request.ruleSetTags else {
+          throw HelperFailure.missingParameter("ruleSetTags")
+        }
+        guard let destination = request.routingDestination else {
+          throw HelperFailure.missingParameter("routingDestination")
+        }
+        response = try manager.matchRuleSets(tags: tags, destination: destination)
       case .shutdown:
         response = try manager.stop()
       }
