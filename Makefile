@@ -2,7 +2,7 @@ SHELL := /bin/zsh
 
 APP_NAME := SBM
 BUNDLE_NAME := SBM
-APP_VERSION := 1.1.12
+APP_VERSION := 1.1.13
 include Core.lock
 CORE_ARCHIVE := .vendor/sing-box-$(CORE_VERSION)-darwin-arm64.tar.gz
 CORE_UPSTREAM_BINARY := .vendor/sing-box-upstream
@@ -93,7 +93,7 @@ dmg: app
 	cp -R "$(APP_BUNDLE)" "$(DIST_DIR)/dmg-root/"
 	ln -s /Applications "$(DIST_DIR)/dmg-root/Applications"
 	hdiutil create -volname "$(APP_NAME)" -srcfolder "$(DIST_DIR)/dmg-root" -ov -format UDZO "$(DMG)"
-	shasum -a 256 "$(DMG)" > "$(DMG).sha256"
+	@cd "$(DIST_DIR)" && shasum -a 256 "$(notdir $(DMG))" > "$(notdir $(DMG)).sha256"
 	rm -rf "$(DIST_DIR)/dmg-root"
 
 clean:

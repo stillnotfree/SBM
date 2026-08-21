@@ -55,18 +55,20 @@ struct SBMApp: App {
           model.refresh()
         }
     } label: {
-      Image(systemName: model.coreRunning ? "shield.fill" : "shield")
-        .onAppear {
-          appDelegate.model = model
-        }
+      Image(
+        systemName: model.connectionPresentation.systemImage
+      )
+      .onAppear {
+        appDelegate.model = model
+      }
     }
     .menuBarExtraStyle(.menu)
 
-    Window("Profiles", id: "profiles") {
+    Window("Settings", id: "profiles") {
       SettingsView(model: model)
     }
-    .defaultSize(width: 560, height: 340)
-    .windowResizability(.contentSize)
+    .defaultSize(width: 720, height: 620)
+    .defaultPosition(.center)
 
     Window("Diagnostics", id: "diagnostics") {
       DiagnosticsView(model: model)
@@ -88,14 +90,14 @@ enum SBMWindow: String, CaseIterable {
 
   var title: String {
     switch self {
-    case .profiles: "Profiles"
+    case .profiles: "Settings"
     case .diagnostics: "Diagnostics"
     case .about: "About SBM"
     }
   }
 
   var level: NSWindow.Level {
-    self == .profiles ? .floating : .normal
+    .normal
   }
 
   var identifier: NSUserInterfaceItemIdentifier {
@@ -109,14 +111,32 @@ private struct MenuContentView: View {
 
   var body: some View {
     Button {
-      model.setCoreEnabled(!model.coreRunning)
+      if let enabled = model.connectionPresentation.nextEnabledState {
+        model.setCoreEnabled(enabled)
+      }
     } label: {
       Label(
-        model.coreRunning ? "VPN Connected" : "VPN Disconnected",
-        systemImage: model.coreRunning ? "lock.shield.fill" : "lock.shield"
+        model.connectionPresentation.title,
+        systemImage: model.connectionPresentation.systemImage
       )
     }
-    .disabled(model.isBusy)
+    .disabled(model.connectionPresentation.nextEnabledState == nil || model.helperSetupInProgress)
+
+    if let deferred = model.deferredRuntimeApplyPresentation {
+      Label(deferred.headline, systemImage: "arrow.triangle.2.circlepath")
+      if deferred.phase == .reconnecting {
+        ProgressView()
+          .controlSize(.small)
+      }
+      if let error = model.deferredRuntimeApplyError {
+        Text(error)
+          .foregroundStyle(.secondary)
+      }
+      Button(deferred.action.title) {
+        model.reconnectToApply()
+      }
+      .disabled(model.helperSetupInProgress || deferred.phase == .reconnecting)
+    }
 
     Divider()
 
@@ -172,15 +192,13 @@ private struct MenuContentView: View {
     Button {
       presentWindow(.profiles)
     } label: {
-      Label("Profiles…", systemImage: "rectangle.stack")
+      Label("Settings…", systemImage: "gearshape")
     }
 
-    if model.lastError != nil {
-      Button {
-        presentWindow(.diagnostics)
-      } label: {
-        Label("Error…", systemImage: "exclamationmark.triangle.fill")
-      }
+    Button {
+      presentWindow(.diagnostics)
+    } label: {
+      Label("Diagnostics…", systemImage: "stethoscope")
     }
 
     if !model.helperEnabled {
@@ -212,9 +230,10 @@ private struct MenuContentView: View {
       .disabled(model.helperSetupInProgress)
     }
 
-    Button("Refresh") {
-      model.refresh()
+    Button(model.isRefreshing ? "Refreshing…" : "Refresh") {
+      model.refreshExternalState()
     }
+    .disabled(model.isRefreshing)
     .keyboardShortcut("r")
 
     Divider()
@@ -228,7 +247,7 @@ private struct MenuContentView: View {
       presentWindow(.about)
     }
 
-    Button(model.coreRunning ? "Disconnect & Quit" : "Quit") {
+    Button(model.coreIsKnownStopped ? "Quit" : "Disconnect & Quit") {
       NSApplication.shared.terminate(nil)
     }
     .keyboardShortcut("q")
@@ -377,10 +396,31 @@ private struct DiagnosticsView: View {
       }
 
       ScrollView {
-        Text(snapshot.text)
-          .font(.system(.body, design: .monospaced))
-          .textSelection(.enabled)
-          .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 12) {
+          Text("Current Status").font(.headline)
+          Text(snapshot.statusText)
+            .font(.system(.body, design: .monospaced))
+            .textSelection(.enabled)
+          HStack {
+            Text("Recent Errors").font(.headline)
+            Spacer()
+            Button("Clear History") { model.clearRecentErrors() }
+              .disabled(model.recentErrors.isEmpty)
+          }
+          if model.recentErrors.isEmpty {
+            Text("No recent errors.").foregroundStyle(.secondary)
+          } else {
+            ForEach(model.recentErrors.reversed()) { entry in
+              Text(
+                entry.repeatCount == 1
+                  ? entry.message : "\(entry.message) (×\(entry.repeatCount))"
+              )
+              .font(.system(.caption, design: .monospaced))
+              .textSelection(.enabled)
+            }
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
       }
       .padding(12)
       .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 10))

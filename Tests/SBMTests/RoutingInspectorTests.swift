@@ -5,6 +5,58 @@ import Testing
 @testable import SBM
 @testable import SBMHelper
 
+@Test func privateIPRuleWithoutResolvedAddressIsIndeterminateAndShowsLaterFallback() {
+  let result = RoutingInspector.inspect(
+    route: [
+      "rules": [
+        ["ip_is_private": true, "action": "route", "outbound": "direct"],
+        ["domain_suffix": ["example.com"], "action": "route", "outbound": "proxy"],
+      ],
+      "final": "direct",
+    ],
+    context: RoutingInspectionContext(domain: "www.example.com"),
+    outboundDecisions: ["direct": .direct, "proxy": .vpn],
+    selectorOutbound: "proxy"
+  )
+  #expect(result.decision == .indeterminate)
+  #expect(result.uncertaintyReason?.contains("resolved destination IP") == true)
+  #expect(result.fallback?.decision == .vpn)
+}
+
+@Test func privateIPRuleEvaluatesConcreteIPv4AndIPv6Addresses() {
+  let route: [String: Any] = [
+    "rules": [["ip_is_private": true, "action": "route", "outbound": "direct"]],
+    "final": "proxy",
+  ]
+  let decisions: [String: RoutingInspectionResult.Decision] = [
+    "direct": .direct, "proxy": .vpn,
+  ]
+  #expect(
+    RoutingInspector.inspect(
+      route: route,
+      context: RoutingInspectionContext(ipAddress: "10.0.0.1"),
+      outboundDecisions: decisions,
+      selectorOutbound: "proxy"
+    ).decision == .direct
+  )
+  #expect(
+    RoutingInspector.inspect(
+      route: route,
+      context: RoutingInspectionContext(ipAddress: "203.0.113.8"),
+      outboundDecisions: decisions,
+      selectorOutbound: "proxy"
+    ).decision == .vpn
+  )
+  #expect(
+    RoutingInspector.inspect(
+      route: route,
+      context: RoutingInspectionContext(ipAddress: "fc00::1"),
+      outboundDecisions: decisions,
+      selectorOutbound: "proxy"
+    ).decision == .direct
+  )
+}
+
 private let outboundDecisions: [String: RoutingInspectionResult.Decision] = [
   "direct": .direct,
   "proxy-selector": .vpn,
@@ -73,6 +125,19 @@ private enum InspectorRuleSetMatcherFailure: Error {
   case transient
 }
 
+private actor FailingRuleSetMatcher {
+  private var requests = 0
+
+  func match(tags _: [String], destination _: String) throws -> [String: Bool] {
+    requests += 1
+    throw RoutingInspectionFailure.activeRuleSetDataUnavailable(
+      "cache metadata missing\nsecret details are omitted"
+    )
+  }
+
+  func count() -> Int { requests }
+}
+
 @Test func routingInspectorExplainsRussianExampleWithoutNetworkAccess() throws {
   let data = try Data(
     contentsOf: URL(fileURLWithPath: "Examples/routing-ru-direct.json")
@@ -112,6 +177,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "2ip.ru",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag
     ),
@@ -122,6 +188,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "www.google.ru",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag
     ),
@@ -132,6 +199,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "google.com",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag
     ),
@@ -185,6 +253,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "gosuslugi.ru",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag,
       defaultApplicationPaths: [applicationPath]
@@ -196,6 +265,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "gosuslugi.ru",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag,
       applicationPath: applicationPath
@@ -243,6 +313,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "google.com",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag,
       defaultApplicationPaths: [applicationPath]
@@ -254,6 +325,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "google.com",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag,
       applicationPath: applicationPath
@@ -298,6 +370,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "example.com",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag,
       applicationPath: applicationPath
@@ -322,12 +395,11 @@ private enum InspectorRuleSetMatcherFailure: Error {
   #expect(!source.contains(#"TextField("gosuslugi.ru", text:"#))
   #expect(source.contains(#"prompt: Text("gosuslugi.ru")"#))
   #expect(source.contains(#"Button("Explain")"#))
-  #expect(source.contains(".fixedSize()"))
-  #expect(source.contains(".fixedSize(horizontal: true, vertical: false)"))
-  #expect(!source.contains(".frame(minWidth: 220, idealWidth: 260, maxWidth: 320)"))
+  #expect(source.contains(".frame(minWidth: 180, maxWidth: .infinity)"))
+  #expect(source.contains(".frame(width: routingInspectorActionButtonWidth)"))
   #expect(source.contains(#"Text("Proxy").tag(ApplicationRoutingTarget.selectedProxy)"#))
   #expect(source.contains(#"prompt: Text("(?i)lte|russia")"#))
-  #expect(source.contains(#"LabeledContent("Exclude regex (optional)")"#))
+  #expect(source.contains(#"settingsRow("Exclude regex (optional)")"#))
 }
 
 @Test @MainActor func explainDoesNotMutatePersistenceGenerationOrRuntime() async {
@@ -373,7 +445,10 @@ private enum InspectorRuleSetMatcherFailure: Error {
   #expect(model.desiredRuntimeGeneration == generation)
   #expect(await runtime.count() == 1)
   #expect(saves == saveCount)
-  #expect(model.routingInspectorOutput == "PROXY · Auto\nMatched: Final route")
+  #expect(
+    model.routingInspectorOutput
+      == "Depends on resolved IP\nOtherwise: PROXY · Auto · Final route"
+  )
   #expect(model.routingInspectorDetails.contains("Traffic from: Default traffic"))
   await runtime.complete(profileID: profileID)
 }
@@ -422,6 +497,8 @@ private enum InspectorRuleSetMatcherFailure: Error {
   )
   model.helperEnabled = true
   model.helperReachable = true
+  model.helperVersion = HelperConstants.helperVersion
+  model.helperRevision = HelperConstants.helperRevision
   model.setCoreEnabled(true)
   for _ in 0..<100 where await runtime.count() == 0 { await Task.yield() }
   await runtime.complete(profileID: profileID, selectedNode: nodeID)
@@ -434,8 +511,76 @@ private enum InspectorRuleSetMatcherFailure: Error {
   }
 
   #expect(await matcher.count() == 3)
-  #expect(model.selectedNodeID == nodeID)
-  #expect(model.routingInspectorOutput == "PROXY · Germany\nMatched: Final route")
+  #expect(model.selectedNodeID == .auto)
+  #expect(
+    model.routingInspectorOutput
+      == "Depends on resolved IP\nOtherwise: PROXY · Auto · Final route"
+  )
+}
+
+@Test @MainActor func activeRuleSetFailureIsTypedAndBounded() async throws {
+  let profileID = UUID()
+  let nodeID = ProxyNodeID(rawValue: "node-germany")
+  let policy = try RoutingPolicyParser.parse(
+    Data(contentsOf: URL(fileURLWithPath: "Examples/routing-ru-direct.json"))
+  )
+  let profile = CoreProfile.compatibility(
+    VPNProfile(
+      connections: [
+        ManagedConnection(
+          id: nodeID,
+          displayName: "Germany",
+          outbound: .shadowsocks(
+            ShadowsocksProfile(
+              server: "198.51.100.20",
+              port: 443,
+              method: "aes-128-gcm",
+              password: "synthetic-test-password"
+            ))
+        )
+      ],
+      routingPolicy: policy
+    )
+  )
+  let runtime = InspectorRuntimeSpy()
+  let matcher = FailingRuleSetMatcher()
+  let model = AppModel(
+    runtimeSender: { request in await runtime.send(request) },
+    profileLibraryLoader: {
+      ProfileLibrary(
+        profiles: [ManagedProfile(id: profileID, name: "Inspector", payload: profile)],
+        selectedProfileID: profileID
+      )
+    },
+    profileLibrarySaver: { _ in },
+    routingRuleSetMatcher: { tags, destination in
+      try await matcher.match(tags: tags, destination: destination)
+    },
+    routingRuleSetRetryDelay: .zero,
+    performStartup: false
+  )
+  model.helperEnabled = true
+  model.helperReachable = true
+  model.helperVersion = HelperConstants.helperVersion
+  model.helperRevision = HelperConstants.helperRevision
+  model.setCoreEnabled(true)
+  for _ in 0..<100 where await runtime.count() == 0 { await Task.yield() }
+  await runtime.complete(profileID: profileID, selectedNode: nodeID)
+  for _ in 0..<100 where !model.coreRunning { await Task.yield() }
+
+  model.routingInspectorInput = "google.com"
+  model.inspectRouting()
+  for _ in 0..<100
+  where !model.routingInspectorDetails.contains("Active rule-set data is unavailable") {
+    await Task.yield()
+  }
+
+  #expect(await matcher.count() == 5)
+  #expect(model.routingInspectorOutput == "Active rule-set data is unavailable.")
+  #expect(
+    model.routingInspectorDetails
+      == "Active rule-set data is unavailable: cache metadata missing secret details are omitted"
+  )
 }
 
 @Test func routingInspectorHandlesFinalRejectCIDRAndPrecedence() {
@@ -621,6 +766,7 @@ private enum InspectorRuleSetMatcherFailure: Error {
     route: composed.route,
     context: RoutingInspectionContext(
       domain: "unmatched.example.com",
+      ipAddress: "93.184.216.34",
       mode: .rule,
       inboundTag: composed.inboundTag
     ),

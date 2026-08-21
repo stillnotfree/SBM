@@ -56,6 +56,16 @@ import Testing
   #expect(try RuleSetCacheReader.content(in: database, tag: "geosite-ru") == expected)
 }
 
+@Test func ruleSetCacheReaderValidatesFileSnapshotAgainstFullDatabaseSize() throws {
+  let expected = Data(#"{"version":4,"rules":[{"domain_suffix":[".ru"]}]}"#.utf8)
+  let temporary = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMRuleSetCache-\(UUID().uuidString).db")
+  try makeExternalRuleSetCacheFixture(tag: "geosite-ru", content: expected).write(to: temporary)
+  defer { try? FileManager.default.removeItem(at: temporary) }
+
+  #expect(try RuleSetCacheReader.content(at: temporary, tag: "geosite-ru") == expected)
+}
+
 private func makeRuleSetCacheFixture(tag: String, content: Data) -> Data {
   let pageSize = 4096
   var data = Data(repeating: 0, count: pageSize * 4)

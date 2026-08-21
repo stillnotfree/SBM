@@ -81,6 +81,13 @@ Unit tests should use synthetic credentials, loopback addresses, temporary
 directories, and injected platform seams. They must not contact real providers,
 read installed root state, or control launchd.
 
+Bundled-core configuration tests may run only `sing-box check` against complete
+candidate files whose config, cache, and temporary paths are isolated under a
+test directory. They must never start a TUN configuration. Disconnect & Quit,
+Refresh, latency cancellation, and runtime ordering tests use injected helper
+responses only. See [manual-validation.md](manual-validation.md) for checks that
+must be performed later by a human on an explicitly installed candidate.
+
 A passing local build proves only source and artifact checks. Finder behavior,
 window level, background-item approval, ISP behavior, and live VPN connectivity
 need separately reported manual evidence. Never imply those checks ran when
@@ -92,3 +99,13 @@ Do not tune MTU, mux, keepalive, FakeIP, concurrency, or protocol selection from
 anecdotes. Use the bounded sampler and A/B procedure in `PERFORMANCE.md`.
 Report the machine, build, profile, network, sample duration, and variance; a
 single local measurement is not a general performance claim.
+
+## Helper revision discipline
+
+Advance `HelperConstants.helperRevision` monotonically whenever privileged
+helper behavior or shared request/profile semantics change. Readiness, approval
+continuation, repair, validation, and runtime-send paths must all reject the
+previous revision before runtime use. The current source uses IPC protocol 10
+and helper revision 48. Protocol 10 is an intentional compatibility boundary
+for the current request/response and managed-connection shape; use a
+revision-only gate only when the existing IPC shape remains compatible.

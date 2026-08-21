@@ -66,6 +66,26 @@ final class SystemHelperService: HelperServiceManaging {
   }
 }
 
+@MainActor
+protocol HelperLifecycleTiming {
+  var now: ContinuousClock.Instant { get }
+
+  func sleep(for duration: Duration) async throws
+}
+
+@MainActor
+struct ContinuousHelperLifecycleTiming: HelperLifecycleTiming {
+  private let clock = ContinuousClock()
+
+  var now: ContinuousClock.Instant {
+    clock.now
+  }
+
+  func sleep(for duration: Duration) async throws {
+    try await clock.sleep(for: duration)
+  }
+}
+
 enum HelperLifecycleFailure: LocalizedError {
   case approvalRequired
   case registrationDidNotFinish
@@ -100,6 +120,7 @@ enum HelperLifecycle {
     service: any HelperServiceManaging,
     timeout: Duration = .seconds(15),
     pollInterval: Duration = .milliseconds(250),
+    timing: any HelperLifecycleTiming = ContinuousHelperLifecycleTiming(),
     probe: @escaping @Sendable () async throws -> HelperResponse
   ) async throws -> HelperResponse {
     switch service.registrationState {
@@ -113,24 +134,24 @@ enum HelperLifecycle {
       throw HelperLifecycleFailure.registrationDidNotFinish
     }
 
-    let clock = ContinuousClock()
-    let deadline = clock.now.advanced(by: timeout)
+    let deadline = timing.now.advanced(by: timeout)
     var mostRecentError: (any Error)?
 
-    while clock.now < deadline {
+    while timing.now < deadline {
       switch service.registrationState {
       case .requiresApproval:
         throw HelperLifecycleFailure.approvalRequired
       case .enabled:
         do {
           let response = try await probe()
-          guard response.helperVersion == HelperConstants.helperVersion,
+          guard response.protocolVersion == HelperConstants.protocolVersion,
+            response.helperVersion == HelperConstants.helperVersion,
             response.helperRevision == HelperConstants.helperRevision
           else {
             mostRecentError = HelperLifecycleFailure.startupTimedOut(
               "macOS is still running an older helper."
             )
-            try await Task.sleep(for: pollInterval)
+            try await timing.sleep(for: pollInterval)
             continue
           }
           return response
@@ -140,7 +161,7 @@ enum HelperLifecycle {
       case .notRegistered, .notFound, .unknown:
         break
       }
-      try await Task.sleep(for: pollInterval)
+      try await timing.sleep(for: pollInterval)
     }
 
     guard service.registrationState == .enabled else {
@@ -156,6 +177,7 @@ enum HelperLifecycle {
     registrationTimeout: Duration = .seconds(60),
     startupTimeout: Duration = .seconds(15),
     pollInterval: Duration = .milliseconds(500),
+    timing: any HelperLifecycleTiming = ContinuousHelperLifecycleTiming(),
     waiting: @escaping () -> Void = {},
     probe: @escaping @Sendable () async throws -> HelperResponse
   ) async throws -> HelperResponse {
@@ -170,15 +192,14 @@ enum HelperLifecycle {
       throw HelperLifecycleFailure.registrationDidNotFinish
     }
 
-    let clock = ContinuousClock()
-    let registrationDeadline = clock.now.advanced(by: registrationTimeout)
+    let registrationDeadline = timing.now.advanced(by: registrationTimeout)
     var mostRecentError: (any Error)?
     var didRegister = false
 
     // SMAppService.unregister() can complete before Background Task Management
     // stops reporting the old item as enabled. Register the replacement
     // explicitly instead of treating that stale state as a successful update.
-    while clock.now < registrationDeadline {
+    while timing.now < registrationDeadline {
       try Task.checkCancellation()
 
       if service.registrationState == .requiresApproval {
@@ -194,7 +215,7 @@ enum HelperLifecycle {
         mostRecentError = error
         waiting()
       }
-      try await Task.sleep(for: pollInterval)
+      try await timing.sleep(for: pollInterval)
     }
 
     guard didRegister else {
@@ -203,8 +224,8 @@ enum HelperLifecycle {
       )
     }
 
-    let startupDeadline = clock.now.advanced(by: startupTimeout)
-    while clock.now < startupDeadline {
+    let startupDeadline = timing.now.advanced(by: startupTimeout)
+    while timing.now < startupDeadline {
       try Task.checkCancellation()
 
       switch service.registrationState {
@@ -213,7 +234,8 @@ enum HelperLifecycle {
       case .enabled:
         do {
           let response = try await probe()
-          guard response.helperVersion == HelperConstants.helperVersion,
+          guard response.protocolVersion == HelperConstants.protocolVersion,
+            response.helperVersion == HelperConstants.helperVersion,
             response.helperRevision == HelperConstants.helperRevision
           else {
             throw HelperLifecycleFailure.startupTimedOut(
@@ -229,7 +251,7 @@ enum HelperLifecycle {
       }
 
       waiting()
-      try await Task.sleep(for: pollInterval)
+      try await timing.sleep(for: pollInterval)
     }
 
     throw HelperLifecycleFailure.startupTimedOut(

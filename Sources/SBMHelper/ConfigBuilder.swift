@@ -160,6 +160,13 @@ struct ConfigBuilder {
     var directDNSRules: [[String: Any]] = []
     var managedRules = route["rules"] as? [[String: Any]] ?? []
     managedRules.append(
+      contentsOf: try ProfileValidator.websiteRouteRules(
+        profile.websiteRoutingRules,
+        directOutbound: "direct",
+        proxyOutbound: "proxy-selector"
+      )
+    )
+    managedRules.append(
       contentsOf: try ProfileValidator.applicationRouteRules(
         profile.applicationRoutingRules,
         directOutbound: "direct",
@@ -181,6 +188,12 @@ struct ConfigBuilder {
         "server": "dns-local",
       ]
     ]
+    dnsRules.append(
+      contentsOf: ProfileValidator.websiteDirectDNSRules(
+        profile.websiteRoutingRules,
+        server: "dns-local"
+      )
+    )
     dnsRules.append(contentsOf: directDNSRules)
     dnsRules.append([
       "action": "route",
@@ -363,6 +376,72 @@ enum ProfileValidator {
       proxyOutbound: "proxy-selector",
       allowedNodeIDs: allowedNodeIDs
     )
+    _ = try websiteRouteRules(
+      profile.websiteRoutingRules,
+      directOutbound: "direct",
+      proxyOutbound: "proxy-selector"
+    )
+  }
+
+  static func websiteRouteRules(
+    _ rules: [WebsiteRoutingRule],
+    directOutbound: String,
+    proxyOutbound: String
+  ) throws -> [[String: Any]] {
+    guard rules.count <= 128 else {
+      throw CoreFailure.invalidProfile("A profile may contain at most 128 website rules.")
+    }
+    var ids = Set<UUID>()
+    var domains = Set<String>()
+    return try rules.map { rule in
+      guard ids.insert(rule.id).inserted, domains.insert(rule.domain).inserted,
+        validNormalizedDomain(rule.domain)
+      else { throw CoreFailure.invalidProfile("A website routing rule is invalid.") }
+      var composed: [String: Any] = [
+        "domain": [rule.domain],
+        "domain_suffix": [".\(rule.domain)"],
+      ]
+      switch rule.target {
+      case .direct:
+        composed["action"] = "route"
+        composed["outbound"] = directOutbound
+      case .selectedProxy:
+        composed["action"] = "route"
+        composed["outbound"] = proxyOutbound
+      case .reject:
+        composed["action"] = "reject"
+      }
+      return composed
+    }
+  }
+
+  static func websiteDirectDNSRules(
+    _ rules: [WebsiteRoutingRule],
+    server: String
+  ) -> [[String: Any]] {
+    rules.compactMap { rule in
+      guard rule.target == .direct else { return nil }
+      return [
+        "domain": [rule.domain],
+        "domain_suffix": [".\(rule.domain)"],
+        "action": "route",
+        "server": server,
+      ]
+    }
+  }
+
+  private static func validNormalizedDomain(_ domain: String) -> Bool {
+    guard !domain.isEmpty, domain.utf8.count <= 253, domain == domain.lowercased(),
+      !domain.hasPrefix("."), !domain.hasSuffix("."), domain.contains(".")
+    else { return false }
+    return domain.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
+      guard !label.isEmpty, label.utf8.count <= 63,
+        label.first != "-", label.last != "-"
+      else { return false }
+      return label.utf8.allSatisfy { byte in
+        (48...57).contains(byte) || (97...122).contains(byte) || byte == 45
+      }
+    }
   }
 
   static func applicationRouteRules(

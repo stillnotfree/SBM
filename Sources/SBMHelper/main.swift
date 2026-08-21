@@ -123,7 +123,7 @@ private final class HelperServer {
         }
         response = try manager.setLatencyTarget(target)
       case .testLatency:
-        response = try manager.testLatency()
+        response = try manager.testLatency(node: request.node)
       case .validateProfile:
         guard let profile = request.profile else { throw HelperFailure.missingParameter("profile") }
         response = try manager.validate(profile: profile)
@@ -150,6 +150,7 @@ private final class HelperServer {
         selectedNode: current.selectedNode,
         activeProfileID: current.activeProfileID,
         nodes: current.nodes,
+        runtimeOutcome: current.runtimeOutcome,
         message: error.localizedDescription
       )
     }

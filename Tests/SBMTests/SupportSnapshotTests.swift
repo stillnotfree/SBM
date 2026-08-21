@@ -18,7 +18,7 @@ import Testing
     helperVersion: "1.2.3",
     helperRevision: 40,
     helperState: .reachable,
-    coreRunning: true,
+    coreState: .running,
     coreVersion: "1.13.16",
     routingMode: .rule,
     profileKind: .nativeJSON,
@@ -76,7 +76,7 @@ import Testing
     helperVersion: nil,
     helperRevision: nil,
     helperState: .notEnabled,
-    coreRunning: false,
+    coreState: .stopped,
     coreVersion: nil,
     routingMode: .direct,
     profileKind: .compatibilitySubscription,
@@ -114,4 +114,60 @@ import Testing
   let source = try String(
     contentsOf: packageRoot.appending(path: "Sources/SBM/SBMApp.swift"), encoding: .utf8)
   #expect(!source.contains("model.testLatency()"))
+}
+
+@Test func maximumRecentErrorsKeepUsefulBoundedStatusAndValidJSON() throws {
+  let errors = (0..<50).map { index in
+    "Failure \(index): " + String(repeating: Character(UnicodeScalar(97 + index % 26)!), count: 500)
+  }
+  let snapshot = SupportSnapshot(
+    capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+    appVersion: "1.2.3",
+    appBuild: "123",
+    macOSVersion: "macOS test",
+    helperReachable: false,
+    helperVersion: "1.1.3",
+    helperRevision: 43,
+    helperState: .unreachable,
+    coreState: .unknown,
+    coreVersion: "1.13.18",
+    routingMode: .rule,
+    profileKind: .compatibilitySubscription,
+    profileUpdatedAt: nil,
+    profileLibraryAvailable: true,
+    sourceCount: 2,
+    localSOCKSEnabled: false,
+    localSOCKSPort: 1082,
+    selectedProtocolKind: .shadowsocks,
+    nodes: [],
+    lastError: "Current useful failure",
+    recentErrors: errors,
+    redactionSecrets: []
+  )
+
+  #expect(snapshot.statusText.contains("Core: unknown"))
+  #expect(snapshot.text.contains("Current useful failure"))
+  #expect(snapshot.text.contains("truncated"))
+  #expect(snapshot.text.utf8.count <= SupportSnapshot.maximumTextBytes)
+  #expect(snapshot.recentErrorsTruncated)
+  let json = snapshot.jsonText()
+  #expect(json.utf8.count <= SupportSnapshot.maximumSerializedBytes)
+  let decoded = try JSONDecoder().decode(
+    SupportSnapshot.self,
+    from: try #require(json.data(using: .utf8))
+  )
+  #expect(decoded.core.state == .unknown)
+  #expect(decoded.recentErrorsTruncated)
+  #expect(decoded.lastError == "Current useful failure")
+}
+
+@Test func diagnosticsCurrentStatusDoesNotRenderRecentErrorsTwice() throws {
+  let root = URL(filePath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+  let source = try String(
+    contentsOf: root.appending(path: "Sources/SBM/SBMApp.swift"), encoding: .utf8)
+  #expect(source.contains("Text(snapshot.statusText)"))
+  #expect(!source.contains("Text(snapshot.text)"))
 }

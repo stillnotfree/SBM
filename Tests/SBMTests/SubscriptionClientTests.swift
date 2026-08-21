@@ -5,6 +5,32 @@ import Testing
 @testable import SBM
 @testable import SBMHelper
 
+@Test func strictHysteria2QueryRejectsDuplicatesCaseVariantsAndUnknownParameters() throws {
+  let invalid = [
+    "hysteria2://password@vpn.example.com:443/?sni=a.example&sni=b.example#HY2",
+    "hysteria2://password@vpn.example.com:443/?sni=a.example&SNI=b.example#HY2",
+    "hysteria2://password@vpn.example.com:443/?sni=a.example&unknown=x#HY2",
+    "hysteria2://password@vpn.example.com:443/?sni=a.example&obfs=salamander&obfs=salamander&obfs-password=secret#HY2",
+    "hysteria2://password@vpn.example.com:443/?sni=a.example&obfs=salamander&obfs-password=one&obfs-password=two#HY2",
+  ]
+  for link in invalid {
+    #expect(throws: SubscriptionFailure.self) {
+      _ = try SubscriptionClient.parsePayload(link)
+    }
+  }
+
+  for scheme in ["hysteria2", "hy2"] {
+    let parsed = try SubscriptionClient.parsePayload(
+      "\(scheme)://password@vpn.example.com:443/?sni=vpn.example.com&obfs=salamander&obfs-password=secret#HY2"
+    )
+    guard case .compatibility(let profile) = parsed else {
+      Issue.record("Expected a compatibility profile")
+      return
+    }
+    #expect(profile.hysteria2.count == 1)
+  }
+}
+
 @Test func serverSubscriptionParsesBothSupportedProtocols() throws {
   let links = """
     vless://5efab93b-90d0-4904-93d6-44b4f0b00000@203.0.113.10:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=chrome&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b&type=tcp#%F0%9F%87%A9%F0%9F%87%AA%20Reality
@@ -18,7 +44,7 @@ import Testing
   }
   #expect(compatibility.vless.first?.server == "203.0.113.10")
   #expect(compatibility.vless.first?.serverName == "www.debian.org")
-  #expect(compatibility.vless.first?.displayName == "🇩🇪 Reality")
+  #expect(compatibility.connections.first?.displayName == "🇩🇪 Reality")
   #expect(compatibility.hysteria2.first?.server == "vpn.example.com")
   #expect(compatibility.hysteria2.first?.password == "test-password")
   #expect(compatibility.hysteria2.first?.obfsPassword == "test-obfs")
@@ -409,8 +435,10 @@ import Testing
     Issue.record("Expected a compatibility subscription")
     return
   }
-  #expect(compatibility.vless.map(\.displayName) == ["Reality 1", "Reality 2"])
-  #expect(compatibility.hysteria2.map(\.displayName) == ["Hysteria2 1", "Hysteria2 2"])
+  #expect(
+    compatibility.connections.map(\.displayName)
+      == ["Reality 1", "Reality 2", "Hysteria2 1", "Hysteria2 2"]
+  )
 }
 
 @Test func mixedSubscriptionSkipsUnsupportedXHTTPConnections() throws {
@@ -431,6 +459,51 @@ import Testing
   #expect(result.skippedTransports == ["xhttp": 1])
   #expect(result.warningDescription?.contains("2 connections imported") == true)
   #expect(result.warningDescription?.contains("1 XHTTP connection skipped") == true)
+}
+
+@Test func mixedSubscriptionSkipsInvalidRecognizedLinksWithoutLeakingSecrets() throws {
+  let validVLESS =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b&type=tcp#Reality"
+  let invalidVLESS =
+    "vless://11111111-2222-3333-4444-555555555555@198.51.100.10:443?flow=xtls-rprx-vision&security=reality&sni=secret-vless.example&fp=firefox&pbk=bad&type=tcp#Invalid"
+  let invalidHysteria =
+    "hysteria2://super-secret-password@secret-hy.example:443/?sni=secret-hy.example&obfs=unsupported#Invalid"
+  let invalidShadowsocks =
+    "ss://rc4-md5:another-secret@secret-ss.example:443/#Invalid"
+
+  let result = try SubscriptionClient.parsePayloadResult(
+    [validVLESS, invalidVLESS, invalidHysteria, invalidShadowsocks].joined(separator: "\n")
+  )
+  guard case .compatibility(let profile) = result.profile else {
+    Issue.record("Expected a compatibility subscription")
+    return
+  }
+
+  #expect(profile.connections.count == 1)
+  #expect(result.skippedInvalidConnections[.vless] == 1)
+  #expect(result.skippedInvalidConnections[.hysteria2] == 1)
+  #expect(result.skippedInvalidConnections[.shadowsocks] == 1)
+  let warning = try #require(result.warningDescription)
+  #expect(warning.contains("1 connection imported"))
+  #expect(warning.contains("1 VLESS connection skipped"))
+  #expect(warning.contains("1 Hysteria2 connection skipped"))
+  #expect(warning.contains("1 Shadowsocks connection skipped"))
+  for secret in [
+    "11111111-2222-3333-4444-555555555555", "secret-vless.example",
+    "super-secret-password", "secret-hy.example", "another-secret", "secret-ss.example",
+  ] {
+    #expect(!warning.contains(secret))
+  }
+}
+
+@Test func allInvalidRecognizedLinksStillFailClosed() {
+  let first =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=bad&type=tcp#Invalid"
+  let second = "hysteria2://password@vpn.example.com:443/?sni=vpn.example.com&obfs=unsupported"
+
+  #expect(throws: SubscriptionFailure.invalidVLESS) {
+    try SubscriptionClient.parsePayload(first + "\n" + second)
+  }
 }
 
 @Test func realityShortIDMayBeEmpty() throws {
@@ -632,7 +705,7 @@ private actor SubscriptionFetchCounter {
     Issue.record("Expected a compatibility profile")
     return
   }
-  #expect(compatibility.vless.map(\.displayName) == ["Netherlands"])
+  #expect(compatibility.connections.map(\.displayName) == ["Netherlands"])
   #expect(compatibility.hysteria2.isEmpty)
   #expect(compatibility.nodeGroups?.first?.nodes == [compatibility.connections[0].id])
 }
@@ -643,7 +716,7 @@ private actor SubscriptionFetchCounter {
   }
 }
 
-@Test func proxyNodeSectionsPreserveSourcesAndSortMeasuredNodesByLatency() {
+@Test func proxyNodeSectionsPreserveSubscriptionOrderRegardlessOfLatency() {
   let nodes = [
     ProxyNode(
       id: .auto,
@@ -699,8 +772,8 @@ private actor SubscriptionFetchCounter {
 
   let sections = ProxyNodeSectionBuilder.make(from: nodes)
   #expect(sections.map(\.name) == ["My VPS", "AID"])
-  #expect(sections[0].nodes.map(\.name) == ["Hysteria2", "Reality"])
-  #expect(sections[1].nodes.map(\.name) == ["Sweden", "Netherlands"])
+  #expect(sections[0].nodes.map(\.name) == ["Reality", "Hysteria2"])
+  #expect(sections[1].nodes.map(\.name) == ["Netherlands", "Sweden"])
 }
 
 @Test func profileAggregatorRejectsNativeJSONSource() throws {

@@ -1,5 +1,5 @@
 public enum CoreBuildInfo {
-  public static let version = "1.13.18"
+  public static let version = "1.13.19"
   public static let signedSHA256 =
-    "0c93ecb8f627955c221eef8b2acb93abf53a7eab56ab9592ac3d5796335f3611"
+    "b57bc9ac266dd1169f7c429765cf918264d46652a6ca04d6f9ce548ddfb368ce"
 }

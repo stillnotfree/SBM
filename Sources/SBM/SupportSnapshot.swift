@@ -5,11 +5,12 @@ import SBMShared
 /// It deliberately does not perform health checks, export configuration, or
 /// retain user-visible profile and node identifiers.
 struct SupportSnapshot: Codable, Sendable, Equatable {
-  static let schemaVersion = 1
+  static let schemaVersion = 3
   static let maximumSerializedBytes = 16 * 1024
   static let maximumTextBytes = 8 * 1024
   static let maximumNodes = 128
   static let maximumSources = 128
+  static let maximumRecentErrorBytes = 4 * 1024
 
   struct App: Codable, Sendable, Equatable {
     let version: String
@@ -37,7 +38,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
   }
 
   struct Core: Codable, Sendable, Equatable {
-    let running: Bool
+    let state: ObservedCoreState
     let version: String?
   }
 
@@ -114,6 +115,9 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
   let protocolSummaries: [ProtocolSummary]
   let nodeObservationsCapped: Bool
   let lastError: String?
+  let recentErrors: [String]
+  let recentErrorCount: Int
+  let recentErrorsTruncated: Bool
 
   private enum CodingKeys: String, CodingKey {
     case schemaVersion = "schema_version"
@@ -127,6 +131,9 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
     case protocolSummaries = "protocol_summaries"
     case nodeObservationsCapped = "node_observations_capped"
     case lastError = "last_error"
+    case recentErrors = "recent_errors"
+    case recentErrorCount = "recent_error_count"
+    case recentErrorsTruncated = "recent_errors_truncated"
   }
 
   init(
@@ -138,7 +145,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
     helperVersion: String?,
     helperRevision: Int?,
     helperState: HelperState,
-    coreRunning: Bool,
+    coreState: ObservedCoreState,
     coreVersion: String?,
     routingMode: RoutingMode,
     profileKind: ProfileKind,
@@ -150,6 +157,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
     selectedProtocolKind: ProxyNodeKind?,
     nodes: [NodeObservation],
     lastError: String?,
+    recentErrors: [String] = [],
     redactionSecrets: [String]
   ) {
     schemaVersion = Self.schemaVersion
@@ -167,7 +175,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
       state: helperState
     )
     core = Core(
-      running: coreRunning,
+      state: coreState,
       version: Self.cleanOptional(coreVersion, limit: 128, secrets: redactionSecrets)
     )
     self.routingMode = routingMode
@@ -185,9 +193,23 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
     nodeObservationsCapped = nodes.count > Self.maximumNodes
     protocolSummaries = Self.makeProtocolSummaries(from: boundedNodes)
     self.lastError = Self.cleanError(lastError, secrets: redactionSecrets)
+    let cleanedRecentErrors = recentErrors.prefix(50).compactMap {
+      Self.cleanError($0, secrets: redactionSecrets)
+    }
+    recentErrorCount = cleanedRecentErrors.count
+    var retainedNewestFirst: [String] = []
+    var retainedBytes = 0
+    for error in cleanedRecentErrors.reversed() {
+      let cost = error.utf8.count + 4
+      guard retainedBytes + cost <= Self.maximumRecentErrorBytes else { break }
+      retainedNewestFirst.append(error)
+      retainedBytes += cost
+    }
+    self.recentErrors = retainedNewestFirst.reversed()
+    recentErrorsTruncated = self.recentErrors.count < recentErrorCount
   }
 
-  var text: String {
+  var statusText: String {
     var lines = [
       "SBM support snapshot (observations only)",
       "Schema: \(schemaVersion)",
@@ -197,7 +219,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
       "macOS: \(app.macOS)",
       "Helper: \(helper.state.rawValue)",
       "Helper version: \(helper.version ?? "unknown"), revision: \(helper.revision.map(String.init) ?? "unknown")",
-      "Core: \(core.running ? "running" : "not running"), \(core.version ?? "unknown")",
+      "Core: \(core.state.rawValue), \(core.version ?? "unknown")",
       "Routing mode: \(routingMode.rawValue)",
       "Profile: \(profile.kind.rawValue), updated \(profile.updatedAt ?? "never")",
       "Profile library: \(profile.libraryAvailable ? "available" : "unavailable"), sources: \(profile.sourceCount)\(profile.sourceCountCapped ? "+" : "")",
@@ -227,6 +249,20 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
     return output
   }
 
+  var text: String {
+    var lines = [statusText]
+    let suffix =
+      recentErrorsTruncated
+      ? " (\(recentErrors.count) of \(recentErrorCount) exported; truncated)" : ""
+    lines.append("Recent errors: \(recentErrorCount)\(suffix)")
+    lines.append(contentsOf: recentErrors.map { "- \($0)" })
+    let output = lines.joined(separator: "\n")
+    guard output.utf8.count <= Self.maximumTextBytes else {
+      return statusText + "\nRecent errors: truncated to preserve the current status"
+    }
+    return output
+  }
+
   func jsonText() -> String {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -235,7 +271,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
       let text = String(data: data, encoding: .utf8)
     else {
       return
-        #"{"active_probes_run":false,"error":"snapshot omitted: too large","schema_version":1}"#
+        #"{"active_probes_run":false,"error":"snapshot omitted: too large","schema_version":3}"#
     }
     return text
   }
@@ -266,15 +302,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
 
   private static func cleanError(_ value: String?, secrets: [String]) -> String? {
     guard let value, !value.isEmpty else { return nil }
-    // Validation failures can contain a whole native configuration. Do not try
-    // to selectively preserve it: diagnostics need the error category, not
-    // profile JSON that may contain unrecognised sensitive fields.
-    guard
-      !value.contains("{") && !value.contains("}") && !value.contains("[") && !value.contains("]")
-    else {
-      return "Error details redacted."
-    }
-    return clean(value, limit: 512, secrets: secrets)
+    return SafeDiagnosticError.sanitize(value, secrets: secrets)
   }
 
   private static func clean(_ value: String, limit: Int, secrets: [String]) -> String {

@@ -121,3 +121,13 @@ network throughput, latency quality, TUN packet cost, or system-wide power.
 
 A local snapshot is evidence only for the stated machine, build, profile,
 network, and procedure. It is not a universal SBM performance claim.
+
+## Responsiveness invariants
+
+Latency work is issued as bounded, cancellation-aware per-node control requests,
+and explicit Disconnect cancels the sweep before submitting the next runtime
+mutation. Manual subscription Refresh is one coalesced bounded sweep and does
+not disable Disconnect. These changes are **MECHANICALLY REQUIRED FOR
+RESPONSIVENESS**; they do not by themselves establish a CPU, memory, battery,
+network-latency, or throughput improvement. Any such claim still requires the
+measurement protocol above.

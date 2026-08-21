@@ -4,7 +4,16 @@ enum RuntimeApplyStatus: Equatable, Sendable {
   case saved
   case applying
   case active
+  case reconnectRequired
   case failed
+}
+
+enum RuntimeApplyCoordinatorFailure: LocalizedError, Sendable {
+  case superseded
+
+  var errorDescription: String? {
+    "The runtime change was superseded by a newer request."
+  }
 }
 
 @MainActor
@@ -47,6 +56,15 @@ final class RuntimeApplyCoordinator<Request: Sendable, Response: Sendable> {
   func submit(_ request: Request, completion: @escaping Completion) -> UInt64 {
     desiredGeneration &+= 1
     let generation = desiredGeneration
+    if let superseded = pending {
+      superseded.completion(
+        Outcome(
+          generation: superseded.generation,
+          isCurrent: false,
+          result: .failure(RuntimeApplyCoordinatorFailure.superseded)
+        )
+      )
+    }
     pending = Pending(generation: generation, request: request, completion: completion)
     status = .applying
     startWorkerIfNeeded()

@@ -6,6 +6,98 @@ import Testing
 @testable import SBM
 @testable import SBMHelper
 
+private struct ReleasedV9RequestShape: Decodable {
+  let protocolVersion: Int
+  let profile: ReleasedV9CoreProfile?
+}
+
+private struct ReleasedV9CoreProfile: Decodable {
+  let compatibility: ReleasedV9ProfileWrapper
+}
+
+private struct ReleasedV9ProfileWrapper: Decodable {
+  let value: ReleasedV9Profile
+
+  private enum CodingKeys: String, CodingKey {
+    case value = "_0"
+  }
+}
+
+private struct ReleasedV9Profile: Decodable {
+  let connections: [ReleasedV9Connection]
+}
+
+private struct ReleasedV9Connection: Decodable {
+  let outbound: ReleasedV9Outbound
+}
+
+private enum ReleasedV9Outbound: Decodable {
+  private enum CodingKeys: String, CodingKey {
+    case kind, vless
+  }
+
+  private enum Kind: String, Decodable {
+    case vless
+  }
+
+  case vless(ReleasedV9VLESS)
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    switch try container.decode(Kind.self, forKey: .kind) {
+    case .vless:
+      self = .vless(try container.decode(ReleasedV9VLESS.self, forKey: .vless))
+    }
+  }
+}
+
+private struct ReleasedV9VLESS: Decodable {
+  let displayName: String
+}
+
+@Test func currentIPCShapeRequiresTheNewProtocolBoundary() throws {
+  #expect(HelperConstants.protocolVersion == 10)
+  #expect(HelperConstants.helperRevision == 48)
+
+  let profile = CoreProfile.compatibility(
+    VPNProfile(
+      connections: [
+        ManagedConnection(
+          displayName: "Current authoritative name",
+          outbound: .vless(
+            VLESSProfile(
+              server: "203.0.113.10",
+              port: 443,
+              uuid: "5efab93b-90d0-4904-93d6-44b4f0b00000",
+              serverName: "example.test",
+              fingerprint: "chrome",
+              publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+              shortID: ""
+            )
+          )
+        )
+      ]
+    )
+  )
+  let request = HelperRequest(action: .start, profile: profile)
+  let encoded = try JSONEncoder().encode(request)
+  let object = try #require(
+    JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+  )
+  let profileObject = try #require(object["profile"] as? [String: Any])
+  let compatibility = try #require(profileObject["compatibility"] as? [String: Any])
+  let profilePayload = try #require(compatibility["_0"] as? [String: Any])
+  let connections = try #require(profilePayload["connections"] as? [[String: Any]])
+  let connection = try #require(connections.first)
+  let outbound = try #require(connection["outbound"] as? [String: Any])
+  let vless = try #require(outbound["vless"] as? [String: Any])
+  #expect(vless["displayName"] == nil)
+
+  #expect(throws: DecodingError.self) {
+    _ = try JSONDecoder().decode(ReleasedV9RequestShape.self, from: encoded)
+  }
+}
+
 @Test func profileLibraryDefaultsLatencyIntervalForOlderStores() throws {
   let data = Data(
     """
@@ -21,7 +113,55 @@ import Testing
   #expect(decoded.latencyIntervalMinutes == 10)
 }
 
-@Test func persistentHelperStateDefaultsRecoveryMarkerForOlderStores() throws {
+@Test func immediatelyPreviousLibrarySchemaMigratesCurrentConnectionModel() throws {
+  let library = ProfileLibrary(
+    profiles: [
+      ManagedProfile(
+        name: "Schema Four",
+        payload: .compatibility(
+          VPNProfile(
+            connections: [
+              ManagedConnection(
+                id: ProxyNodeID(rawValue: "node-schema-four"),
+                displayName: "Schema Four Node",
+                outbound: .shadowsocks(
+                  ShadowsocksProfile(
+                    server: "203.0.113.44",
+                    port: 443,
+                    method: "aes-256-gcm",
+                    password: "schema-four-password"
+                  ))
+              )
+            ]
+          )
+        )
+      )
+    ],
+    selectedProfileID: nil
+  )
+  var root = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(library)) as? [String: Any])
+  root["schemaVersion"] = 4
+  let decoded = try JSONDecoder().decode(
+    ProfileLibrary.self,
+    from: JSONSerialization.data(withJSONObject: root)
+  )
+  #expect(decoded.requiresMigration)
+
+  let rewritten = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
+  #expect(rewritten["schemaVersion"] as? Int == ProfileLibrary.currentSchemaVersion)
+  let profiles = try #require(rewritten["profiles"] as? [[String: Any]])
+  let payload = try #require(profiles[0]["payload"] as? [String: Any])
+  let compatibility = try #require(payload["compatibility"] as? [String: Any])
+  let current = try #require(compatibility["_0"] as? [String: Any])
+  #expect(current["connections"] != nil)
+  #expect(current["vless"] == nil)
+  #expect(current["hysteria2"] == nil)
+  #expect(current["shadowsocks"] == nil)
+}
+
+@Test func persistentHelperStateDefaultsRecoveryAndDeferredMarkersForOlderStores() throws {
   let data = Data(
     """
     {
@@ -39,6 +179,7 @@ import Testing
   let state = try JSONDecoder().decode(PersistentState.self, from: data)
   #expect(state.desiredRunning)
   #expect(!state.automaticRecoveryAttempted)
+  #expect(!state.deferredRuntimeApplyPending)
 }
 
 @Test func legacyManagedLibraryMigratesExactAggregateIDsAndAtomicallyRewrites() throws {
@@ -61,11 +202,32 @@ import Testing
     server: "hy.example.com", port: 443, password: "hy-password",
     serverName: "hy.example.com", displayName: "Hysteria A"
   )
-  let sourceA = CoreProfile.compatibility(VPNProfile(vless: [realityA], hysteria2: [hysteria]))
-  let sourceB = CoreProfile.compatibility(VPNProfile(vless: [realityA, realityB]))
+  let sourceAConnections = [
+    ManagedConnection(
+      id: ProxyNodeID(rawValue: "vless-1"), displayName: "Reality A", outbound: .vless(realityA)
+    ),
+    ManagedConnection(
+      id: ProxyNodeID(rawValue: "hysteria2-1"),
+      displayName: "Hysteria A",
+      outbound: .hysteria2(hysteria)
+    ),
+  ]
+  let sourceA = CoreProfile.compatibility(
+    VPNProfile(connections: sourceAConnections)
+  )
+  let sourceB = CoreProfile.compatibility(
+    VPNProfile(connections: [
+      ManagedConnection(
+        id: ProxyNodeID(rawValue: "vless-1"), displayName: "Reality A", outbound: .vless(realityA)
+      ),
+      ManagedConnection(
+        id: ProxyNodeID(rawValue: "vless-2"), displayName: "Reality B", outbound: .vless(realityB)
+      ),
+    ])
+  )
   let aggregate = CoreProfile.compatibility(
     VPNProfile(
-      vless: [realityA], hysteria2: [hysteria],
+      connections: sourceAConnections,
       nodeGroups: [
         ProxyNodeGroup(
           id: sourceAID.uuidString, name: "First",
@@ -247,7 +409,7 @@ import Testing
 @Test func profileLibraryRejectsUnknownOrSchemaMismatchedManagedConnectionEncoding() throws {
   let future = Data(
     """
-    {"schemaVersion":4,"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
+    {"schemaVersion":6,"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
     """.utf8)
   #expect(throws: DecodingError.self) {
     try JSONDecoder().decode(ProfileLibrary.self, from: future)
@@ -273,16 +435,38 @@ import Testing
 }
 
 private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [String: Any] {
-  guard case .compatibility(let compatibilityProfile) = profile else { fatalError() }
+  guard case .compatibility = profile else { fatalError() }
   var root = try #require(
     JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)) as? [String: Any])
   var wrapper = try #require(root["compatibility"] as? [String: Any])
   var value = try #require(wrapper["_0"] as? [String: Any])
+  let connections = try #require(value["connections"] as? [[String: Any]])
+  var vless: [[String: Any]] = []
+  var hysteria2: [[String: Any]] = []
+  var shadowsocks: [[String: Any]] = []
+  for connection in connections {
+    let displayName = try #require(connection["displayName"] as? String)
+    let outbound = try #require(connection["outbound"] as? [String: Any])
+    let kind = try #require(outbound["kind"] as? String)
+    var payload: [String: Any]
+    switch kind {
+    case "vless": payload = try #require(outbound["vless"] as? [String: Any])
+    case "hysteria2": payload = try #require(outbound["hysteria2"] as? [String: Any])
+    case "shadowsocks": payload = try #require(outbound["shadowsocks"] as? [String: Any])
+    default: continue
+    }
+    payload["displayName"] = displayName
+    switch kind {
+    case "vless": vless.append(payload)
+    case "hysteria2": hysteria2.append(payload)
+    case "shadowsocks": shadowsocks.append(payload)
+    default: break
+    }
+  }
   value.removeValue(forKey: "connections")
-  value["vless"] = try JSONSerialization.jsonObject(
-    with: JSONEncoder().encode(compatibilityProfile.vless))
-  value["hysteria2"] = try JSONSerialization.jsonObject(
-    with: JSONEncoder().encode(compatibilityProfile.hysteria2))
+  value["vless"] = vless
+  value["hysteria2"] = hysteria2
+  value["shadowsocks"] = shadowsocks
   wrapper["_0"] = value
   root["compatibility"] = wrapper
   return root
@@ -375,6 +559,24 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
 
   let decoded = try JSONDecoder().decode(HelperResponse.self, from: legacy)
   #expect(!decoded.automaticRecoveryExhausted)
+  #expect(decoded.runtimeOutcome == .applied)
+}
+
+@Test func helperResponseRoundTripsReconnectRequiredOutcome() throws {
+  let response = HelperResponse(
+    success: true,
+    coreRunning: true,
+    activeProfileID: UUID(uuidString: "00000000-0000-0000-0000-000000000044"),
+    runtimeOutcome: .reconnectRequired,
+    message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+  )
+
+  let decoded = try JSONDecoder().decode(
+    HelperResponse.self,
+    from: JSONEncoder().encode(response)
+  )
+  #expect(decoded.runtimeOutcome == .reconnectRequired)
+  #expect(decoded.message == "Changes ready to apply")
 }
 
 @Test func restoredCoreMetadataUsesPostRenameFileIdentity() throws {
@@ -417,6 +619,13 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   #expect(library.latencyIntervalMinutes == 100_000)
 }
 
+@Test func generatedSubscriptionHWIDUsesCanonicalUUIDFormat() {
+  let hardwareID = SubscriptionHeaders.makeHardwareID()
+  #expect(UUID(uuidString: hardwareID) != nil)
+  #expect(hardwareID.count == 36)
+  #expect(hardwareID == hardwareID.uppercased())
+}
+
 @Test func resettingRequestPresetPreservesHWID() {
   let original = SubscriptionHeaders(
     userAgent: "Custom/1.0",
@@ -438,11 +647,9 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   #expect(fresh.headers.userAgent == "Happ/5.4.0/ios/2607311456556")
   #expect(fresh.headers.appVersion == "5.4.0")
   #expect(fresh.headers.deviceOS == "iOS")
-  #expect(fresh.headers.hardwareID.count == 16)
-  #expect(
-    fresh.headers.hardwareID.allSatisfy {
-      $0.isLowercase || $0.isNumber
-    })
+  #expect(UUID(uuidString: fresh.headers.hardwareID) != nil)
+  #expect(fresh.headers.hardwareID.count == 36)
+  #expect(fresh.headers.hardwareID == fresh.headers.hardwareID.uppercased())
 
   let stored = ManagedSource(
     name: "Existing",

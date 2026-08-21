@@ -158,9 +158,14 @@ struct NativeConfigurationComposer {
             && !["direct", "block", "dns", "selector", "urltest"].contains(typesByTag[tag])
         })
     )
+    let websiteRules = try ProfileValidator.websiteRouteRules(
+      profile.websiteRoutingRules,
+      directOutbound: directTag,
+      proxyOutbound: selectorTag
+    )
     rules.insert(
       contentsOf: managedRouteRules(selectorTag: selectorTag, directTag: directTag)
-        + applicationRules,
+        + websiteRules + applicationRules,
       at: 0
     )
     route["rules"] = rules
@@ -172,7 +177,8 @@ struct NativeConfigurationComposer {
 
     let dns = try composeDNS(
       imported: source["dns"] as? [String: Any],
-      selectorTag: selectorTag
+      selectorTag: selectorTag,
+      websiteRules: profile.websiteRoutingRules
     )
     if source["dns"] == nil, route["default_domain_resolver"] == nil {
       route["default_domain_resolver"] = "sbm-dns-local"
@@ -660,7 +666,10 @@ struct NativeConfigurationComposer {
     ]
   }
 
-  private func managedDNS(selectorTag: String) -> [String: Any] {
+  private func managedDNS(
+    selectorTag: String,
+    websiteRules: [WebsiteRoutingRule]
+  ) -> [String: Any] {
     [
       "servers": [
         ["type": "local", "tag": "sbm-dns-local"],
@@ -680,9 +689,12 @@ struct NativeConfigurationComposer {
           "clash_mode": RoutingMode.direct.rawValue,
           "action": "route",
           "server": "sbm-dns-local",
-        ],
-        ["action": "route", "server": "sbm-dns-remote"],
-      ],
+        ]
+      ]
+        + ProfileValidator.websiteDirectDNSRules(
+          websiteRules,
+          server: "sbm-dns-local"
+        ) + [["action": "route", "server": "sbm-dns-remote"]],
       "final": "sbm-dns-remote",
       "strategy": "ipv4_only",
       "cache_capacity": 4096,
@@ -691,9 +703,12 @@ struct NativeConfigurationComposer {
 
   private func composeDNS(
     imported: [String: Any]?,
-    selectorTag: String
+    selectorTag: String,
+    websiteRules: [WebsiteRoutingRule]
   ) throws -> [String: Any] {
-    guard var dns = imported else { return managedDNS(selectorTag: selectorTag) }
+    guard var dns = imported else {
+      return managedDNS(selectorTag: selectorTag, websiteRules: websiteRules)
+    }
     dns["strategy"] = "ipv4_only"
     guard var servers = dns["servers"] as? [[String: Any]], !servers.isEmpty else {
       throw CoreFailure.invalidProfile("The imported DNS configuration has no servers.")
@@ -731,7 +746,11 @@ struct NativeConfigurationComposer {
           "action": "route",
           "server": "sbm-dns-remote",
         ],
-      ],
+      ]
+        + ProfileValidator.websiteDirectDNSRules(
+          websiteRules,
+          server: "sbm-dns-local"
+        ),
       at: 0
     )
     dns["servers"] = servers

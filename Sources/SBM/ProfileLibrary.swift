@@ -38,8 +38,7 @@ struct SubscriptionHeaders: Codable, Equatable, Sendable {
   }
 
   static func makeHardwareID() -> String {
-    let alphabet = Array("abcdefghijklmnopqrstuvwxyz0123456789")
-    return String((0..<16).map { _ in alphabet.randomElement()! })
+    UUID().uuidString.uppercased()
   }
 
   func resettingRequestPreset() -> SubscriptionHeaders {
@@ -135,11 +134,92 @@ struct ManagedProfile: Codable, Equatable, Identifiable, Sendable {
   }
 }
 
+private struct LegacyManagedSourceDTO: Decodable {
+  let id: UUID
+  let name: String
+  let value: String
+  let headers: SubscriptionHeaders
+  let excludeRegex: String?
+  let payload: LegacyCoreProfileDTO?
+  let updatedAt: Date?
+
+  func currentSource() -> ManagedSource {
+    ManagedSource(
+      id: id,
+      name: name,
+      value: value,
+      headers: headers,
+      excludeRegex: excludeRegex,
+      payload: payload?.currentProfile(),
+      updatedAt: updatedAt
+    )
+  }
+}
+
+private struct LegacyManagedProfileDTO: Decodable {
+  let id: UUID
+  let name: String
+  let sources: [LegacyManagedSourceDTO]
+  let payload: LegacyCoreProfileDTO?
+  let updatedAt: Date?
+
+  func currentProfile() -> ManagedProfile {
+    ManagedProfile(
+      id: id,
+      name: name,
+      sources: sources.map { $0.currentSource() },
+      payload: payload?.currentProfile(),
+      updatedAt: updatedAt
+    )
+  }
+}
+
+private struct LegacyProfileLibraryDTO: Decodable {
+  let profiles: [LegacyManagedProfileDTO]
+  let selectedProfileID: UUID?
+  let localSOCKSEnabled: Bool
+  let localSOCKSPort: UInt16
+  let latencyIntervalMinutes: Int
+  let latencyTestURL: String
+
+  private enum CodingKeys: String, CodingKey {
+    case profiles, selectedProfileID, localSOCKSEnabled, localSOCKSPort, latencyIntervalMinutes,
+      latencyTestURL
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    profiles = try container.decode([LegacyManagedProfileDTO].self, forKey: .profiles)
+    selectedProfileID = try container.decodeIfPresent(UUID.self, forKey: .selectedProfileID)
+    localSOCKSEnabled =
+      try container.decodeIfPresent(Bool.self, forKey: .localSOCKSEnabled) ?? false
+    localSOCKSPort = try container.decodeIfPresent(UInt16.self, forKey: .localSOCKSPort) ?? 1082
+    latencyIntervalMinutes =
+      max(try container.decodeIfPresent(Int.self, forKey: .latencyIntervalMinutes) ?? 10, 1)
+    latencyTestURL = try LatencyTargetPolicy.normalized(
+      try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
+        ?? LatencyTargetPolicy.defaultURL
+    )
+  }
+
+  func currentLibrary() -> ProfileLibrary {
+    ProfileLibrary(
+      profiles: profiles.map { $0.currentProfile() },
+      selectedProfileID: selectedProfileID,
+      localSOCKSEnabled: localSOCKSEnabled,
+      localSOCKSPort: localSOCKSPort,
+      latencyIntervalMinutes: latencyIntervalMinutes,
+      latencyTestURL: latencyTestURL
+    )
+  }
+}
+
 enum ProfileAggregator {
   static func merge(
     sources: [ManagedSource],
     routingPolicy: RoutingPolicy?,
-    applicationRoutingRules: [ApplicationRoutingRule] = []
+    applicationRoutingRules: [ApplicationRoutingRule] = [],
+    websiteRoutingRules: [WebsiteRoutingRule] = []
   ) throws -> CoreProfile {
     var connections: [ManagedConnection] = []
     var groups: [ProxyNodeGroup] = []
@@ -181,7 +261,8 @@ enum ProfileAggregator {
         connections: connections,
         routingPolicy: routingPolicy,
         nodeGroups: groups,
-        applicationRoutingRules: applicationRoutingRules
+        applicationRoutingRules: applicationRoutingRules,
+        websiteRoutingRules: websiteRoutingRules
       )
     )
   }
@@ -197,7 +278,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
   /// Not encoded. ProfileStore writes the upgraded schema before it is used.
   var requiresMigration = false
 
-  static let currentSchemaVersion = 3
+  static let currentSchemaVersion = 5
 
   private enum CodingKeys: String, CodingKey {
     case profiles
@@ -227,6 +308,25 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
+    let version = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+    guard (1...Self.currentSchemaVersion).contains(version) else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .schemaVersion,
+        in: container,
+        debugDescription: "Unsupported profile-library schema version."
+      )
+    }
+    if version == 1 {
+      let legacy = try LegacyProfileLibraryDTO(from: decoder).currentLibrary()
+      profiles = ProfileLibraryMigrator.migrateLegacyConnections(in: legacy.profiles)
+      selectedProfileID = legacy.selectedProfileID
+      localSOCKSEnabled = legacy.localSOCKSEnabled
+      localSOCKSPort = legacy.localSOCKSPort
+      latencyIntervalMinutes = legacy.latencyIntervalMinutes
+      latencyTestURL = legacy.latencyTestURL
+      requiresMigration = true
+      return
+    }
     profiles = try container.decode([ManagedProfile].self, forKey: .profiles)
     selectedProfileID = try container.decodeIfPresent(UUID.self, forKey: .selectedProfileID)
     localSOCKSEnabled =
@@ -240,26 +340,6 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
       try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
       ?? LatencyTargetPolicy.defaultURL
     latencyTestURL = try LatencyTargetPolicy.normalized(storedTarget)
-    let version = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
-    guard (1...Self.currentSchemaVersion).contains(version) else {
-      throw DecodingError.dataCorruptedError(
-        forKey: .schemaVersion,
-        in: container,
-        debugDescription: "Unsupported profile-library schema version."
-      )
-    }
-    let containsLegacyConnections = profiles.contains(
-      where: ProfileLibraryMigrator.containsLegacyConnections)
-    if version == Self.currentSchemaVersion, containsLegacyConnections {
-      throw DecodingError.dataCorruptedError(
-        forKey: .profiles,
-        in: container,
-        debugDescription: "Current profile-library schema must use managed connections."
-      )
-    }
-    if version == 1 {
-      profiles = ProfileLibraryMigrator.migrateLegacyConnections(in: profiles)
-    }
     if version < Self.currentSchemaVersion {
       requiresMigration = true
     }
@@ -316,7 +396,8 @@ enum ManagedConnectionReconciler {
         connections: reconciled,
         routingPolicy: incoming.routingPolicy,
         nodeGroups: reconciledGroups,
-        applicationRoutingRules: incoming.applicationRoutingRules
+        applicationRoutingRules: incoming.applicationRoutingRules,
+        websiteRoutingRules: previous.websiteRoutingRules
       )
     )
   }
@@ -326,10 +407,12 @@ enum ManagedConnectionReconciler {
     case (.compatibility(let left)?, .compatibility(let right)?):
       return left.routingPolicy != right.routingPolicy
         || left.applicationRoutingRules != right.applicationRoutingRules
+        || left.websiteRoutingRules != right.websiteRoutingRules
         || activationIdentities(left.connections) != activationIdentities(right.connections)
     case (.native(let left)?, .native(let right)?):
       return left.configuration != right.configuration || left.selectorTag != right.selectorTag
         || left.applicationRoutingRules != right.applicationRoutingRules
+        || left.websiteRoutingRules != right.websiteRoutingRules
     case (nil, nil): return false
     default: return true
     }
@@ -349,18 +432,6 @@ enum ProfileLibraryMigrator {
   /// filtering and exact old-payload de-duplication.
   static func migrateLegacyConnections(in profiles: [ManagedProfile]) -> [ManagedProfile] {
     profiles.map(migrateLegacyConnections(in:))
-  }
-
-  static func containsLegacyConnections(in profile: ManagedProfile) -> Bool {
-    if case .compatibility(let payload) = profile.payload, payload.usesLegacyConnectionEncoding {
-      return true
-    }
-    return profile.sources.contains { source in
-      if case .compatibility(let payload) = source.payload {
-        return payload.usesLegacyConnectionEncoding
-      }
-      return false
-    }
   }
 
   private static func migrateLegacyConnections(in profile: ManagedProfile) -> ManagedProfile {
@@ -423,7 +494,8 @@ enum ProfileLibraryMigrator {
           connections: connections,
           routingPolicy: compatibility.routingPolicy,
           nodeGroups: compatibility.nodeGroups ?? [],
-          applicationRoutingRules: compatibility.applicationRoutingRules
+          applicationRoutingRules: compatibility.applicationRoutingRules,
+          websiteRoutingRules: compatibility.websiteRoutingRules
         ))
     }
 

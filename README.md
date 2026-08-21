@@ -34,12 +34,13 @@ release.
 - Native Swift menu bar app with a TUN-only connection and no Electron runtime.
 - Rule, Global, and Direct modes with automatic or manual server selection.
 - Multiple HTTPS subscriptions and VLESS/Hysteria2/Shadowsocks links in one selectable profile.
-- Source-grouped server menus with per-source latency sorting and exclude regex filters.
+- Source-grouped server menus that preserve subscription order, with latency badges and exclude regex filters.
 - Per-subscription User-Agent, X-App-Version, X-Device-OS, and X-HWID headers.
 - Exact per-application DIRECT, current-proxy, stable-server, or REJECT routing.
+- Per-profile website routing to Proxy, Direct, or Reject without editing JSON.
 - A local, probe-free Routing Inspector for deterministic composed rules.
 - Native sing-box JSON profiles for protocols not represented by compact links.
-- Bounded redacted support snapshots as human-readable text or versioned JSON.
+- Always-available diagnostics with 50 bounded, deduplicated, redacted recent errors.
 - No system-proxy mode, dashboard, traffic statistics, telemetry, or access logging.
 
 ## Install
@@ -49,7 +50,7 @@ release.
 2. Open the DMG and drag **SBM.app** to Applications.
 3. If Gatekeeper blocks it, use **System Settings > Privacy & Security > Open
    Anyway**.
-4. Open **Profiles…** and add a subscription, connection link, or sing-box JSON
+4. Open **Settings…** and add a subscription, connection link, or sing-box JSON
    profile.
 
 SBM launches at login and reconnects the selected cached profile automatically.
@@ -69,25 +70,26 @@ client-identification fields from a user-captured Happ 5.4.0 iOS request. SBM
 does not invent the captured device model, OS version, locale, or transport
 headers, and every field can be replaced before syncing.
 Resetting the request preset preserves the source HWID. Copying or explicitly
-regenerating the HWID is available separately; generated values use the
-observed 16-character lowercase-alphanumeric shape, not a claim of Happ's
-internal generation algorithm. The HWID is never rotated during a refresh or
+regenerating the HWID is available separately; generated values use canonical UUID strings. SBM does not claim to reproduce
+Happ's internal generation algorithm. The HWID is never rotated during a refresh or
 application update.
 Each source also has an optional case-sensitive `Exclude regex`; use inline
 flags such as `(?i)` for case-insensitive matching. Matching connection names
 are removed before the menu, Auto group, and sing-box configuration are built.
-The server menu keeps sources in profile order and sorts measured nodes by
-latency only within their own source.
+The server menu keeps sources and nodes in subscription/profile order; latency is
+displayed as metadata and does not reorder manual-selection entries.
 Sensitive provider headers are removed when a redirect crosses an origin.
 Duplicate connection links are collapsed and a managed profile is limited to
 63 proxy connections.
 
 Managed connections use typed stable IDs. A profile library in the v1.1.11
-layout (schema 1) is migrated automatically; the current schema is 3 and is
+layout (schema 1) is migrated automatically through a one-way DTO boundary;
+the immediately previous schema 4 is also rewritten to current schema 5 and
 saved atomically before use. On a subscription refresh, a node renamed or reordered without a
 change to its connection identity keeps its ID; the active managed profile is
 not reactivated for that change alone. A changed outbound or routing policy is
-still applied normally.
+validated and saved as desired state while a known-good running runtime remains
+active; **Reconnect to Apply** performs the required explicit stop and start.
 
 Shadowsocks compact links are limited to plugin-free, strict SIP002 `ss://`
 URIs. The exact supported methods are `aes-128-gcm`, `aes-256-gcm`,
@@ -108,7 +110,7 @@ sources.
 
 ## Latency target and privacy
 
-In **Profiles…**, set the HTTPS latency-test target and choose **Apply** to
+In **Settings… > Advanced**, set the **Test target** HTTPS URL and choose **Apply** to
 save it. SBM validates an absolute HTTPS URL without credentials or fragments.
 While the VPN is connected, a latency test sends an HTTPS request to that target
 through each tested proxy; choose an endpoint you trust. Its operator can
@@ -118,10 +120,30 @@ from sing-box's URLTest interval used by Auto selection. Manual tests use a
 newly applied target immediately; SBM-created Auto groups receive it on the next
 normal connection. Imported native URLTest outbounds remain unchanged.
 
-The Diagnostics window copies a bounded support snapshot as text or sorted-key
-JSON. It aggregates already observed state and runs no DNS, network, latency, or
-process probe. Profile and node names/IDs, subscription data, headers,
-credentials, raw native JSON, and logs are omitted.
+The always-available Diagnostics window copies a bounded support snapshot as
+text or sorted-key JSON and retains at most 50 sanitized recent failures with
+consecutive deduplication and a Clear History action. It aggregates already
+observed state and runs no DNS, network, latency, or process probe. Profile and
+node names/IDs, subscription data, headers, credentials, raw native JSON, and
+logs are omitted. Errors are sanitized both when retained and when exported;
+large histories are deterministically truncated without discarding current
+status.
+
+The menu **Refresh** action refreshes observed helper status and forces every
+eligible remote subscription source to synchronize once without restarting the
+VPN. Independent source failures do not stop the sweep; duplicate manual sweeps
+are coalesced, and a materially changed active profile is validated and saved
+through the normal runtime coordinator while a known-good running runtime stays
+active. **Reconnect to Apply** explicitly stops and starts the latest deferred
+candidate.
+Local compact links are not fetched. A source deleted or edited before its turn
+is not requested with stale URL or headers. If activation fails, valid refreshed
+data remains saved for retry and newer routing edits are preserved; the UI
+distinguishes that saved state from the previous known-good active runtime. The pinned sing-box
+1.13.19 interface provides scheduled remote
+rule-set updates through `update_interval`, but no supported bounded control
+operation to force-refresh the running rule sets, so **Refresh** does not claim
+to do that.
 
 Managed subscriptions and individual links can optionally be combined with a
 separate user-owned routing JSON. The file may contain only `route.rules` and remote
@@ -130,8 +152,16 @@ can route traffic only to `direct` or to the server currently selected in the
 menu. The app does not download, generate, or modify geopolitical lists on the
 user's behalf.
 
+Website rules are profile-specific, limited to 128 normalized hostnames, match
+both the exact apex and its subdomains, and target Proxy, Direct, or Reject.
+Their precedence is: mandatory SBM safety, Website Routing, Application
+Routing, imported routing, then the final route. A Direct website rule receives
+the matching local-DNS policy; Proxy retains remote/proxied DNS and Reject does
+not create a physical bypass. Website rules work for compatibility and native
+profiles without broadening native import capabilities.
+
 Application rules use the exact main executable from a selected macOS `.app`.
-They run after mandatory SBM safety rules and before imported routing, and can
+They run after website rules and before imported routing, and can
 target DIRECT, the current proxy selector, one stable managed server, or native
 REJECT. A moved or deleted application remains visible but inactive; SBM does not guess by
 name or scan bundles for other executables. Application rules do not create a
@@ -172,10 +202,14 @@ candidate, including its runtime API secret, must pass the bundled `sing-box
 check` before the working core is stopped. A failed runtime activation restores
 the previous working configuration and core.
 
-In Rule mode, imported DNS servers and routing rules remain authoritative. The
+In Rule mode, imported DNS servers and routing rules remain authoritative below
+SBM's mandatory and first-class routing layers. The
 imported `route.final` is replaced by the menu-controlled selector, so unmatched
-traffic follows the server selected in SBM. The TUN interface routes both IPv4
-and IPv6 traffic. The Direct and Global modes temporarily prepend app-owned DNS
+traffic follows the server selected in SBM. The generated TUN has IPv4 and IPv6
+addresses with `auto_route` and `strict_route`; literal IPv6 follows the same
+Proxy/Direct/Reject route policy, while hostname DNS remains intentionally
+`ipv4_only`. Direct mode and explicit Direct rules use sing-box's direct
+outbound intentionally rather than physical traffic escaping the TUN. The Direct and Global modes temporarily prepend app-owned DNS
 and route overrides;
 switching back to Rule restores the profile's policy without rewriting the
 source profile.
@@ -218,7 +252,7 @@ Before packaging a proposed release, run the local, non-publishing gate with the
 version already set in the repository metadata, for example:
 
 ```sh
-make release-check TAG=v1.1.12
+make release-check TAG=v1.1.13
 ```
 
 It checks release metadata and local verification commands, then builds and
@@ -246,7 +280,7 @@ performance or power claim.
    and allowing `SBMHelper`. SBM waits for the system-reported approval state
    and then verifies or replaces the helper automatically; returning to SBM
    does not require a separate Refresh or Repair action.
-4. Open **Profiles…** and enter a private HTTPS subscription, paste an
+4. Open **Settings…** and enter a private HTTPS subscription, paste an
    individual connection link, or import a JSON file.
 5. For a compact subscription or connection link, optionally import a routing
    JSON in its profile editor.
@@ -256,7 +290,11 @@ performance or power claim.
 Every normal application exit, including **Disconnect & Quit** and Command-Q,
 asks the helper to persist the disconnected state and stop the TUN core before
 the UI terminates. When the helper is reachable, the app verifies that the core
-has stopped. A broken or unavailable helper never traps the user in the app.
+has stopped. If shutdown fails or the stopped state cannot be proven, SBM denies
+termination and remains open so Disconnect & Quit can be retried.
+Failure to contact the helper is displayed as an unknown VPN state, never as a
+proven disconnection. An explicit Disconnect remains authoritative across later
+settings edits and suppresses same-session automatic reconnection.
 The launchd socket remains registered, so reopening SBM starts the helper on
 demand without another installation approval.
 
@@ -266,8 +304,10 @@ in the source repository. The development disclosure remains in this README.
 
 HTTPS profiles are refreshed on save, on launch, and every six hours while the
 app is running. Individual connection links are local profile sources and are
-not fetched from the network. A changed active profile is applied
-transactionally.
+not fetched from the network. A changed active profile is validated without
+replacing a running known-good runtime; the helper persists the reconnect-needed
+state while that runtime remains active. **Reconnect to Apply** applies the
+latest candidate through the explicit stop/start transaction.
 
 Profile URLs and cached credentials are stored at
 `~/Library/Application Support/SBM/profiles.json` with mode `0600`.
@@ -290,7 +330,7 @@ update.
 
 ## Current status
 
-Version 1.1.11 bundles the pinned stable sing-box 1.13.18 core and is not an
+Version 1.1.13 bundles the pinned stable sing-box 1.13.19 core and is not an
 independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
 REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are

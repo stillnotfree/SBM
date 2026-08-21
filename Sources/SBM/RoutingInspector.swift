@@ -315,7 +315,12 @@ enum RoutingInspector {
       if let boolean = value as? Bool { return "\(key) = \(boolean)" }
       return key
     }
-    return descriptions.isEmpty ? "Rule \(index + 1)" : descriptions.joined(separator: " + ")
+    let summary =
+      descriptions.isEmpty ? "Rule \(index + 1)" : descriptions.joined(separator: " + ")
+    if let stage = rule["_sbm_stage"] as? String {
+      return "\(stage): \(summary)"
+    }
+    return summary
   }
 
   private static func match(
@@ -366,7 +371,9 @@ enum RoutingInspector {
     context: RoutingInspectionContext,
     ruleSetMatches: [String: Bool]
   ) -> Match {
-    let structuralKeys: Set<String> = ["action", "outbound", "invert", "type", "mode", "rules"]
+    let structuralKeys: Set<String> = [
+      "action", "outbound", "invert", "type", "mode", "rules", "_sbm_stage",
+    ]
     let destinationKeys = destinationAddressKeys.filter { rule[$0] != nil }.sorted()
     let destinationMatch = matchAny(keys: destinationKeys, rule: rule, context: context)
     var unknownReason: String?
@@ -516,7 +523,7 @@ enum RoutingInspector {
       guard boolValue(value) == true else { return .unknown("an invalid private-IP condition") }
       guard let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) else {
         // Domain inspection deliberately explains hostname policy without a DNS probe.
-        return context.domain == nil ? .no : .no
+        return context.domain == nil ? .no : .unknown("the resolved destination IP")
       }
       return address.isPrivate ? .yes : .no
     default:
@@ -587,6 +594,13 @@ struct ComposedRoutingInspection {
       ]
       var rules = managedRules(proxyOutbound: "proxy-selector", directOutbound: "direct")
       rules.append(
+        contentsOf: websiteRules(
+          compatibility.websiteRoutingRules,
+          directOutbound: "direct",
+          proxyOutbound: "proxy-selector"
+        )
+      )
+      rules.append(
         contentsOf: applicationRules(
           compatibility.applicationRoutingRules,
           directOutbound: "direct",
@@ -631,6 +645,13 @@ struct ComposedRoutingInspection {
       else { throw RoutingInspectionFailure.unavailable }
       var route = root["route"] as? [String: Any] ?? [:]
       var rules = managedRules(proxyOutbound: native.selectorTag, directOutbound: "sbm-direct")
+      rules.append(
+        contentsOf: websiteRules(
+          native.websiteRoutingRules,
+          directOutbound: "sbm-direct",
+          proxyOutbound: native.selectorTag
+        )
+      )
       let fixedNodeIDs = nativeFixedNodeIDs(root: root)
       rules.append(
         contentsOf: applicationRules(
@@ -679,14 +700,15 @@ struct ComposedRoutingInspection {
 
   func presentation(for result: RoutingInspectionResult) -> String {
     guard result.decision != .indeterminate else {
-      return result.uncertaintyReason ?? "Additional routing context is required."
+      var lines = [conciseUncertainty(for: result.uncertaintyReason)]
+      if let fallback = result.fallback {
+        lines.append(
+          "Otherwise: \(decisionSummary(fallback.decision, outbound: fallback.outboundTag)) · \(fallback.matchedRule)"
+        )
+      }
+      return lines.joined(separator: "\n")
     }
-    var decision = result.decision.label
-    if result.decision == .vpn, let outbound = result.outboundTag,
-      let server = vpnServerNames[outbound]
-    {
-      decision += " · \(server.replacingOccurrences(of: " (chosen automatically)", with: ""))"
-    }
+    let decision = decisionSummary(result.decision, outbound: result.outboundTag)
     let matched = result.matchedRule ?? "Final route"
     return "\(decision)\nMatched: \(matched)"
   }
@@ -695,10 +717,43 @@ struct ComposedRoutingInspection {
     var lines = ["Traffic from: \(contextLabel)"]
     if let ruleIndex = result.ruleIndex { lines.append("Rule: \(ruleIndex + 1)") }
     if let outbound = result.outboundTag { lines.append("Outbound: \(outbound)") }
+    if let reason = result.uncertaintyReason { lines.append("Reason: \(reason)") }
     if let fallback = result.fallback {
-      lines.append("If not matched: \(fallback.decision.label) · \(fallback.matchedRule)")
+      lines.append(
+        "If not matched: \(decisionSummary(fallback.decision, outbound: fallback.outboundTag)) · \(fallback.matchedRule)"
+      )
     }
     return lines.joined(separator: "\n")
+  }
+
+  private func decisionSummary(
+    _ decision: RoutingInspectionResult.Decision,
+    outbound: String?
+  ) -> String {
+    guard decision == .vpn, let outbound, let server = vpnServerNames[outbound] else {
+      return decision.label
+    }
+    return "PROXY · \(server.replacingOccurrences(of: " (chosen automatically)", with: ""))"
+  }
+
+  private func conciseUncertainty(for reason: String?) -> String {
+    let value = reason?.lowercased() ?? ""
+    if value.contains("resolved destination ip") {
+      return "Depends on resolved IP"
+    }
+    if value.contains("active rule-set cache") {
+      return "Depends on active rule-set data"
+    }
+    if value.contains("process path") || value.contains("application") {
+      return "Depends on application context"
+    }
+    if value.contains("protocol") || value.contains("network") || value.contains("port") {
+      return "Depends on connection context"
+    }
+    if value.contains("final outbound") || value.contains("outbound") {
+      return "Depends on outbound classification"
+    }
+    return "Additional routing context is required"
   }
 
   private static func managedRules(
@@ -749,6 +804,31 @@ struct ComposedRoutingInspection {
       composed["process_path"] = [
         URL(fileURLWithPath: rule.executablePath).standardizedFileURL.path
       ]
+      return composed
+    }
+  }
+
+  private static func websiteRules(
+    _ rules: [WebsiteRoutingRule],
+    directOutbound: String,
+    proxyOutbound: String
+  ) -> [[String: Any]] {
+    rules.map { rule in
+      var composed: [String: Any] = [
+        "domain": [rule.domain],
+        "domain_suffix": [".\(rule.domain)"],
+        "_sbm_stage": "Website Routing",
+      ]
+      switch rule.target {
+      case .direct:
+        composed["action"] = "route"
+        composed["outbound"] = directOutbound
+      case .selectedProxy:
+        composed["action"] = "route"
+        composed["outbound"] = proxyOutbound
+      case .reject:
+        composed["action"] = "reject"
+      }
       return composed
     }
   }
@@ -813,11 +893,18 @@ extension ProxyNodeID {
 enum RoutingInspectionFailure: LocalizedError {
   case invalidInput
   case unavailable
+  case activeRuleSetDataUnavailable(String?)
 
   var errorDescription: String? {
     switch self {
-    case .invalidInput: "Enter one domain name or IP address."
-    case .unavailable: "The selected profile has no inspectable composed route."
+    case .invalidInput: return "Enter one domain name or IP address."
+    case .unavailable: return "The selected profile has no inspectable composed route."
+    case .activeRuleSetDataUnavailable(let reason):
+      let bounded = reason?
+        .replacingOccurrences(of: "\n", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      guard let bounded, !bounded.isEmpty else { return "Active rule-set data is unavailable." }
+      return "Active rule-set data is unavailable: \(String(bounded.prefix(240)))"
     }
   }
 }
@@ -861,7 +948,7 @@ private struct IPAddress {
     let remainingBits = prefix % 8
     guard bytes.prefix(completeBytes) == network.bytes.prefix(completeBytes) else { return false }
     guard remainingBits > 0 else { return true }
-    let mask = UInt8(0xFF << (8 - remainingBits))
+    let mask = UInt8(truncatingIfNeeded: 0xFF << (8 - remainingBits))
     return bytes[completeBytes] & mask == network.bytes[completeBytes] & mask
   }
 }

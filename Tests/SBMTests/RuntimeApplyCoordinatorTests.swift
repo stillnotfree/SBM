@@ -44,6 +44,22 @@ private actor DelayedHelperSender {
   }
 }
 
+private actor LatencyRequestRecorder {
+  private var nodes: [ProxyNodeID] = []
+
+  func send(_ node: ProxyNodeID) -> HelperResponse {
+    nodes.append(node)
+    return HelperResponse(
+      success: true,
+      coreRunning: true,
+      delays: [NodeDelay(node: node, milliseconds: 20)],
+      message: "latency"
+    )
+  }
+
+  func requestCount() -> Int { nodes.count }
+}
+
 private struct RecordedOutcome: Equatable {
   let response: String
   let isCurrent: Bool
@@ -128,6 +144,32 @@ private func waitForRequestCount(
   await sender.completeNext(with: "active-c")
   while coordinator.isApplying { await Task.yield() }
   #expect(coordinator.status == .active)
+}
+
+@Test @MainActor func replacedPendingGenerationReceivesSupersededCompletion() async {
+  let sender = DelayedRuntimeSender()
+  let coordinator = RuntimeApplyCoordinator<String, String> { request in
+    await sender.send(request)
+  }
+  var pendingWasSuperseded = false
+
+  coordinator.submit("in-flight") { _ in }
+  await waitForRequestCount(1, sender: sender)
+  coordinator.submit("pending-shutdown") { outcome in
+    if case .failure(let error) = outcome.result,
+      error is RuntimeApplyCoordinatorFailure
+    {
+      pendingWasSuperseded = !outcome.isCurrent
+    }
+  }
+  coordinator.submit("newer-start") { _ in }
+
+  #expect(pendingWasSuperseded)
+  await sender.completeNext(with: "stale")
+  await waitForRequestCount(2, sender: sender)
+  #expect(await sender.recordedRequests() == ["in-flight", "newer-start"])
+  await sender.completeNext(with: "current")
+  while coordinator.isApplying { await Task.yield() }
 }
 
 @Test @MainActor func routingRemovalDuringDelayedStartIsAppliedAfterStart() async throws {
@@ -560,11 +602,425 @@ private func waitForRequestCount(
   #expect(model.applicationRoutingRules.first?.target == .selectedProxy)
 }
 
+@Test @MainActor
+func deferredApplicationRoutingKeepsKnownGoodRuntimeUntilExplicitReconnect() async {
+  let profileID = UUID()
+  let rule = ApplicationRoutingRule(
+    displayName: "Browser",
+    bundlePath: "/Applications/Browser.app",
+    executablePath: "/Applications/Browser.app/Contents/MacOS/Browser",
+    target: .selectedProxy
+  )
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Applications",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-deferred"), server: "deferred.example.test")
+        ],
+        applicationRoutingRules: [rule]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    sender: sender
+  )
+  model.coreRunning = true
+
+  model.setApplicationRoutingTarget(rule.id, target: .direct)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+
+  #expect(model.coreRunning)
+  #expect(model.applicationRoutingRules.first?.target == .direct)
+  #expect(model.deferredRuntimeApplyPresentation?.headline == "Changes ready to apply")
+  #expect(model.applicationRoutingStatus.state == .reconnectRequired)
+  #expect(model.applicationRoutingStatus.message == nil)
+  #expect(model.subscriptionStatus != DeferredRuntimeApplyPresentation.changesReadyToApply)
+  #expect(await sender.requestCount() == 1)
+
+  model.setCoreEnabled(false)
+  await waitForRequestCount(2, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: false,
+      activeProfileID: profileID,
+      message: "VPN disconnected"
+    )
+  )
+  await waitForModel {
+    model.observedCoreState == .stopped && model.runtimeApplyStatus != .applying
+  }
+
+  model.setCoreEnabled(true)
+  await waitForRequestCount(3, sender: sender)
+  let reconnectRequest = await sender.recordedRequests()[2]
+  #expect(reconnectRequest.action == .start)
+  #expect(reconnectRequest.profile?.applicationRoutingRules.first?.target == .direct)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      message: "VPN connected"
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .active }
+  #expect(model.coreRunning)
+  #expect(model.deferredRuntimeApplyPresentation == nil)
+  #expect(model.applicationRoutingStatus.state == .saved)
+  #expect(model.applicationRoutingStatus.message == nil)
+  #expect(model.subscriptionStatus != DeferredRuntimeApplyPresentation.changesReadyToApply)
+}
+
+@Test @MainActor
+func reconnectToApplyStopsBeforeStartingAndClearsPendingOnlyAfterAuthoritativeStatus() async {
+  let profileID = UUID()
+  let rule = ApplicationRoutingRule(
+    displayName: "Browser",
+    bundlePath: "/Applications/Browser.app",
+    executablePath: "/Applications/Browser.app/Contents/MacOS/Browser",
+    target: .selectedProxy
+  )
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Applications",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-reconnect"), server: "reconnect.example.test")
+        ],
+        applicationRoutingRules: [rule]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = AppModel(
+    runtimeSender: { request in await sender.send(request) },
+    profileValidator: { _ in
+      HelperResponse(success: true, coreRunning: false, message: "valid")
+    },
+    profileLibraryLoader: {
+      ProfileLibrary(profiles: [profile], selectedProfileID: profileID)
+    },
+    profileLibrarySaver: { _ in },
+    runtimeStateReader: {
+      HelperResponse(
+        success: true,
+        coreRunning: true,
+        activeProfileID: profileID,
+        message: "authoritative active"
+      )
+    },
+    performStartup: false
+  )
+  model.helperEnabled = true
+  model.helperReachable = true
+  model.helperVersion = HelperConstants.helperVersion
+  model.helperRevision = HelperConstants.helperRevision
+  model.coreRunning = true
+
+  model.setApplicationRoutingTarget(rule.id, target: .direct)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+  #expect(model.deferredRuntimeApplyPresentation?.action.title == "Reconnect to Apply")
+
+  model.reconnectToApply()
+  await waitForRequestCount(2, sender: sender)
+  #expect(await sender.recordedRequests().map(\.action) == [.start, .stop])
+  model.reconnectToApply()
+  await Task.yield()
+  #expect(await sender.requestCount() == 2)
+
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: false,
+      activeProfileID: profileID,
+      message: "stopped"
+    )
+  )
+  await waitForRequestCount(3, sender: sender)
+  #expect(await sender.recordedRequests().map(\.action) == [.start, .stop, .start])
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      message: "connected"
+    )
+  )
+  await waitForModel { model.deferredRuntimeApplyPhase == .idle }
+  #expect(model.runtimeApplyStatus == .active)
+  #expect(model.deferredRuntimeApplyPresentation == nil)
+}
+
+@Test @MainActor
+func reconnectToApplyDisconnectFailureDoesNotStartOrHidePendingState() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Failure",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-stop-failure"), server: "stop-failure.example.test")
+        ],
+        applicationRoutingRules: [
+          ApplicationRoutingRule(
+            displayName: "Browser",
+            bundlePath: "/Applications/Browser.app",
+            executablePath: "/Applications/Browser.app/Contents/MacOS/Browser",
+            target: .selectedProxy
+          )
+        ]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    sender: sender
+  )
+  model.coreRunning = true
+  let ruleID = try! #require(model.applicationRoutingRules.first?.id)
+  model.setApplicationRoutingTarget(ruleID, target: .direct)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+
+  model.reconnectToApply()
+  await waitForRequestCount(2, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: false,
+      coreRunning: true,
+      activeProfileID: profileID,
+      message: "stop refused"
+    )
+  )
+  await waitForModel { model.deferredRuntimeApplyPhase == .failed }
+  #expect(await sender.requestCount() == 2)
+  #expect(model.coreRunning)
+  #expect(model.deferredRuntimeApplyPresentation?.action.title == "Reconnect to Apply")
+  #expect(model.deferredRuntimeApplyError != nil)
+}
+
+@Test @MainActor
+func reconnectToApplyConnectFailureLeavesTheVpnStoppedWithoutRetryLoop() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Connect failure",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-start-failure"), server: "start-failure.example.test")
+        ],
+        applicationRoutingRules: [
+          ApplicationRoutingRule(
+            displayName: "Browser",
+            bundlePath: "/Applications/Browser.app",
+            executablePath: "/Applications/Browser.app/Contents/MacOS/Browser",
+            target: .selectedProxy
+          )
+        ]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    sender: sender
+  )
+  model.coreRunning = true
+  let ruleID = try! #require(model.applicationRoutingRules.first?.id)
+  model.setApplicationRoutingTarget(ruleID, target: .direct)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+
+  model.reconnectToApply()
+  await waitForRequestCount(2, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: false,
+      activeProfileID: profileID,
+      message: "stopped"
+    )
+  )
+  await waitForRequestCount(3, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: false,
+      coreRunning: false,
+      activeProfileID: profileID,
+      message: "candidate rejected"
+    )
+  )
+  await waitForModel { model.deferredRuntimeApplyPhase == .failed }
+  #expect(await sender.requestCount() == 3)
+  #expect(!model.coreRunning)
+  #expect(model.deferredRuntimeApplyPresentation != nil)
+  #expect(model.deferredRuntimeApplyError?.contains("remains disconnected") == true)
+}
+
+@Test @MainActor func deferredProfileSwitchDoesNotRetargetOldRuntimeNode() async {
+  let profileAID = UUID()
+  let profileBID = UUID()
+  let nodeA = ProxyNodeID(rawValue: "node-a")
+  let nodeB = ProxyNodeID(rawValue: "node-b")
+  let profileA = ManagedProfile(
+    id: profileAID,
+    name: "A",
+    payload: .compatibility(
+      VPNProfile(connections: [runtimeTestConnection(id: nodeA, server: "a.example.test")])
+    )
+  )
+  let profileB = ManagedProfile(
+    id: profileBID,
+    name: "B",
+    payload: .compatibility(
+      VPNProfile(connections: [runtimeTestConnection(id: nodeB, server: "b.example.test")])
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profileA, profileB], selectedProfileID: profileAID),
+    sender: sender
+  )
+  model.coreRunning = true
+
+  model.selectProfile(profileBID)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileAID,
+      nodes: [ProxyNodeDescriptor(id: nodeA, name: "A")],
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+
+  model.setSelectedNode(nodeB)
+  await Task.yield()
+
+  #expect(model.selectedNodeID == nodeB)
+  #expect(model.runtimeApplyStatus == .reconnectRequired)
+  #expect(await sender.requestCount() == 1)
+}
+
+@Test @MainActor func latencyTestDoesNotTargetOldRuntimeAfterDeferredProfileSwitch() async {
+  let profileAID = UUID()
+  let profileBID = UUID()
+  let nodeA = ProxyNodeID(rawValue: "latency-a")
+  let nodeB = ProxyNodeID(rawValue: "latency-b")
+  let profileA = ManagedProfile(
+    id: profileAID,
+    name: "A",
+    payload: .compatibility(
+      VPNProfile(connections: [runtimeTestConnection(id: nodeA, server: "a.example.test")])
+    )
+  )
+  let profileB = ManagedProfile(
+    id: profileBID,
+    name: "B",
+    payload: .compatibility(
+      VPNProfile(connections: [runtimeTestConnection(id: nodeB, server: "b.example.test")])
+    )
+  )
+  let sender = DelayedHelperSender()
+  let latency = LatencyRequestRecorder()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profileA, profileB], selectedProfileID: profileAID),
+    sender: sender,
+    latencySender: { node in await latency.send(node) }
+  )
+  model.coreRunning = true
+
+  model.selectProfile(profileBID)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileAID,
+      nodes: [ProxyNodeDescriptor(id: nodeA, name: "A")],
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+
+  model.testLatency()
+  await Task.yield()
+
+  #expect(await latency.requestCount() == 0)
+  #expect(
+    model.lastError
+      == "Disconnect and reconnect before testing latency for the selected profile."
+  )
+}
+
 @MainActor
 private func runtimeTestModel(
   library: ProfileLibrary,
   sender: DelayedHelperSender,
-  manager: SubscriptionManager = SubscriptionManager()
+  manager: SubscriptionManager = SubscriptionManager(),
+  latencySender: @escaping @Sendable (ProxyNodeID) async throws -> HelperResponse = { node in
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      delays: [NodeDelay(node: node, milliseconds: 20)],
+      message: "latency"
+    )
+  }
 ) -> AppModel {
   let model = AppModel(
     subscriptionManager: manager,
@@ -574,6 +1030,7 @@ private func runtimeTestModel(
     },
     profileLibraryLoader: { library },
     profileLibrarySaver: { _ in },
+    latencySender: latencySender,
     performStartup: false
   )
   model.helperEnabled = true

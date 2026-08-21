@@ -80,6 +80,12 @@
 
 ## Editing workflow
 
+Reasoning discipline:
+
+- Do not silently choose between materially different interpretations. Inspect the current code and authoritative project docs first; if ambiguity still changes security, runtime behavior, or user-visible semantics, surface it before implementation.
+- Prefer the smallest design that satisfies verified requirements. Do not add speculative features, configurability, or abstractions for hypothetical future use.
+- Keep changes surgical: do not refactor, reformat, or remove adjacent code unless the requested change makes that cleanup necessary.
+
 1. Record `git status --short` and inspect the relevant diff.
 2. Trace the concrete behavior through source and existing tests.
 3. Add a deterministic failing regression for a confirmed defect.

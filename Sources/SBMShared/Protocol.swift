@@ -2,9 +2,9 @@ import CryptoKit
 import Foundation
 
 public enum HelperConstants {
-  public static let protocolVersion = 9
+  public static let protocolVersion = 10
   public static let helperVersion = "1.1.3"
-  public static let helperRevision = 42
+  public static let helperRevision = 48
   public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.sock"
   public static let daemonPlistName = "com.stillnotfree.sbm.helper.plist"
 }
@@ -20,6 +20,20 @@ public enum HelperAction: String, Codable, Sendable {
   case validateProfile
   case matchRuleSets
   case shutdown
+}
+
+public enum HelperRuntimeOutcome: String, Codable, Equatable, Sendable {
+  case applied
+  case reconnectRequired
+
+  public var userMessage: String? {
+    switch self {
+    case .applied:
+      nil
+    case .reconnectRequired:
+      "Changes ready to apply"
+    }
+  }
 }
 
 public enum RoutingMode: String, Codable, CaseIterable, Hashable, Sendable {
@@ -86,7 +100,6 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
   public let fingerprint: String
   public let publicKey: String
   public let shortID: String
-  public let displayName: String
 
   public init(
     server: String,
@@ -95,8 +108,7 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
     serverName: String,
     fingerprint: String,
     publicKey: String,
-    shortID: String,
-    displayName: String
+    shortID: String
   ) {
     self.server = server
     self.port = port
@@ -105,7 +117,6 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
     self.fingerprint = fingerprint
     self.publicKey = publicKey
     self.shortID = shortID
-    self.displayName = displayName
   }
 }
 
@@ -115,22 +126,19 @@ public struct Hysteria2Profile: Codable, Equatable, Sendable {
   public let password: String
   public let serverName: String
   public let obfsPassword: String?
-  public let displayName: String
 
   public init(
     server: String,
     port: UInt16,
     password: String,
     serverName: String,
-    obfsPassword: String? = nil,
-    displayName: String
+    obfsPassword: String? = nil
   ) {
     self.server = server
     self.port = port
     self.password = password
     self.serverName = serverName
     self.obfsPassword = obfsPassword
-    self.displayName = displayName
   }
 }
 
@@ -139,14 +147,180 @@ public struct ShadowsocksProfile: Codable, Equatable, Sendable {
   public let port: UInt16
   public let method: String
   public let password: String
-  public let displayName: String
 
-  public init(server: String, port: UInt16, method: String, password: String, displayName: String) {
+  public init(server: String, port: UInt16, method: String, password: String) {
     self.server = server
     self.port = port
     self.method = method
     self.password = password
-    self.displayName = displayName
+  }
+}
+
+/// Decoder-only representation used at the boundary for profile libraries
+/// written before managed connections became the sole current representation.
+/// It is intentionally not used by the runtime model or current encoder.
+public enum LegacyCoreProfileDTO: Decodable, Sendable {
+  case compatibility(LegacyVPNProfileDTO)
+  case native(NativeProfile)
+
+  private struct Wrapper<Value: Decodable>: Decodable {
+    let value: Value
+
+    private enum CodingKeys: String, CodingKey { case value = "_0" }
+  }
+
+  private enum CodingKeys: String, CodingKey { case compatibility, native }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    if let wrapped = try container.decodeIfPresent(
+      Wrapper<LegacyVPNProfileDTO>.self,
+      forKey: .compatibility
+    ) {
+      self = .compatibility(wrapped.value)
+    } else if let native = try container.decodeIfPresent(NativeProfile.self, forKey: .native) {
+      self = .native(native)
+    } else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .compatibility,
+        in: container,
+        debugDescription: "Legacy profile payload has no supported kind."
+      )
+    }
+  }
+
+  public func currentProfile() -> CoreProfile {
+    switch self {
+    case .compatibility(let value): .compatibility(value.currentProfile())
+    case .native(let value): .native(value)
+    }
+  }
+}
+
+public struct LegacyVPNProfileDTO: Decodable, Sendable {
+  public let vless: [LegacyVLESSProfileDTO]
+  public let hysteria2: [LegacyHysteria2ProfileDTO]
+  public let shadowsocks: [LegacyShadowsocksProfileDTO]
+  public let routingPolicy: RoutingPolicy?
+  public let nodeGroups: [ProxyNodeGroup]?
+  public let applicationRoutingRules: [ApplicationRoutingRule]
+  public let websiteRoutingRules: [WebsiteRoutingRule]
+
+  private enum CodingKeys: String, CodingKey {
+    case vless, hysteria2, shadowsocks, routingPolicy, nodeGroups, applicationRoutingRules,
+      websiteRoutingRules
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    vless = try container.decodeIfPresent([LegacyVLESSProfileDTO].self, forKey: .vless) ?? []
+    hysteria2 =
+      try container.decodeIfPresent([LegacyHysteria2ProfileDTO].self, forKey: .hysteria2) ?? []
+    shadowsocks =
+      try container.decodeIfPresent([LegacyShadowsocksProfileDTO].self, forKey: .shadowsocks)
+      ?? []
+    routingPolicy = try container.decodeIfPresent(RoutingPolicy.self, forKey: .routingPolicy)
+    nodeGroups = try container.decodeIfPresent([ProxyNodeGroup].self, forKey: .nodeGroups)
+    applicationRoutingRules =
+      try container.decodeIfPresent(
+        [ApplicationRoutingRule].self,
+        forKey: .applicationRoutingRules
+      ) ?? []
+    websiteRoutingRules =
+      try container.decodeIfPresent(
+        [WebsiteRoutingRule].self,
+        forKey: .websiteRoutingRules
+      ) ?? []
+  }
+
+  public func currentProfile() -> VPNProfile {
+    let vless = vless.enumerated().map { entry in
+      ManagedConnection(
+        id: ProxyNodeID(rawValue: "vless-\(entry.offset + 1)"),
+        displayName: entry.element.displayName,
+        outbound: .vless(entry.element.currentProfile())
+      )
+    }
+    let hysteria2 = hysteria2.enumerated().map { entry in
+      ManagedConnection(
+        id: ProxyNodeID(rawValue: "hysteria2-\(entry.offset + 1)"),
+        displayName: entry.element.displayName,
+        outbound: .hysteria2(entry.element.currentProfile())
+      )
+    }
+    let shadowsocks = shadowsocks.enumerated().map { entry in
+      ManagedConnection(
+        id: ProxyNodeID(rawValue: "shadowsocks-\(entry.offset + 1)"),
+        displayName: entry.element.displayName,
+        outbound: .shadowsocks(entry.element.currentProfile())
+      )
+    }
+    return VPNProfile(
+      connections: vless + hysteria2 + shadowsocks,
+      routingPolicy: routingPolicy,
+      nodeGroups: nodeGroups ?? [],
+      applicationRoutingRules: applicationRoutingRules,
+      websiteRoutingRules: websiteRoutingRules
+    )
+  }
+}
+
+public struct LegacyVLESSProfileDTO: Decodable, Sendable {
+  public let server: String
+  public let port: UInt16
+  public let uuid: String
+  public let serverName: String
+  public let fingerprint: String
+  public let publicKey: String
+  public let shortID: String
+  public let displayName: String
+
+  public func currentProfile() -> VLESSProfile {
+    VLESSProfile(
+      server: server,
+      port: port,
+      uuid: uuid,
+      serverName: serverName,
+      fingerprint: fingerprint,
+      publicKey: publicKey,
+      shortID: shortID
+    )
+  }
+}
+
+public struct LegacyHysteria2ProfileDTO: Decodable, Sendable {
+  public let server: String
+  public let port: UInt16
+  public let password: String
+  public let serverName: String
+  public let obfsPassword: String?
+  public let displayName: String
+
+  public func currentProfile() -> Hysteria2Profile {
+    Hysteria2Profile(
+      server: server,
+      port: port,
+      password: password,
+      serverName: serverName,
+      obfsPassword: obfsPassword
+    )
+  }
+}
+
+public struct LegacyShadowsocksProfileDTO: Decodable, Sendable {
+  public let server: String
+  public let port: UInt16
+  public let method: String
+  public let password: String
+  public let displayName: String
+
+  public func currentProfile() -> ShadowsocksProfile {
+    ShadowsocksProfile(
+      server: server,
+      port: port,
+      method: method,
+      password: password
+    )
   }
 }
 
@@ -154,14 +328,6 @@ public enum ManagedOutbound: Codable, Equatable, Sendable {
   case vless(VLESSProfile)
   case hysteria2(Hysteria2Profile)
   case shadowsocks(ShadowsocksProfile)
-
-  public var displayName: String {
-    switch self {
-    case .vless(let value): value.displayName
-    case .hysteria2(let value): value.displayName
-    case .shadowsocks(let value): value.displayName
-    }
-  }
 
   public var kind: ProxyNodeKind {
     switch self {
@@ -248,10 +414,11 @@ public struct ManagedConnection: Codable, Equatable, Sendable, Identifiable {
 
   public init(
     id: ProxyNodeID? = nil,
-    displayName: String? = nil, outbound: ManagedOutbound
+    displayName: String,
+    outbound: ManagedOutbound
   ) {
     self.id = id ?? outbound.stableNodeID
-    self.displayName = displayName ?? outbound.displayName
+    self.displayName = displayName
     self.outbound = outbound
   }
 
@@ -308,70 +475,51 @@ public struct ApplicationRoutingRule: Codable, Equatable, Identifiable, Sendable
   }
 }
 
+public enum WebsiteRoutingTarget: String, Codable, Equatable, Hashable, Sendable {
+  case selectedProxy
+  case direct
+  case reject
+}
+
+public struct WebsiteRoutingRule: Codable, Equatable, Identifiable, Sendable {
+  public let id: UUID
+  public let domain: String
+  public let target: WebsiteRoutingTarget
+
+  public init(
+    id: UUID = UUID(),
+    domain: String,
+    target: WebsiteRoutingTarget
+  ) {
+    self.id = id
+    self.domain = domain
+    self.target = target
+  }
+}
+
 public struct VPNProfile: Codable, Equatable, Sendable {
   public let connections: [ManagedConnection]
   public let routingPolicy: RoutingPolicy?
   public let nodeGroups: [ProxyNodeGroup]?
   public let applicationRoutingRules: [ApplicationRoutingRule]
-  /// Decoding marker only. The user-library schema coordinates migration of
-  /// old parallel arrays; a current schema must never silently contain them.
-  public let usesLegacyConnectionEncoding: Bool
-
-  /// Compatibility views are source-compatible with the v1.1.11 API. New code
-  /// must operate on `connections`, which keeps the user-visible stable ID.
-  public var vless: [VLESSProfile] {
-    connections.compactMap { if case .vless(let value) = $0.outbound { value } else { nil } }
-  }
-  public var hysteria2: [Hysteria2Profile] {
-    connections.compactMap { if case .hysteria2(let value) = $0.outbound { value } else { nil } }
-  }
-  public var shadowsocks: [ShadowsocksProfile] {
-    connections.compactMap { if case .shadowsocks(let value) = $0.outbound { value } else { nil } }
-  }
+  public let websiteRoutingRules: [WebsiteRoutingRule]
 
   public init(
     connections: [ManagedConnection],
     routingPolicy: RoutingPolicy? = nil,
     nodeGroups: [ProxyNodeGroup] = [],
-    applicationRoutingRules: [ApplicationRoutingRule] = []
+    applicationRoutingRules: [ApplicationRoutingRule] = [],
+    websiteRoutingRules: [WebsiteRoutingRule] = []
   ) {
     self.connections = connections
     self.routingPolicy = routingPolicy
     self.nodeGroups = nodeGroups
     self.applicationRoutingRules = applicationRoutingRules
-    self.usesLegacyConnectionEncoding = false
-  }
-
-  public init(
-    vless: [VLESSProfile] = [],
-    hysteria2: [Hysteria2Profile] = [],
-    shadowsocks: [ShadowsocksProfile] = [],
-    routingPolicy: RoutingPolicy? = nil,
-    nodeGroups: [ProxyNodeGroup] = [],
-    applicationRoutingRules: [ApplicationRoutingRule] = []
-  ) {
-    self.connections =
-      vless.enumerated().map {
-        ManagedConnection(
-          id: ProxyNodeID(rawValue: "vless-\($0.offset + 1)"), outbound: .vless($0.element))
-      }
-      + hysteria2.enumerated().map {
-        ManagedConnection(
-          id: ProxyNodeID(rawValue: "hysteria2-\($0.offset + 1)"), outbound: .hysteria2($0.element))
-      }
-      + shadowsocks.enumerated().map {
-        ManagedConnection(
-          id: ProxyNodeID(rawValue: "shadowsocks-\($0.offset + 1)"),
-          outbound: .shadowsocks($0.element))
-      }
-    self.routingPolicy = routingPolicy
-    self.nodeGroups = nodeGroups
-    self.applicationRoutingRules = applicationRoutingRules
-    self.usesLegacyConnectionEncoding = false
+    self.websiteRoutingRules = websiteRoutingRules
   }
 
   private enum CodingKeys: String, CodingKey {
-    case connections, vless, hysteria2, routingPolicy, nodeGroups, applicationRoutingRules
+    case connections, routingPolicy, nodeGroups, applicationRoutingRules, websiteRoutingRules
   }
 
   public init(from decoder: Decoder) throws {
@@ -383,26 +531,23 @@ public struct VPNProfile: Codable, Equatable, Sendable {
         [ApplicationRoutingRule].self,
         forKey: .applicationRoutingRules
       ) ?? []
+    websiteRoutingRules =
+      try container.decodeIfPresent(
+        [WebsiteRoutingRule].self,
+        forKey: .websiteRoutingRules
+      ) ?? []
     if let connections = try container.decodeIfPresent(
       [ManagedConnection].self, forKey: .connections)
     {
       self.connections = connections
-      usesLegacyConnectionEncoding = false
     } else {
-      let vless = try container.decodeIfPresent([VLESSProfile].self, forKey: .vless) ?? []
-      let hysteria2 =
-        try container.decodeIfPresent([Hysteria2Profile].self, forKey: .hysteria2) ?? []
-      self.connections =
-        vless.enumerated().map {
-          ManagedConnection(
-            id: ProxyNodeID(rawValue: "vless-\($0.offset + 1)"), outbound: .vless($0.element))
-        }
-        + hysteria2.enumerated().map {
-          ManagedConnection(
-            id: ProxyNodeID(rawValue: "hysteria2-\($0.offset + 1)"),
-            outbound: .hysteria2($0.element))
-        }
-      usesLegacyConnectionEncoding = true
+      throw DecodingError.keyNotFound(
+        CodingKeys.connections,
+        DecodingError.Context(
+          codingPath: container.codingPath,
+          debugDescription: "Current VPN profile has no managed connections."
+        )
+      )
     }
   }
 
@@ -412,6 +557,7 @@ public struct VPNProfile: Codable, Equatable, Sendable {
     try container.encodeIfPresent(routingPolicy, forKey: .routingPolicy)
     try container.encodeIfPresent(nodeGroups, forKey: .nodeGroups)
     try container.encode(applicationRoutingRules, forKey: .applicationRoutingRules)
+    try container.encode(websiteRoutingRules, forKey: .websiteRoutingRules)
   }
 }
 
@@ -420,21 +566,24 @@ public struct NativeProfile: Codable, Equatable, Sendable {
   public let selectorTag: String
   public let nodes: [ProxyNodeDescriptor]
   public let applicationRoutingRules: [ApplicationRoutingRule]
+  public let websiteRoutingRules: [WebsiteRoutingRule]
 
   public init(
     configuration: Data,
     selectorTag: String,
     nodes: [ProxyNodeDescriptor],
-    applicationRoutingRules: [ApplicationRoutingRule] = []
+    applicationRoutingRules: [ApplicationRoutingRule] = [],
+    websiteRoutingRules: [WebsiteRoutingRule] = []
   ) {
     self.configuration = configuration
     self.selectorTag = selectorTag
     self.nodes = nodes
     self.applicationRoutingRules = applicationRoutingRules
+    self.websiteRoutingRules = websiteRoutingRules
   }
 
   private enum CodingKeys: String, CodingKey {
-    case configuration, selectorTag, nodes, applicationRoutingRules
+    case configuration, selectorTag, nodes, applicationRoutingRules, websiteRoutingRules
   }
 
   public init(from decoder: Decoder) throws {
@@ -447,6 +596,11 @@ public struct NativeProfile: Codable, Equatable, Sendable {
         [ApplicationRoutingRule].self,
         forKey: .applicationRoutingRules
       ) ?? []
+    websiteRoutingRules =
+      try container.decodeIfPresent(
+        [WebsiteRoutingRule].self,
+        forKey: .websiteRoutingRules
+      ) ?? []
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -455,6 +609,7 @@ public struct NativeProfile: Codable, Equatable, Sendable {
     try container.encode(selectorTag, forKey: .selectorTag)
     try container.encode(nodes, forKey: .nodes)
     try container.encode(applicationRoutingRules, forKey: .applicationRoutingRules)
+    try container.encode(websiteRoutingRules, forKey: .websiteRoutingRules)
   }
 }
 
@@ -485,6 +640,13 @@ public enum CoreProfile: Codable, Equatable, Sendable {
     switch self {
     case .compatibility(let profile): profile.applicationRoutingRules
     case .native(let profile): profile.applicationRoutingRules
+    }
+  }
+
+  public var websiteRoutingRules: [WebsiteRoutingRule] {
+    switch self {
+    case .compatibility(let profile): profile.websiteRoutingRules
+    case .native(let profile): profile.websiteRoutingRules
     }
   }
 }
@@ -563,6 +725,7 @@ public struct HelperResponse: Codable, Sendable {
   /// `true` requires an explicit user connection before recovery can retry.
   public let automaticRecoveryExhausted: Bool
   public let ruleSetMatches: [RuleSetMatch]
+  public let runtimeOutcome: HelperRuntimeOutcome
   public let message: String
 
   public init(
@@ -576,6 +739,7 @@ public struct HelperResponse: Codable, Sendable {
     delays: [NodeDelay] = [],
     automaticRecoveryExhausted: Bool = false,
     ruleSetMatches: [RuleSetMatch] = [],
+    runtimeOutcome: HelperRuntimeOutcome = .applied,
     message: String
   ) {
     self.protocolVersion = HelperConstants.protocolVersion
@@ -591,6 +755,7 @@ public struct HelperResponse: Codable, Sendable {
     self.delays = delays
     self.automaticRecoveryExhausted = automaticRecoveryExhausted
     self.ruleSetMatches = ruleSetMatches
+    self.runtimeOutcome = runtimeOutcome
     self.message = message
   }
 
@@ -608,6 +773,7 @@ public struct HelperResponse: Codable, Sendable {
     case delays
     case automaticRecoveryExhausted
     case ruleSetMatches
+    case runtimeOutcome
     case message
   }
 
@@ -628,6 +794,8 @@ public struct HelperResponse: Codable, Sendable {
       try container.decodeIfPresent(Bool.self, forKey: .automaticRecoveryExhausted) ?? false
     ruleSetMatches =
       try container.decodeIfPresent([RuleSetMatch].self, forKey: .ruleSetMatches) ?? []
+    runtimeOutcome =
+      try container.decodeIfPresent(HelperRuntimeOutcome.self, forKey: .runtimeOutcome) ?? .applied
     message = try container.decode(String.self, forKey: .message)
   }
 }

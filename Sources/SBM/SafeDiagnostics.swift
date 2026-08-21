@@ -121,3 +121,15 @@ enum DiagnosticSecrets {
       || normalized == "x_hwid"
   }
 }
+
+enum SafeDiagnosticError {
+  static func sanitize(_ value: String, secrets: [String]) -> String {
+    guard !value.contains("{"), !value.contains("}"),
+      !value.contains("["), !value.contains("]")
+    else { return "Error details redacted." }
+    let redacted = SecretRedactor.redact(value, secrets: secrets)
+      .replacingOccurrences(of: "\n", with: " ")
+      .replacingOccurrences(of: "\r", with: " ")
+    return redacted.count <= 512 ? redacted : String(redacted.prefix(512)) + "…"
+  }
+}

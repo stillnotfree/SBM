@@ -1,13 +1,18 @@
 import Darwin
 import Foundation
+import SBMShared
 import Testing
 
 @testable import SBMHelper
 
 @Test func localAPIPortProbeIgnoresTimeWaitButRejectsLiveListener() throws {
-  let listener = socket(AF_INET, SOCK_STREAM, 0)
+  var listener = socket(AF_INET, SOCK_STREAM, 0)
   #expect(listener >= 0)
-  defer { close(listener) }
+  defer {
+    if listener >= 0 {
+      close(listener)
+    }
+  }
   var reuseAddress: Int32 = 1
   #expect(
     setsockopt(
@@ -40,9 +45,13 @@ import Testing
   let port = UInt16(bigEndian: boundAddress.sin_port)
   #expect(!LocalTCPPortProbe.isAvailable(port))
 
-  let client = socket(AF_INET, SOCK_STREAM, 0)
+  var client = socket(AF_INET, SOCK_STREAM, 0)
   #expect(client >= 0)
-  defer { close(client) }
+  defer {
+    if client >= 0 {
+      close(client)
+    }
+  }
   #expect(
     withUnsafePointer(to: &boundAddress) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -54,7 +63,9 @@ import Testing
   #expect(accepted >= 0)
   close(accepted)
   close(client)
+  client = -1
   close(listener)
+  listener = -1
 
   #expect(LocalTCPPortProbe.isAvailable(port))
 }
@@ -282,4 +293,137 @@ func disconnectedPostLaunchFailureCleansCandidateAndRestoresSnapshot(
   #expect(harness.events.filter { $0 == "terminate-B" }.count == 1)
   #expect(harness.candidateRunning)
   #expect(harness.activeConfiguration == "B")
+}
+
+@Test func runningChangedConfigurationRequiresReconnectBeforeTransition() {
+  #expect(
+    CoreActivationPolicy.disposition(wasRunning: true, configurationChanged: true)
+      == .reconnectRequired
+  )
+  #expect(
+    CoreActivationPolicy.disposition(wasRunning: true, configurationChanged: false)
+      == .activate
+  )
+  #expect(
+    CoreActivationPolicy.disposition(wasRunning: false, configurationChanged: true)
+      == .activate
+  )
+}
+
+private enum DeferredMarkerTestError: Error {
+  case invalidCandidate
+  case persistence
+  case coreStillRunning
+}
+
+@Test func deferredCandidatePersistsMarkerOnlyAfterValidationAndKeepsActiveState() throws {
+  var state = PersistentState()
+  let activeProfileID = UUID(uuidString: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")!
+  state.activeProfileID = activeProfileID
+  state.desiredRunning = true
+  let activeProfile = state.activeProfileID
+  var validationFinished = false
+  var persisted: [PersistentState] = []
+
+  let outcome = try DeferredRuntimeMarkerPolicy.deferValidatedCandidate(
+    validate: { validationFinished = true },
+    persistMarker: {
+      try DeferredRuntimeMarkerPolicy.persist(true, in: &state) { snapshot in
+        #expect(validationFinished)
+        persisted.append(snapshot)
+      }
+    }
+  )
+
+  #expect(outcome == .reconnectRequired)
+  #expect(state.activeProfileID == activeProfile)
+  #expect(state.desiredRunning)
+  #expect(state.deferredRuntimeApplyPending)
+  #expect(persisted.count == 1)
+  #expect(persisted.first?.deferredRuntimeApplyPending == true)
+  #expect(
+    DeferredRuntimeMarkerPolicy.outcome(
+      coreRunning: true,
+      marker: state.deferredRuntimeApplyPending
+    )
+      == .reconnectRequired
+  )
+
+  let reloaded = try JSONDecoder().decode(
+    PersistentState.self,
+    from: JSONEncoder().encode(persisted[0])
+  )
+  #expect(reloaded.deferredRuntimeApplyPending)
+  #expect(reloaded.activeProfileID == activeProfile)
+}
+
+@Test func invalidDeferredCandidateNeverPersistsMarker() {
+  var persistCalls = 0
+  var state = PersistentState()
+
+  #expect(throws: DeferredMarkerTestError.self) {
+    try DeferredRuntimeMarkerPolicy.deferValidatedCandidate(
+      validate: { throw DeferredMarkerTestError.invalidCandidate },
+      persistMarker: {
+        persistCalls += 1
+        try DeferredRuntimeMarkerPolicy.persist(true, in: &state) { _ in }
+      }
+    )
+  }
+
+  #expect(persistCalls == 0)
+  #expect(!state.deferredRuntimeApplyPending)
+}
+
+@Test func deferredMarkerPersistenceFailureDoesNotClaimReconnectRequired() {
+  var state = PersistentState()
+  var saveCalls = 0
+
+  #expect(throws: DeferredMarkerTestError.self) {
+    try DeferredRuntimeMarkerPolicy.persist(true, in: &state) { _ in
+      saveCalls += 1
+      throw DeferredMarkerTestError.persistence
+    }
+  }
+
+  #expect(saveCalls == 1)
+  #expect(!state.deferredRuntimeApplyPending)
+}
+
+@Test func revertingOrSuccessfullyReconnectingClearsDeferredMarker() throws {
+  var state = PersistentState()
+  state.deferredRuntimeApplyPending = true
+  var persisted: [PersistentState] = []
+
+  try DeferredRuntimeMarkerPolicy.persist(false, in: &state) { persisted.append($0) }
+  #expect(!state.deferredRuntimeApplyPending)
+  #expect(persisted.last?.deferredRuntimeApplyPending == false)
+  #expect(
+    DeferredRuntimeMarkerPolicy.outcome(
+      coreRunning: true,
+      marker: state.deferredRuntimeApplyPending
+    )
+      == .applied
+  )
+
+  state.deferredRuntimeApplyPending = true
+  var coreRunning = true
+  #expect(throws: DeferredMarkerTestError.self) {
+    guard !coreRunning else { throw DeferredMarkerTestError.coreStillRunning }
+    try DeferredRuntimeMarkerPolicy.persist(false, in: &state) { persisted.append($0) }
+  }
+  #expect(state.deferredRuntimeApplyPending)
+
+  // An explicit stop is proven before metadata is cleared.
+  coreRunning = false
+  try DeferredRuntimeMarkerPolicy.persist(false, in: &state) { persisted.append($0) }
+  #expect(!coreRunning)
+  #expect(!state.deferredRuntimeApplyPending)
+  #expect(
+    DeferredRuntimeMarkerPolicy.outcome(
+      coreRunning: true,
+      marker: state.deferredRuntimeApplyPending
+    )
+      == .applied
+  )
 }

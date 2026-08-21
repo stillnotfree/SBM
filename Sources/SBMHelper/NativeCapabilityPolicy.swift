@@ -4,7 +4,7 @@ import SBMShared
 /// Privileged native profiles are authorized against the exact bundled core.
 /// Updating sing-box requires reviewing this policy before native JSON is accepted.
 enum NativeCapabilityPolicy {
-  static let reviewedCoreVersion = "1.13.18"
+  static let reviewedCoreVersion = "1.13.19"
 
   static let dialKeys: Set<String> = [
     "detour", "bind_interface", "inet4_bind_address", "inet6_bind_address",

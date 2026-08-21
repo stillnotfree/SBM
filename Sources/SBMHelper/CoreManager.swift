@@ -86,6 +86,9 @@ struct PersistentState: Codable {
   var nodes: [ProxyNodeDescriptor] = []
   var desiredRunning = false
   var automaticRecoveryAttempted = false
+  /// Metadata only: the desired app configuration was validated but deferred
+  /// because a known-good core is still running with different bytes.
+  var deferredRuntimeApplyPending = false
   var localSOCKSEnabled = false
   var localSOCKSPort: UInt16 = 1082
   var latencyTestURL = LatencyTargetPolicy.defaultURL
@@ -102,6 +105,7 @@ struct PersistentState: Codable {
     case nodes
     case desiredRunning
     case automaticRecoveryAttempted
+    case deferredRuntimeApplyPending
     case localSOCKSEnabled
     case localSOCKSPort
     case latencyTestURL
@@ -110,7 +114,20 @@ struct PersistentState: Codable {
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    profile = try container.decodeIfPresent(CoreProfile.self, forKey: .profile)
+    if container.contains(.profile) {
+      do {
+        profile = try container.decode(CoreProfile.self, forKey: .profile)
+      } catch {
+        // Helper state can outlive the profile-library migration. Decode the
+        // released parallel-array shape only at this one-way boundary.
+        let legacy = try LegacyCoreProfileDTO(
+          from: container.superDecoder(forKey: .profile)
+        )
+        profile = legacy.currentProfile()
+      }
+    } else {
+      profile = nil
+    }
     activeProfileID = try container.decodeIfPresent(UUID.self, forKey: .activeProfileID)
     mode = try container.decodeIfPresent(RoutingMode.self, forKey: .mode) ?? .rule
     selectedNode =
@@ -143,6 +160,8 @@ struct PersistentState: Codable {
     desiredRunning = try container.decodeIfPresent(Bool.self, forKey: .desiredRunning) ?? false
     automaticRecoveryAttempted =
       try container.decodeIfPresent(Bool.self, forKey: .automaticRecoveryAttempted) ?? false
+    deferredRuntimeApplyPending =
+      try container.decodeIfPresent(Bool.self, forKey: .deferredRuntimeApplyPending) ?? false
     localSOCKSEnabled =
       try container.decodeIfPresent(Bool.self, forKey: .localSOCKSEnabled) ?? false
     localSOCKSPort =
@@ -158,6 +177,39 @@ struct PersistentState: Codable {
 
   mutating func setLatencyTestURL(_ value: String) throws {
     latencyTestURL = try LatencyTargetPolicy.normalized(value)
+  }
+}
+
+enum DeferredRuntimeMarkerPolicy {
+  static func deferValidatedCandidate(
+    validate: () throws -> Void,
+    persistMarker: () throws -> Void
+  ) throws -> HelperRuntimeOutcome {
+    try validate()
+    try persistMarker()
+    return .reconnectRequired
+  }
+
+  static func outcome(
+    coreRunning: Bool,
+    marker: Bool
+  ) -> HelperRuntimeOutcome {
+    coreRunning && marker ? .reconnectRequired : .applied
+  }
+
+  static func persist(
+    _ marker: Bool,
+    in state: inout PersistentState,
+    save: (PersistentState) throws -> Void
+  ) throws {
+    let previous = state
+    state.deferredRuntimeApplyPending = marker
+    do {
+      try save(state)
+    } catch {
+      state = previous
+      throw error
+    }
   }
 }
 
@@ -182,6 +234,20 @@ enum DesiredRuntimeRecoveryPolicy {
       return .disableDesiredState
     }
     return .attemptRecovery
+  }
+}
+
+enum CoreActivationDisposition: Equatable {
+  case activate
+  case reconnectRequired
+}
+
+enum CoreActivationPolicy {
+  static func disposition(
+    wasRunning: Bool,
+    configurationChanged: Bool
+  ) -> CoreActivationDisposition {
+    wasRunning && configurationChanged ? .reconnectRequired : .activate
   }
 }
 
@@ -330,14 +396,21 @@ final class CoreManager: @unchecked Sendable {
 
   func status(
     message: String = "Helper connected",
-    ruleSetMatches: [RuleSetMatch] = []
+    ruleSetMatches: [RuleSetMatch] = [],
+    runtimeOutcome: HelperRuntimeOutcome? = nil
   ) -> HelperResponse {
+    let effectiveRuntimeOutcome =
+      runtimeOutcome
+      ?? DeferredRuntimeMarkerPolicy.outcome(
+        coreRunning: isCoreRunning,
+        marker: state.deferredRuntimeApplyPending
+      )
     let recoveryExhausted = state.automaticRecoveryAttempted && !state.desiredRunning
     let effectiveMessage =
       bootstrapFailure.map { "Core bootstrap failed: \($0)" }
       ?? (recoveryExhausted
         ? "Automatic VPN recovery is exhausted; connect manually to retry"
-        : message)
+        : effectiveRuntimeOutcome.userMessage ?? message)
     return HelperResponse(
       success: bootstrapFailure == nil && !recoveryExhausted,
       coreRunning: isCoreRunning,
@@ -348,6 +421,7 @@ final class CoreManager: @unchecked Sendable {
       nodes: state.nodes,
       automaticRecoveryExhausted: recoveryExhausted,
       ruleSetMatches: ruleSetMatches,
+      runtimeOutcome: effectiveRuntimeOutcome,
       message: effectiveMessage
     )
   }
@@ -399,29 +473,30 @@ final class CoreManager: @unchecked Sendable {
     let previousState = state
     let wasRunning = isCoreRunning
     do {
+      var requestedState = previousState
       if let profile {
-        state.profile = profile
-        state.activeProfileID = profileID
+        requestedState.profile = profile
+        requestedState.activeProfileID = profileID
       }
       if let mode {
-        state.mode = mode
+        requestedState.mode = mode
       }
       if let selectedNode {
-        state.selectedNode = selectedNode
+        requestedState.selectedNode = selectedNode
       }
       if let localSOCKSEnabled {
-        state.localSOCKSEnabled = localSOCKSEnabled
+        requestedState.localSOCKSEnabled = localSOCKSEnabled
       }
       if let localSOCKSPort {
         guard (1024...65535).contains(Int(localSOCKSPort)), localSOCKSPort != 19090 else {
           throw CoreFailure.invalidProfile("The local SOCKS5 port is not allowed.")
         }
-        state.localSOCKSPort = localSOCKSPort
+        requestedState.localSOCKSPort = localSOCKSPort
       }
       if let normalizedLatencyTestURL {
-        state.latencyTestURL = normalizedLatencyTestURL
+        requestedState.latencyTestURL = normalizedLatencyTestURL
       }
-      guard let activeProfile = state.profile else {
+      guard let activeProfile = requestedState.profile else {
         throw CoreFailure.profileMissing
       }
 
@@ -429,17 +504,50 @@ final class CoreManager: @unchecked Sendable {
       let previousConfiguration = try configurationSnapshot()
       let preview = try configuration(
         profile: activeProfile,
-        apiSecret: state.apiSecret
+        apiSecret: requestedState.apiSecret,
+        state: requestedState
       )
       let configurationChanged = previousConfiguration != preview.data
 
+      let candidateSecret: String
+      switch CoreActivationPolicy.disposition(
+        wasRunning: wasRunning,
+        configurationChanged: configurationChanged
+      ) {
+      case .reconnectRequired:
+        let candidateSecret = Self.makeAPISecret()
+        let runtimeOutcome = try DeferredRuntimeMarkerPolicy.deferValidatedCandidate(
+          validate: { [self] in
+            _ = try validatedConfiguration(
+              profile: activeProfile,
+              apiSecret: candidateSecret,
+              state: requestedState
+            )
+          },
+          persistMarker: { [self] in
+            try persistDeferredRuntimeMarker(true)
+          }
+        )
+        runtimeLogger.notice(
+          "Changed runtime candidate validated; keeping known-good core active until reconnect"
+        )
+        return status(
+          message: runtimeOutcome.userMessage
+            ?? "Changes ready to apply",
+          runtimeOutcome: runtimeOutcome
+        )
+      case .activate:
+        candidateSecret = Self.makeAPISecret()
+      }
+
+      state = requestedState
+      state.deferredRuntimeApplyPending = false
       if isCoreRunning, !configurationChanged {
         state.desiredRunning = true
         state.automaticRecoveryAttempted = false
         try saveState()
         return status(message: "VPN already connected")
       }
-      let candidateSecret = Self.makeAPISecret()
       var knownGoodWasStopped = false
       let transaction = CoreActivationTransaction<BuiltConfiguration>(
         prepare: { [self] in
@@ -529,6 +637,7 @@ final class CoreManager: @unchecked Sendable {
     guard terminateCore(), !isCoreRunning else {
       throw CoreFailure.coreStopFailed
     }
+    try persistDeferredRuntimeMarker(false)
     return status(message: "VPN disconnected")
   }
 
@@ -586,9 +695,17 @@ final class CoreManager: @unchecked Sendable {
     return status(message: "Latency target updated")
   }
 
-  func testLatency() throws -> HelperResponse {
+  func testLatency(node requestedNode: ProxyNodeID? = nil) throws -> HelperResponse {
     guard isCoreRunning else { throw CoreFailure.coreNotRunning }
-    let descriptors = state.nodes
+    let descriptors: [ProxyNodeDescriptor]
+    if let requestedNode {
+      guard let descriptor = state.nodes.first(where: { $0.id == requestedNode }) else {
+        throw CoreFailure.invalidProfile("The requested latency node is not active.")
+      }
+      descriptors = [descriptor]
+    } else {
+      descriptors = state.nodes
+    }
     let results = DelayResults()
     let workerCount = min(8, descriptors.count)
     DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
@@ -1016,27 +1133,30 @@ final class CoreManager: @unchecked Sendable {
 
   private func validatedConfiguration(
     profile: CoreProfile,
-    apiSecret: String
+    apiSecret: String,
+    state runtimeState: PersistentState? = nil
   ) throws -> BuiltConfiguration {
-    let built = try configuration(profile: profile, apiSecret: apiSecret)
+    let built = try configuration(profile: profile, apiSecret: apiSecret, state: runtimeState)
     try validateConfiguration(built)
     return built
   }
 
   private func configuration(
     profile: CoreProfile,
-    apiSecret: String
+    apiSecret: String,
+    state runtimeState: PersistentState? = nil
   ) throws -> BuiltConfiguration {
+    let effectiveState = runtimeState ?? state
     let builder = ConfigBuilder(
       cachePath: cacheURL.path,
       apiSecret: apiSecret
     )
     return try builder.makeConfiguration(
       profile: profile,
-      mode: state.mode,
-      selectedNode: state.selectedNode,
-      localSOCKSPort: state.localSOCKSEnabled ? state.localSOCKSPort : nil,
-      latencyTestURL: state.latencyTestURL
+      mode: effectiveState.mode,
+      selectedNode: effectiveState.selectedNode,
+      localSOCKSPort: effectiveState.localSOCKSEnabled ? effectiveState.localSOCKSPort : nil,
+      latencyTestURL: effectiveState.latencyTestURL
     )
   }
 
@@ -1185,10 +1305,18 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
-  private func saveState() throws {
-    let data = try JSONEncoder().encode(state)
+  private func persistDeferredRuntimeMarker(_ marker: Bool) throws {
+    try DeferredRuntimeMarkerPolicy.persist(marker, in: &state) { snapshot in
+      try saveState(snapshot)
+    }
+  }
+
+  private func saveState(_ snapshot: PersistentState? = nil) throws {
+    let data = try JSONEncoder().encode(snapshot ?? state)
     try data.write(to: stateURL, options: .atomic)
     try secureFile(stateURL)
+    try synchronizeFile(stateURL)
+    try synchronizeSupportDirectory()
   }
 
   private func secureFile(_ url: URL) throws {

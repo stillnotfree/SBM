@@ -30,7 +30,10 @@ struct RuleSetCacheReader {
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
     let currentHeader = try handle.read(upToCount: pageSize * 2) ?? Data()
-    guard try selectedMetadata(in: currentHeader, pageSize: pageSize) == snapshotMeta else {
+    guard
+      try selectedMetadata(
+        in: currentHeader, pageSize: pageSize, databaseByteCount: snapshot.count) == snapshotMeta
+    else {
       throw RuleSetCacheFailure.invalidDatabase
     }
     return try content(in: snapshot, tag: tag)
@@ -65,8 +68,14 @@ struct RuleSetCacheReader {
     let transactionID: UInt64
   }
 
-  private static func selectedMetadata(in data: Data, pageSize: Int) throws -> Metadata {
-    let metas = [0, pageSize].compactMap { try? metadata(in: data, at: $0, pageSize: pageSize) }
+  private static func selectedMetadata(
+    in data: Data, pageSize: Int, databaseByteCount: Int? = nil
+  ) throws -> Metadata {
+    let databaseByteCount = databaseByteCount ?? data.count
+    let metas = [0, pageSize].compactMap {
+      try? metadata(
+        in: data, at: $0, pageSize: pageSize, databaseByteCount: databaseByteCount)
+    }
     guard let selected = metas.max(by: { $0.transactionID < $1.transactionID }) else {
       throw RuleSetCacheFailure.invalidDatabase
     }
@@ -86,9 +95,9 @@ struct RuleSetCacheReader {
     return pageSize
   }
 
-  private static func metadata(in data: Data, at pageOffset: Int, pageSize: Int) throws
-    -> Metadata
-  {
+  private static func metadata(
+    in data: Data, at pageOffset: Int, pageSize: Int, databaseByteCount: Int
+  ) throws -> Metadata {
     guard try unsigned64(data, at: pageOffset) <= 1,
       try unsigned16(data, at: pageOffset + 8) == 0x04,
       try unsigned32(data, at: pageOffset + pageHeaderSize) == 0xED0C_DAED,
@@ -104,7 +113,7 @@ struct RuleSetCacheReader {
     let rootPage = try unsigned64(data, at: pageOffset + pageHeaderSize + 16)
     let highWaterMark = try unsigned64(data, at: pageOffset + pageHeaderSize + 40)
     guard rootPage > 1, rootPage < highWaterMark,
-      rootPage <= UInt64(data.count / pageSize)
+      rootPage <= UInt64(databaseByteCount / pageSize)
     else { throw RuleSetCacheFailure.invalidDatabase }
     return Metadata(
       rootPage: rootPage,

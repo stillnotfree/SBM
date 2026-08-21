@@ -56,12 +56,29 @@ private struct SubscriptionOrigin: Equatable, Sendable {
   }
 }
 
+enum SubscriptionConnectionKind: String, Hashable, Sendable {
+  case vless = "VLESS"
+  case hysteria2 = "Hysteria2"
+  case shadowsocks = "Shadowsocks"
+}
+
 struct SubscriptionFetchResult: Sendable {
   let profile: CoreProfile
   let skippedTransports: [String: Int]
+  let skippedInvalidConnections: [SubscriptionConnectionKind: Int]
+
+  init(
+    profile: CoreProfile,
+    skippedTransports: [String: Int],
+    skippedInvalidConnections: [SubscriptionConnectionKind: Int] = [:]
+  ) {
+    self.profile = profile
+    self.skippedTransports = skippedTransports
+    self.skippedInvalidConnections = skippedInvalidConnections
+  }
 
   var warningDescription: String? {
-    guard !skippedTransports.isEmpty else { return nil }
+    guard !skippedTransports.isEmpty || !skippedInvalidConnections.isEmpty else { return nil }
     let importedCount: Int
     switch profile {
     case .compatibility(let profile):
@@ -69,13 +86,19 @@ struct SubscriptionFetchResult: Sendable {
     case .native:
       importedCount = 1
     }
-    let details = skippedTransports.keys.sorted().map { transport in
+    var details = skippedTransports.keys.sorted().map { transport in
       let count = skippedTransports[transport, default: 0]
-      return "\(count) \(transport.uppercased())"
-    }.joined(separator: ", ")
-    let skippedCount = skippedTransports.values.reduce(0, +)
+      return
+        "\(count) \(transport.uppercased()) connection\(count == 1 ? "" : "s") skipped (unsupported transport)"
+    }
+    details += skippedInvalidConnections.keys.sorted { $0.rawValue < $1.rawValue }.map { kind in
+      let count = skippedInvalidConnections[kind, default: 0]
+      return
+        "\(count) \(kind.rawValue) connection\(count == 1 ? "" : "s") skipped (invalid or unsupported)"
+    }
     return
-      "\(importedCount) connection\(importedCount == 1 ? "" : "s") imported; \(details) connection\(skippedCount == 1 ? "" : "s") skipped because sing-box does not support the transport"
+      "\(importedCount) connection\(importedCount == 1 ? "" : "s") imported; "
+      + details.joined(separator: "; ")
   }
 }
 
@@ -218,6 +241,19 @@ enum SubscriptionClient {
       .scheme?.lowercased() == "https"
   }
 
+  static func validateSourceValue(_ value: String) throws -> String {
+    let source = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !source.isEmpty, source.utf8.count <= 4096,
+      !source.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+    else { throw SubscriptionFailure.invalidURL }
+    if isDirectSource(source) { return source }
+    guard let url = URL(string: source),
+      url.scheme?.lowercased() == "https",
+      url.host != nil
+    else { throw SubscriptionFailure.invalidURL }
+    return source
+  }
+
   private static func isDirectSource(_ value: String) -> Bool {
     let lowercased = value.lowercased()
     return lowercased.hasPrefix("vless://")
@@ -266,34 +302,53 @@ enum SubscriptionClient {
       throw SubscriptionFailure.tooManyConnections
     }
 
-    var vlessProfiles: [VLESSProfile] = []
+    var connections: [ManagedConnection] = []
     var skippedTransports: [String: Int] = [:]
+    var skippedInvalidConnections: [SubscriptionConnectionKind: Int] = [:]
+    var firstFailure: SubscriptionFailure?
+
     for link in vlessLinks {
-      let transport = try vlessTransport(link)
-      guard transport == "tcp" else {
-        skippedTransports[transport, default: 0] += 1
-        continue
+      do {
+        let transport = try vlessTransport(link)
+        guard transport == "tcp" else {
+          skippedTransports[transport, default: 0] += 1
+          firstFailure = firstFailure ?? .unsupportedVLESSTransport(transport)
+          continue
+        }
+        connections.append(try parseVLESS(link))
+      } catch let error as SubscriptionFailure {
+        skippedInvalidConnections[.vless, default: 0] += 1
+        firstFailure = firstFailure ?? error
       }
-      vlessProfiles.append(try parseVLESS(link))
     }
-    let hysteriaProfiles = try hysteriaLinks.map(parseHysteria2)
-    let shadowsocksProfiles = try shadowsocksLinks.map(parseShadowsocks)
-    guard !vlessProfiles.isEmpty || !hysteriaProfiles.isEmpty || !shadowsocksProfiles.isEmpty else {
-      if let transport = skippedTransports.keys.sorted().first {
-        throw SubscriptionFailure.unsupportedVLESSTransport(transport)
+    for link in hysteriaLinks {
+      do {
+        connections.append(try parseHysteria2(link))
+      } catch let error as SubscriptionFailure {
+        skippedInvalidConnections[.hysteria2, default: 0] += 1
+        firstFailure = firstFailure ?? error
       }
-      throw SubscriptionFailure.missingProtocols
+    }
+    for link in shadowsocksLinks {
+      do {
+        connections.append(try parseShadowsocks(link))
+      } catch let error as SubscriptionFailure {
+        skippedInvalidConnections[.shadowsocks, default: 0] += 1
+        firstFailure = firstFailure ?? error
+      }
+    }
+    guard !connections.isEmpty else {
+      throw firstFailure ?? SubscriptionFailure.missingProtocols
     }
 
     return SubscriptionFetchResult(
       profile: .compatibility(
         VPNProfile(
-          connections: vlessProfiles.map { ManagedConnection(outbound: .vless($0)) }
-            + hysteriaProfiles.map { ManagedConnection(outbound: .hysteria2($0)) }
-            + shadowsocksProfiles.map { ManagedConnection(outbound: .shadowsocks($0)) }
+          connections: connections
         )
       ),
-      skippedTransports: skippedTransports
+      skippedTransports: skippedTransports,
+      skippedInvalidConnections: skippedInvalidConnections
     )
   }
 
@@ -309,7 +364,7 @@ enum SubscriptionClient {
     return decoded
   }
 
-  private static func parseVLESS(_ link: String) throws -> VLESSProfile {
+  private static func parseVLESS(_ link: String) throws -> ManagedConnection {
     guard let components = URLComponents(string: link),
       components.scheme?.lowercased() == "vless",
       let server = components.host,
@@ -350,15 +405,19 @@ enum SubscriptionClient {
     guard let port = UInt16(exactly: components.port ?? 443), port > 0 else {
       throw SubscriptionFailure.invalidVLESS
     }
-    return VLESSProfile(
-      server: server,
-      port: port,
-      uuid: uuid.lowercased(),
-      serverName: serverName,
-      fingerprint: fingerprint,
-      publicKey: publicKey,
-      shortID: shortID,
-      displayName: try displayName(components.fragment, fallback: "Reality")
+    return ManagedConnection(
+      displayName: try displayName(components.fragment, fallback: "Reality"),
+      outbound: .vless(
+        VLESSProfile(
+          server: server,
+          port: port,
+          uuid: uuid.lowercased(),
+          serverName: serverName,
+          fingerprint: fingerprint,
+          publicKey: publicKey,
+          shortID: shortID
+        )
+      )
     )
   }
 
@@ -432,22 +491,24 @@ enum SubscriptionClient {
       })
   }
 
-  private static func parseHysteria2(_ link: String) throws -> Hysteria2Profile {
+  private static func parseHysteria2(_ link: String) throws -> ManagedConnection {
     guard let components = URLComponents(string: link),
       ["hysteria2", "hy2"].contains(components.scheme?.lowercased() ?? ""),
       let server = components.host,
       let user = components.user
     else { throw SubscriptionFailure.invalidHysteria2 }
 
-    let query = queryMap(components.queryItems)
-    guard let serverName = query["sni"], !serverName.isEmpty else {
+    let query = try strictHysteria2Query(components.queryItems)
+    guard let serverName = query["sni"], validServerName(serverName) else {
       throw SubscriptionFailure.invalidHysteria2
     }
     let obfsPassword: String?
     switch (query["obfs"]?.lowercased(), query["obfs-password"]) {
-    case (nil, nil), ("", nil), (nil, ""):
+    case (nil, nil):
       obfsPassword = nil
-    case ("salamander", let password?) where !password.isEmpty:
+    case ("salamander", let password?)
+    where !password.isEmpty && password.utf8.count <= 1024
+      && !password.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }):
       obfsPassword = password
     default:
       throw SubscriptionFailure.invalidHysteria2
@@ -459,17 +520,41 @@ enum SubscriptionClient {
     } else {
       credential = user
     }
+    let decodedCredential = credential.removingPercentEncoding ?? credential
+    guard !decodedCredential.isEmpty, decodedCredential.utf8.count <= 1024,
+      !decodedCredential.unicodeScalars.contains(where: {
+        CharacterSet.controlCharacters.contains($0)
+      })
+    else { throw SubscriptionFailure.invalidHysteria2 }
     guard let port = UInt16(exactly: components.port ?? 443), port > 0 else {
       throw SubscriptionFailure.invalidHysteria2
     }
-    return Hysteria2Profile(
-      server: server,
-      port: port,
-      password: credential.removingPercentEncoding ?? credential,
-      serverName: serverName,
-      obfsPassword: obfsPassword,
-      displayName: try displayName(components.fragment, fallback: "Hysteria2")
+    return ManagedConnection(
+      displayName: try displayName(components.fragment, fallback: "Hysteria2"),
+      outbound: .hysteria2(
+        Hysteria2Profile(
+          server: server,
+          port: port,
+          password: decodedCredential,
+          serverName: serverName,
+          obfsPassword: obfsPassword
+        )
+      )
     )
+  }
+
+  private static func strictHysteria2Query(_ items: [URLQueryItem]?) throws -> [String: String] {
+    let allowed: Set<String> = ["sni", "obfs", "obfs-password"]
+    var result: [String: String] = [:]
+    var foldedNames: Set<String> = []
+    for item in items ?? [] {
+      let folded = item.name.lowercased()
+      guard item.name == folded, allowed.contains(item.name),
+        result[item.name] == nil, foldedNames.insert(folded).inserted
+      else { throw SubscriptionFailure.invalidHysteria2 }
+      result[item.name] = item.value ?? ""
+    }
+    return result
   }
 
   private static let shadowsocksMethods: Set<String> = [
@@ -483,7 +568,7 @@ enum SubscriptionClient {
 
   /// Strict SIP002 without plugin support. In particular, this deliberately
   /// rejects the pre-SIP002 whole-URI Base64 form and every query parameter.
-  private static func parseShadowsocks(_ link: String) throws -> ShadowsocksProfile {
+  private static func parseShadowsocks(_ link: String) throws -> ManagedConnection {
     guard link.utf8.count <= 4096,
       let components = URLComponents(string: link),
       components.scheme?.lowercased() == "ss",
@@ -534,12 +619,16 @@ enum SubscriptionClient {
       !(encoded && method.hasPrefix("2022-")),
       validShadowsocks2022PSK(method: method, password: password)
     else { throw SubscriptionFailure.invalidShadowsocks }
-    return ShadowsocksProfile(
-      server: host,
-      port: port,
-      method: method,
-      password: password,
-      displayName: try displayName(components.fragment, fallback: "Shadowsocks")
+    return ManagedConnection(
+      displayName: try displayName(components.fragment, fallback: "Shadowsocks"),
+      outbound: .shadowsocks(
+        ShadowsocksProfile(
+          server: host,
+          port: port,
+          method: method,
+          password: password
+        )
+      )
     )
   }
 
@@ -591,11 +680,6 @@ enum SubscriptionClient {
     return value
   }
 
-  private static func queryMap(_ items: [URLQueryItem]?) -> [String: String] {
-    (items ?? []).reduce(into: [:]) { result, item in
-      result[item.name.lowercased()] = item.value ?? ""
-    }
-  }
 }
 
 enum RoutingPolicyParser {

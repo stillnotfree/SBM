@@ -136,7 +136,7 @@ import Testing
   )
 }
 
-@Test func latencyTargetEditorUsesSeparateFlexibleFieldAndActionRows() throws {
+@Test func latencyTargetEditorUsesAlignedTargetRowAndSectionActions() throws {
   let packageRoot = URL(filePath: #filePath)
     .deletingLastPathComponent()
     .deletingLastPathComponent()
@@ -148,23 +148,20 @@ import Testing
     source.range(of: #"Section("Local SOCKS5")"#, range: latencyStart.upperBound..<source.endIndex)
   )
   let section = source[latencyStart.lowerBound..<latencyEnd.lowerBound]
-  let editorStart = try #require(section.range(of: "VStack(alignment: .leading, spacing: 8)"))
   let field = try #require(
-    section.range(
-      of: #"TextField("HTTPS test target", text: $model.latencyTestURLDraft)"#,
-      range: editorStart.upperBound..<section.endIndex
-    )
+    section.range(of: #"settingsRow("Test target")"#)
   )
   let actions = try #require(
     section.range(of: "HStack(spacing: 8)", range: field.upperBound..<section.endIndex)
   )
-  let fieldModifiers = section[field.upperBound..<actions.lowerBound]
+  let fieldRow = section[field.lowerBound..<actions.lowerBound]
   let actionRow = section[actions.lowerBound..<section.endIndex]
 
-  #expect(fieldModifiers.contains(".labelsHidden()"))
-  #expect(fieldModifiers.contains(".frame(maxWidth: .infinity)"))
+  #expect(fieldRow.contains(#"TextField("Test target", text: $model.latencyTestURLDraft)"#))
+  #expect(!section.contains("HTTPS test target"))
+  #expect(!section.contains("Ping target"))
   #expect(actionRow.contains(#"Button("Apply")"#))
-  #expect(actionRow.contains(#"Button("Reset to default")"#))
+  #expect(actionRow.contains(#"Button("Reset to Default")"#))
 }
 
 @Test @MainActor func applyConfirmationOnlyFollowsSuccessfulPersistence() throws {
@@ -187,7 +184,7 @@ import Testing
   )
 
   model.latencyTestURLDraft = "https://changed.example.test/check"
-  model.localSOCKSPort = 1083
+  model.localSOCKSPortDraft = 1083
   #expect(model.applyLatencyTestURL())
   #expect(savedLibraries.last?.latencyTestURL == "https://changed.example.test/check")
   #expect(model.applyLocalSOCKSSettings())
@@ -207,7 +204,7 @@ private enum ApplyConfirmationTestFailure: Error {
   case persistence
 }
 
-@Test func settingsUseOneImporterAndTransientSavedIndicatorsAndCurrentRoutingCopy() throws {
+@Test func settingsUseOneImporterAndNativePendingFeedbackAndCurrentRoutingCopy() throws {
   let packageRoot = URL(filePath: #filePath)
     .deletingLastPathComponent()
     .deletingLastPathComponent()
@@ -220,11 +217,14 @@ private enum ApplyConfirmationTestFailure: Error {
   #expect(source.contains(#"Button("Import Routing…")"#))
   #expect(source.contains(#"Button("Open Current…")"#))
   #expect(source.contains("model.openCurrentRoutingPolicy()"))
-  #expect(source.contains("@State private var latencySavedIndicatorVisible = false"))
-  #expect(source.contains("@State private var localSOCKSSavedIndicatorVisible = false"))
-  #expect(source.contains("if model.applyLatencyTestURL()"))
-  #expect(source.contains("if model.applyLocalSOCKSSettings()"))
-  #expect(source.components(separatedBy: "Task.sleep(for: .milliseconds(2_500))").count - 1 == 2)
+  #expect(source.contains("model.latencyApplyInProgress"))
+  #expect(source.contains("model.localSOCKSApplyInProgress"))
+  #expect(source.contains("if model.latencyApplyInProgress"))
+  #expect(source.contains("if model.localSOCKSApplyInProgress"))
+  #expect(source.contains("if model.canRetryLatencySynchronization"))
+  #expect(source.contains("if model.canRetryLocalSOCKSSynchronization"))
+  #expect(!source.contains("Saved"))
+  #expect(!source.contains("Task.sleep"))
 }
 
 @Test func currentRoutingCopyIsValidJSONWithPrivatePermissions() throws {

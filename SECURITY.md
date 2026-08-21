@@ -22,3 +22,17 @@ privileged helper, profile validation, updater, local control interface, and
 packaging are in scope.
 
 This project has not received an independent professional security audit.
+
+Website Routing accepts only bounded normalized hostnames (or unambiguous
+HTTP/HTTPS URLs without credentials), stores typed Proxy/Direct/Reject targets,
+and cannot inject arbitrary sing-box fields or outbound tags. Mandatory SBM
+safety rules remain above website and application routing.
+
+Diagnostics retains at most 50 recent errors. Errors are redacted before
+retention and again when text or JSON is copied; subscription URLs, sensitive
+headers, credentials, raw native JSON, profile bodies, helper secrets, and raw
+core logs are excluded. Diagnostics performs no DNS or network probes.
+Error history is byte-budgeted during export so current status is retained and
+truncation is explicit. An unreachable helper produces an unknown core state,
+not a claim that the privileged VPN core has stopped; termination remains
+fail-closed unless a stopped response is known.

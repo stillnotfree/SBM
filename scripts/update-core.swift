@@ -41,6 +41,8 @@ private enum UpdateCoreFailure: LocalizedError {
   case extractionFailed
   case architectureMismatch(String)
   case versionMismatch(String)
+  case invalidPinnedVersion
+  case downgradeRefused(pinned: String, fetched: String)
 
   var errorDescription: String? {
     switch self {
@@ -56,6 +58,10 @@ private enum UpdateCoreFailure: LocalizedError {
       "The extracted sing-box binary is not arm64: \(output)"
     case .versionMismatch(let output):
       "The extracted core reported an unexpected version: \(output)"
+    case .invalidPinnedVersion:
+      "Core.lock does not contain a valid stable CORE_VERSION."
+    case .downgradeRefused(let pinned, let fetched):
+      "Refusing to downgrade the pinned sing-box core from \(pinned) to \(fetched)."
     }
   }
 }
@@ -73,6 +79,7 @@ private enum UpdateCore {
     else {
       throw UpdateCoreFailure.wrongDirectory
     }
+    let pinnedVersion = try readPinnedVersion(from: root.appendingPathComponent("Core.lock"))
 
     var releaseRequest = URLRequest(
       url: URL(string: "https://api.github.com/repos/SagerNet/sing-box/releases/latest")!)
@@ -93,6 +100,18 @@ private enum UpdateCore {
       ? String(release.tagName.dropFirst()) : release.tagName
     guard !release.draft, !release.prerelease, isStableVersion(version) else {
       throw UpdateCoreFailure.invalidRelease
+    }
+    guard let versionComparison = compareStableVersions(version, pinnedVersion) else {
+      throw UpdateCoreFailure.invalidPinnedVersion
+    }
+    switch versionComparison {
+    case 0:
+      print("Pinned sing-box \(pinnedVersion) is already current.")
+      return
+    case let order where order < 0:
+      throw UpdateCoreFailure.downgradeRefused(pinned: pinnedVersion, fetched: version)
+    default:
+      break
     }
 
     let assetName = "sing-box-\(version)-darwin-arm64.tar.gz"
@@ -185,11 +204,42 @@ private enum UpdateCore {
   }
 
   private static func isStableVersion(_ value: String) -> Bool {
+    stableComponents(value) != nil
+  }
+
+  private static func stableComponents(_ value: String) -> [Int]? {
     let parts = value.split(separator: ".", omittingEmptySubsequences: false)
-    return parts.count == 3
-      && parts.allSatisfy { part in
-        !part.isEmpty && part.allSatisfy(\.isNumber)
-      }
+    guard parts.count == 3 else { return nil }
+    let values = parts.compactMap { part -> Int? in
+      guard !part.isEmpty,
+        part.unicodeScalars.allSatisfy({ (48...57).contains($0.value) })
+      else { return nil }
+      return Int(part)
+    }
+    return values.count == 3 ? values : nil
+  }
+
+  private static func compareStableVersions(_ lhs: String, _ rhs: String) -> Int? {
+    guard let left = stableComponents(lhs), let right = stableComponents(rhs) else { return nil }
+    for index in 0..<3 where left[index] != right[index] {
+      return left[index] < right[index] ? -1 : 1
+    }
+    return 0
+  }
+
+  private static func readPinnedVersion(from url: URL) throws -> String {
+    guard let contents = try? String(contentsOf: url, encoding: .utf8),
+      let line = contents.split(whereSeparator: \.isNewline).first(where: {
+        $0.trimmingCharacters(in: .whitespaces).hasPrefix("CORE_VERSION :=")
+      })
+    else {
+      throw UpdateCoreFailure.invalidPinnedVersion
+    }
+    let value = line
+      .replacingOccurrences(of: "CORE_VERSION :=", with: "")
+      .trimmingCharacters(in: .whitespaces)
+    guard isStableVersion(value) else { throw UpdateCoreFailure.invalidPinnedVersion }
+    return value
   }
 
   private static func sha256(of url: URL) throws -> String {
