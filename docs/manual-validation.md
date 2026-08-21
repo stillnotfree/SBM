@@ -136,4 +136,15 @@ a release blocker.
 | 18 | Disconnect cleanup | Managed IPv4/IPv6 routes and TUN removed |
 
 REAL-MAC LIVE IPv6 VALIDATION:
-NOT PERFORMED — CURRENT VPN MUST REMAIN ONLINE
+PARTIALLY PERFORMED
+
+Validated on an IPv4-only underlay:
+- installed helper revision 50 confirmed;
+- no physical IPv6 default route;
+- public IPv6 destination routed through the managed utun;
+- forced literal IPv6 rejected immediately before TLS ClientHello;
+- Chrome and Arc successfully fell back to IPv4 for ya.ru.
+
+The complete 18-item matrix, including a real dual-stack underlay, network
+transitions, sleep/wake, and physical-interface packet capture, has not been
+performed.
