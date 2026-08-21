@@ -57,7 +57,7 @@ private struct ReleasedV9VLESS: Decodable {
 
 @Test func currentIPCShapeRequiresTheNewProtocolBoundary() throws {
   #expect(HelperConstants.protocolVersion == 10)
-  #expect(HelperConstants.helperRevision == 48)
+  #expect(HelperConstants.helperRevision == 50)
 
   let profile = CoreProfile.compatibility(
     VPNProfile(

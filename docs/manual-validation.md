@@ -119,20 +119,20 @@ a release blocker.
 | 1 | TUN IPv4 and IPv6 addresses | Both managed addresses present |
 | 2 | IPv4 routes | Default capture through SBM while connected |
 | 3 | IPv6 routes | Default capture through SBM while connected |
-| 4 | Dual-stack hostname | Follows selected route; current DNS strategy is IPv4-only |
-| 5 | Literal public IPv6 | PROXIED except explicit Direct/Direct mode |
-| 6 | Forced IPv6 request | No unintended physical bypass |
-| 7 | Rule mode | Website/app/imported/final precedence preserved |
-| 8 | Global mode | PROXIED except mandatory safety behavior |
-| 9 | Direct mode | INTENTIONAL DIRECT through sing-box direct outbound |
+| 4 | Dual-stack hostname | IPv4 user traffic follows selected route; DNS strategy is IPv4-only |
+| 5 | Literal public IPv6 | BLOCKED/FAIL-CLOSED before traffic sniff |
+| 6 | Forced IPv6 request | Immediate local refusal; no unintended physical bypass |
+| 7 | Rule mode | IPv4 Website/app/imported/final precedence preserved |
+| 8 | Global mode | IPv4 PROXIED; IPv6 BLOCKED/FAIL-CLOSED |
+| 9 | Direct mode | IPv4 INTENTIONAL DIRECT; IPv6 BLOCKED/FAIL-CLOSED |
 | 10 | Compatibility profile | Same capture and mode semantics |
 | 11 | Native profile | Same app-owned TUN and safety semantics |
-| 12 | Website Proxy | PROXIED for apex and subdomain |
-| 13 | Website Direct | INTENTIONAL DIRECT |
+| 12 | Website Proxy | IPv4 PROXIED for apex and subdomain; IPv6 BLOCKED/FAIL-CLOSED |
+| 13 | Website Direct | IPv4 INTENTIONAL DIRECT; IPv6 BLOCKED/FAIL-CLOSED |
 | 14 | Website Reject | BLOCKED/FAIL-CLOSED |
-| 15 | Application Routing | Target policy applies to exact executable |
-| 16 | Wi-Fi/network transition | Re-converges without physical IPv6 bypass |
-| 17 | Sleep/wake | Re-converges without physical IPv6 bypass |
+| 15 | Application Routing | IPv4 target policy applies to exact executable; IPv6 blocked before app rule |
+| 16 | Wi-Fi/network transition | Re-converges without physical IPv6 bypass; IPv6 remains blocked |
+| 17 | Sleep/wake | Re-converges without physical IPv6 bypass; IPv6 remains blocked |
 | 18 | Disconnect cleanup | Managed IPv4/IPv6 routes and TUN removed |
 
 REAL-MAC LIVE IPv6 VALIDATION:

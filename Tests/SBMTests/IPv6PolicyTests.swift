@@ -80,10 +80,24 @@ private func ipv6NativeProfile() throws -> CoreProfile {
       #expect(addresses.contains("fdfe:dcba:9876::1/126"))
       #expect(tunnel["auto_route"] as? Bool == true)
       #expect(tunnel["strict_route"] as? Bool == true)
+      #expect(tunnel["stack"] as? String == "system")
 
       let dns = try #require(root["dns"] as? [String: Any])
       #expect(dns["strategy"] as? String == "ipv4_only")
       let route = try #require(root["route"] as? [String: Any])
+      let rules = try #require(route["rules"] as? [[String: Any]])
+      let ipv6RejectIndex = try #require(
+        rules.firstIndex {
+          ($0["ip_version"] as? Int) == 6
+            && ($0["action"] as? String) == "reject"
+        }
+      )
+      let sniffIndex = try #require(
+        rules.firstIndex { ($0["action"] as? String) == "sniff" }
+      )
+      #expect(ipv6RejectIndex < sniffIndex)
+      #expect(rules[ipv6RejectIndex]["outbound"] == nil)
+      #expect(rules[ipv6RejectIndex]["clash_mode"] == nil)
       #expect(route["final"] as? String == built.selectorTag)
 
       let configURL = temporary.appendingPathComponent("\(kind)-\(mode.rawValue).json")
@@ -103,13 +117,13 @@ private func ipv6NativeProfile() throws -> CoreProfile {
   }
 }
 
-@Test func literalIPv6AndWebsiteTargetsFollowIntentionalRoutePolicy() throws {
+@Test func literalIPv6IsRejectedBeforeWebsitePolicy() throws {
   for profile in [ipv6CompatibilityProfile(), try ipv6NativeProfile()] {
     let composed = try ComposedRoutingInspection.make(profile: profile)
     for (mode, expected) in [
-      (RoutingMode.rule, RoutingInspectionResult.Decision.vpn),
-      (.global, .vpn),
-      (.direct, .direct),
+      (RoutingMode.rule, RoutingInspectionResult.Decision.reject),
+      (.global, .reject),
+      (.direct, .reject),
     ] {
       let literal = RoutingInspector.inspect(
         route: composed.route,
@@ -120,13 +134,10 @@ private func ipv6NativeProfile() throws -> CoreProfile {
         selectorOutbound: composed.selectorOutbound
       )
       #expect(literal.decision == expected)
+      #expect(literal.ruleIndex == 0)
     }
 
-    for (domain, expected) in [
-      ("proxy.example", RoutingInspectionResult.Decision.vpn),
-      ("direct.example", .direct),
-      ("reject.example", .reject),
-    ] {
+    for domain in ["proxy.example", "direct.example", "reject.example"] {
       let website = RoutingInspector.inspect(
         route: composed.route,
         context: RoutingInspectionContext(
@@ -138,8 +149,8 @@ private func ipv6NativeProfile() throws -> CoreProfile {
         outboundDecisions: composed.outboundDecisions,
         selectorOutbound: composed.selectorOutbound
       )
-      #expect(website.decision == expected)
-      #expect(website.matchedRule?.contains("Website Routing") == true)
+      #expect(website.decision == .reject)
+      #expect(website.ruleIndex == 0)
     }
   }
 }

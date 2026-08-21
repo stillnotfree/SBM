@@ -4,7 +4,7 @@ import Foundation
 public enum HelperConstants {
   public static let protocolVersion = 10
   public static let helperVersion = "1.1.3"
-  public static let helperRevision = 48
+  public static let helperRevision = 50
   public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.sock"
   public static let daemonPlistName = "com.stillnotfree.sbm.helper.plist"
 }

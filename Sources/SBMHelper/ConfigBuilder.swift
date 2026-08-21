@@ -137,6 +137,7 @@ struct ConfigBuilder {
       "auto_detect_interface": true,
       "default_domain_resolver": "dns-local",
       "rules": [
+        ["ip_version": 6, "action": "reject"],
         ["action": "sniff"],
         ["protocol": "dns", "action": "hijack-dns"],
         [

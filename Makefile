@@ -2,7 +2,7 @@ SHELL := /bin/zsh
 
 APP_NAME := SBM
 BUNDLE_NAME := SBM
-APP_VERSION := 1.1.13
+APP_VERSION := 1.1.14
 include Core.lock
 CORE_ARCHIVE := .vendor/sing-box-$(CORE_VERSION)-darwin-arm64.tar.gz
 CORE_UPSTREAM_BINARY := .vendor/sing-box-upstream

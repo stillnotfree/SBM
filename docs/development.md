@@ -106,6 +106,6 @@ Advance `HelperConstants.helperRevision` monotonically whenever privileged
 helper behavior or shared request/profile semantics change. Readiness, approval
 continuation, repair, validation, and runtime-send paths must all reject the
 previous revision before runtime use. The current source uses IPC protocol 10
-and helper revision 48. Protocol 10 is an intentional compatibility boundary
+and helper revision 50. Protocol 10 is an intentional compatibility boundary
 for the current request/response and managed-connection shape; use a
 revision-only gate only when the existing IPC shape remains compatible.

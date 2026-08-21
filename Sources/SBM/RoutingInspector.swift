@@ -761,6 +761,7 @@ struct ComposedRoutingInspection {
     directOutbound: String
   ) -> [[String: Any]] {
     [
+      ["ip_version": 6, "action": "reject"],
       ["action": "sniff"],
       ["protocol": "dns", "action": "hijack-dns"],
       [

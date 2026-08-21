@@ -26,7 +26,7 @@
 > audit.
 
 Unless a feature is explicitly stated in release notes, this README describes
-the current source tree and does not assert its availability in the v1.1.11
+the current source tree and does not assert its availability in the v1.1.14
 release.
 
 ## Highlights
@@ -42,6 +42,7 @@ release.
 - Native sing-box JSON profiles for protocols not represented by compact links.
 - Always-available diagnostics with 50 bounded, deduplicated, redacted recent errors.
 - No system-proxy mode, dashboard, traffic statistics, telemetry, or access logging.
+- IPv4 user-traffic policy: IPv6 stays captured by the managed TUN and is rejected locally before traffic sniffing.
 
 ## Install
 
@@ -205,14 +206,15 @@ the previous working configuration and core.
 In Rule mode, imported DNS servers and routing rules remain authoritative below
 SBM's mandatory and first-class routing layers. The
 imported `route.final` is replaced by the menu-controlled selector, so unmatched
-traffic follows the server selected in SBM. The generated TUN has IPv4 and IPv6
-addresses with `auto_route` and `strict_route`; literal IPv6 follows the same
-Proxy/Direct/Reject route policy, while hostname DNS remains intentionally
-`ipv4_only`. Direct mode and explicit Direct rules use sing-box's direct
-outbound intentionally rather than physical traffic escaping the TUN. The Direct and Global modes temporarily prepend app-owned DNS
-and route overrides;
-switching back to Rule restores the profile's policy without rewriting the
-source profile.
+traffic follows the server selected in SBM. The generated TUN retains IPv4 and
+IPv6 addresses with `auto_route` and `strict_route`, but SBM currently routes
+user traffic over IPv4: IPv6 is captured by the managed TUN and rejected locally
+before the unconditional traffic sniff. This avoids physical IPv6 bypass and
+unreliable Direct behavior; it is not complete IPv6 support. Hostname DNS
+remains intentionally `ipv4_only`, and IPv4 Direct/Proxy/Global semantics are
+unchanged. The Direct and Global modes temporarily prepend app-owned DNS and
+route overrides; switching back to Rule restores the profile's policy without
+rewriting the source profile.
 
 The root helper accepts commands only from local administrator accounts. It
 validates and constrains imported profiles before starting the bundled root-owned
@@ -252,7 +254,7 @@ Before packaging a proposed release, run the local, non-publishing gate with the
 version already set in the repository metadata, for example:
 
 ```sh
-make release-check TAG=v1.1.13
+make release-check TAG=v1.1.14
 ```
 
 It checks release metadata and local verification commands, then builds and
@@ -330,7 +332,7 @@ update.
 
 ## Current status
 
-Version 1.1.13 bundles the pinned stable sing-box 1.13.19 core and is not an
+Version 1.1.14 bundles the pinned stable sing-box 1.13.19 core and is not an
 independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
 REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are

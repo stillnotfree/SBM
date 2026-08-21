@@ -219,10 +219,12 @@ profiles without expanding their capability allowlist.
 
 Both composers replace imported inbounds with a dual-stack TUN using
 `auto_route` and `strict_route`. Hostname DNS remains `ipv4_only`; literal IPv6
-is still captured and follows mode, website, application, imported, and final
-route policy. Direct mode and explicit Direct rules intentionally select the
-direct outbound. Real route-table and physical-bypass behavior requires the
-separate real-Mac validation matrix and is not established by config tests.
+is captured by the managed TUN and rejected locally before the unconditional
+traffic sniff. This prevents physical IPv6 bypass and unreliable Direct
+behavior. It is an intentional IPv4 user-traffic policy, not complete IPv6
+support; IPv4 Direct, Proxy, and Global semantics remain unchanged. Real
+route-table behavior still requires the separate real-Mac validation matrix and
+is not established by config tests.
 
 New subscription sources reproduce the exact `User-Agent`, `X-App-Version`, and
 `X-Device-OS` client-identification fields from a user-captured Happ 5.4.0 iOS
@@ -267,7 +269,7 @@ existing verified replacement flow only when the installed helper is not
 current. Approval is never inferred from elapsed time or process existence.
 Every privileged-helper behavior or shared semantic change advances the
 monotonic helper revision. This build requires IPC protocol 10 and helper
-revision 48 and rejects the previous protocol/revision boundary before runtime
+revision 50 and rejects the previous protocol/revision boundary before runtime
 use.
 
 ## Update model

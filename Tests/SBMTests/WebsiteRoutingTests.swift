@@ -154,8 +154,7 @@ private func websiteTestConnection() -> ManagedConnection {
       selectorOutbound: composed.selectorOutbound
     )
     #expect(result.decision == .indeterminate)
-    #expect(result.fallback?.decision == .vpn)
-    #expect(result.fallback?.matchedRule.contains("Website Routing") == true)
+    #expect(result.fallback == nil)
   }
 }
 

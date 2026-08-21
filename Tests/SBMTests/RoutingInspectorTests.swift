@@ -211,7 +211,7 @@ private actor FailingRuleSetMatcher {
   #expect(special.decision == .vpn)
   #expect(unresolved.decision == .indeterminate)
   #expect(unresolved.uncertaintyReason?.contains("geosite-category-ru") == true)
-  #expect(unresolved.ruleIndex == 7)
+  #expect(unresolved.ruleIndex == 8)
   #expect(unresolved.fallback?.decision == .vpn)
   #expect(unresolved.fallback?.matchedRule == "Final route")
 }
@@ -275,9 +275,9 @@ private actor FailingRuleSetMatcher {
   )
 
   #expect(defaultResult.decision == .direct)
-  #expect(defaultResult.ruleIndex == 7)
+  #expect(defaultResult.ruleIndex == 8)
   #expect(applicationResult.decision == .vpn)
-  #expect(applicationResult.ruleIndex == 5)
+  #expect(applicationResult.ruleIndex == 6)
 }
 
 @Test func defaultTrafficSkipsApplicationRuleAndUsesDeterministicFinal() throws {
@@ -383,7 +383,7 @@ private actor FailingRuleSetMatcher {
   #expect(composed.presentation(for: result) == "REJECT\nMatched: Transmission")
   #expect(
     composed.details(for: result, contextLabel: "Transmission")
-      == "Traffic from: Transmission\nRule: 6")
+      == "Traffic from: Transmission\nRule: 7")
 }
 
 @Test func routingInspectorViewUsesPromptAndUncompressedExplainControl() throws {
@@ -447,7 +447,7 @@ private actor FailingRuleSetMatcher {
   #expect(saves == saveCount)
   #expect(
     model.routingInspectorOutput
-      == "Depends on resolved IP\nOtherwise: PROXY · Auto · Final route"
+      == "Depends on resolved IP"
   )
   #expect(model.routingInspectorDetails.contains("Traffic from: Default traffic"))
   await runtime.complete(profileID: profileID)
@@ -514,7 +514,7 @@ private actor FailingRuleSetMatcher {
   #expect(model.selectedNodeID == .auto)
   #expect(
     model.routingInspectorOutput
-      == "Depends on resolved IP\nOtherwise: PROXY · Auto · Final route"
+      == "Depends on resolved IP"
   )
 }
 

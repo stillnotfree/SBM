@@ -454,7 +454,7 @@ private func waitForRequestCount(
   model.inspectRouting()
   #expect(model.desiredRuntimeGeneration == generationDuringApply)
   #expect(await sender.requestCount() == 1)
-  #expect(model.routingInspectorOutput.contains("DIRECT"))
+  #expect(model.routingInspectorOutput == "Depends on resolved IP")
   #expect(model.routingInspectorDetails.contains("Traffic from: Browser"))
 
   model.setApplicationRoutingTarget(applicationRule.id, target: .selectedProxy)
