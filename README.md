@@ -28,12 +28,22 @@
 
 ## Screenshots
 
+<p align="center">
+  <img src="docs/menu.png" width="62%" alt="SBM menu bar menu">
+</p>
+
+<details>
+<summary><strong>More screenshots</strong></summary>
+
+<br>
+
 <div align="center">
-  <img src="docs/menu.png" width="48%" alt="SBM menu bar menu">
   <img src="docs/settings-profiles.png" width="48%" alt="SBM profile settings">
   <img src="docs/settings-routing.png" width="48%" alt="SBM routing settings">
   <img src="docs/settings-advanced.png" width="48%" alt="SBM advanced settings">
 </div>
+
+</details>
 
 > **Development disclosure:** this project was vibe-coded and generated
 > primarily by an AI coding agent (OpenAI Codex), under human direction,

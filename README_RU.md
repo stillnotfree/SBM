@@ -28,12 +28,22 @@
 
 ## Скриншоты
 
+<p align="center">
+  <img src="docs/menu.png" width="62%" alt="Меню SBM в строке меню">
+</p>
+
+<details>
+<summary><strong>Другие скриншоты</strong></summary>
+
+<br>
+
 <div align="center">
-  <img src="docs/menu.png" width="48%" alt="Меню SBM в строке меню">
   <img src="docs/settings-profiles.png" width="48%" alt="Настройки профилей SBM">
   <img src="docs/settings-routing.png" width="48%" alt="Настройки маршрутизации SBM">
   <img src="docs/settings-advanced.png" width="48%" alt="Расширенные настройки SBM">
 </div>
+
+</details>
 
 > **О разработке:** проект преимущественно создан ИИ-агентом OpenAI Codex под
 > руководством человека, с последующим тестированием и проверкой. Независимый

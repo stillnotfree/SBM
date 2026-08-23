@@ -27,12 +27,22 @@
 
 ## 截图
 
+<p align="center">
+  <img src="docs/menu.png" width="62%" alt="SBM 菜单栏菜单">
+</p>
+
+<details>
+<summary><strong>更多截图</strong></summary>
+
+<br>
+
 <div align="center">
-  <img src="docs/menu.png" width="48%" alt="SBM 菜单栏菜单">
   <img src="docs/settings-profiles.png" width="48%" alt="SBM 配置文件设置">
   <img src="docs/settings-routing.png" width="48%" alt="SBM 路由设置">
   <img src="docs/settings-advanced.png" width="48%" alt="SBM 高级设置">
 </div>
+
+</details>
 
 > **开发说明：** 本项目主要由 OpenAI Codex AI 编程代理在人工指导下生成，
 > 并经过人工审查和测试。项目没有接受独立的专业安全审计。
