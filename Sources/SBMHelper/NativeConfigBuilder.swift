@@ -10,7 +10,8 @@ struct NativeConfigurationComposer {
     mode: RoutingMode,
     selectedNode: ProxyNodeID,
     localSOCKSPort: UInt16? = nil,
-    latencyTestURL: String = LatencyTargetPolicy.defaultURL
+    latencyTestURL: String = LatencyTargetPolicy.defaultURL,
+    ipv6Enabled: Bool = false
   ) throws -> BuiltConfiguration {
     let latencyTestURL = try LatencyTargetPolicy.normalized(latencyTestURL)
     try NativeCapabilityPolicy.requireReviewedCore()
@@ -164,7 +165,11 @@ struct NativeConfigurationComposer {
       proxyOutbound: selectorTag
     )
     rules.insert(
-      contentsOf: managedRouteRules(selectorTag: selectorTag, directTag: directTag)
+      contentsOf: managedRouteRules(
+        selectorTag: selectorTag,
+        directTag: directTag,
+        ipv6Enabled: ipv6Enabled
+      )
         + websiteRules + applicationRules,
       at: 0
     )
@@ -178,7 +183,8 @@ struct NativeConfigurationComposer {
     let dns = try composeDNS(
       imported: source["dns"] as? [String: Any],
       selectorTag: selectorTag,
-      websiteRules: profile.websiteRoutingRules
+      websiteRules: profile.websiteRoutingRules,
+      ipv6Enabled: ipv6Enabled
     )
     if source["dns"] == nil, route["default_domain_resolver"] == nil {
       route["default_domain_resolver"] = "sbm-dns-local"
@@ -644,9 +650,12 @@ struct NativeConfigurationComposer {
     ])
   }
 
-  private func managedRouteRules(selectorTag: String, directTag: String) -> [[String: Any]] {
-    [
-      ["ip_version": 6, "action": "reject"],
+  private func managedRouteRules(
+    selectorTag: String,
+    directTag: String,
+    ipv6Enabled: Bool
+  ) -> [[String: Any]] {
+    var rules: [[String: Any]] = [
       ["action": "sniff"],
       ["protocol": "dns", "action": "hijack-dns"],
       [
@@ -665,13 +674,18 @@ struct NativeConfigurationComposer {
         "outbound": directTag,
       ],
     ]
+    if !ipv6Enabled {
+      rules.insert(["ip_version": 6, "action": "reject"], at: 0)
+    }
+    return rules
   }
 
   private func managedDNS(
     selectorTag: String,
-    websiteRules: [WebsiteRoutingRule]
+    websiteRules: [WebsiteRoutingRule],
+    ipv6Enabled: Bool
   ) -> [String: Any] {
-    [
+    var dns: [String: Any] = [
       "servers": [
         ["type": "local", "tag": "sbm-dns-local"],
         [
@@ -697,20 +711,30 @@ struct NativeConfigurationComposer {
           server: "sbm-dns-local"
         ) + [["action": "route", "server": "sbm-dns-remote"]],
       "final": "sbm-dns-remote",
-      "strategy": "ipv4_only",
       "cache_capacity": 4096,
     ]
+    if !ipv6Enabled {
+      dns["strategy"] = "ipv4_only"
+    }
+    return dns
   }
 
   private func composeDNS(
     imported: [String: Any]?,
     selectorTag: String,
-    websiteRules: [WebsiteRoutingRule]
+    websiteRules: [WebsiteRoutingRule],
+    ipv6Enabled: Bool
   ) throws -> [String: Any] {
     guard var dns = imported else {
-      return managedDNS(selectorTag: selectorTag, websiteRules: websiteRules)
+      return managedDNS(
+        selectorTag: selectorTag,
+        websiteRules: websiteRules,
+        ipv6Enabled: ipv6Enabled
+      )
     }
-    dns["strategy"] = "ipv4_only"
+    if !ipv6Enabled {
+      dns["strategy"] = "ipv4_only"
+    }
     guard var servers = dns["servers"] as? [[String: Any]], !servers.isEmpty else {
       throw CoreFailure.invalidProfile("The imported DNS configuration has no servers.")
     }

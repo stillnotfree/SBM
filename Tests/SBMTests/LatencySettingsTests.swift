@@ -219,11 +219,15 @@ private enum ApplyConfirmationTestFailure: Error {
   #expect(source.contains("model.openCurrentRoutingPolicy()"))
   #expect(source.contains("model.latencyApplyInProgress"))
   #expect(source.contains("model.localSOCKSApplyInProgress"))
-  #expect(source.contains("if model.latencyApplyInProgress"))
-  #expect(source.contains("if model.localSOCKSApplyInProgress"))
+  #expect(source.contains("applyProgress(model.latencyApplyInProgress)"))
+  #expect(source.contains("applyProgress(model.localSOCKSApplyInProgress)"))
+  #expect(source.contains(".frame(width: 16, height: 16)"))
+  #expect(source.contains(".accessibilityHidden(!isVisible)"))
+  #expect(!source.contains("if model.latencyApplyInProgress { ProgressView()"))
+  #expect(!source.contains("if model.localSOCKSApplyInProgress { ProgressView()"))
   #expect(source.contains("if model.canRetryLatencySynchronization"))
   #expect(source.contains("if model.canRetryLocalSOCKSSynchronization"))
-  #expect(!source.contains("Saved"))
+  #expect(source.contains("Saved; reconnect to apply"))
   #expect(!source.contains("Task.sleep"))
 }
 

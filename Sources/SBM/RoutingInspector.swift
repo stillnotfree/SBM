@@ -25,12 +25,95 @@ struct RoutingInspectionResult: Equatable, Sendable {
     let outboundTag: String?
   }
 
+  struct Alternative: Equatable, Sendable {
+    let decision: Decision
+    let condition: String
+    let matchedRule: String?
+    let outboundTag: String?
+    let ruleIndex: Int?
+  }
+
   let decision: Decision
   let matchedRule: String?
   let uncertaintyReason: String?
   let outboundTag: String?
   let ruleIndex: Int?
   let fallback: Fallback?
+  let alternatives: [Alternative]
+  let collapsedPathCount: Int
+  let analysisLimited: Bool
+
+  init(
+    decision: Decision,
+    matchedRule: String?,
+    uncertaintyReason: String?,
+    outboundTag: String?,
+    ruleIndex: Int?,
+    fallback: Fallback?,
+    alternatives: [Alternative] = [],
+    collapsedPathCount: Int = 0,
+    analysisLimited: Bool = false
+  ) {
+    self.decision = decision
+    self.matchedRule = matchedRule
+    self.uncertaintyReason = uncertaintyReason
+    self.outboundTag = outboundTag
+    self.ruleIndex = ruleIndex
+    self.fallback = fallback
+    self.alternatives = alternatives
+    self.collapsedPathCount = collapsedPathCount
+    self.analysisLimited = analysisLimited
+  }
+}
+
+struct RoutingInspectionSnapshot: Equatable, Sendable {
+  let profileID: UUID?
+  let profileRevision: Date?
+  let applicationID: UUID?
+  let applicationPath: String?
+  let destination: String
+  let selectedNodeID: ProxyNodeID
+  let mode: RoutingMode
+  let routingRevision: UInt64
+  let ipv6Enabled: Bool
+  let activeProfileID: UUID?
+  let coreRunning: Bool
+  let helperRevision: Int?
+}
+
+enum RoutingInspectorState: Equatable, Sendable {
+  case idle
+  case checking(snapshot: RoutingInspectionSnapshot, details: String)
+  case result(snapshot: RoutingInspectionSnapshot, output: String, details: String)
+  case failed(snapshot: RoutingInspectionSnapshot, output: String, details: String)
+
+  static let idleOutput = SBMText.localized(
+    "Enter a domain or IP address to explain traffic routing."
+  )
+
+  var snapshot: RoutingInspectionSnapshot? {
+    switch self {
+    case .idle: nil
+    case .checking(let snapshot, _), .result(let snapshot, _, _), .failed(let snapshot, _, _):
+      snapshot
+    }
+  }
+
+  var output: String {
+    switch self {
+    case .idle: Self.idleOutput
+    case .checking: SBMText.localized("Checking active rule sets…")
+    case .result(_, let output, _), .failed(_, let output, _): output
+    }
+  }
+
+  var details: String {
+    switch self {
+    case .idle: ""
+    case .checking(_, let details), .result(_, _, let details), .failed(_, _, let details):
+      details
+    }
+  }
 }
 
 struct RoutingInspectionContext: Equatable, Sendable {
@@ -66,8 +149,363 @@ enum RoutingInspector {
   private enum Match {
     case yes
     case no
-    case unknown(String)
+    case unknown(reason: String, predicate: SymbolicPredicate?)
   }
+
+  private indirect enum SymbolicPredicate: Hashable {
+    case ipVersion([Int])
+    case ipIsPrivate(Bool)
+    case ipCIDR([String])
+    case negated(SymbolicPredicate)
+  }
+
+  private struct SymbolicContext: Hashable {
+    enum AddressFamily: Hashable {
+      case unknown
+      case ipv4
+      case ipv6
+    }
+
+    enum Privacy: Hashable {
+      case unknown
+      case `private`
+      case `public`
+    }
+
+    struct Branch {
+      let context: SymbolicContext
+      let condition: String
+    }
+
+    private struct CIDR: Hashable {
+      let family: Int
+      let bytes: [UInt8]
+      let prefix: Int
+      let rawValue: String
+
+      init?(_ value: String) {
+        let pieces = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard pieces.count == 2,
+          let address = IPAddress.parse(String(pieces[0])),
+          let prefix = Int(pieces[1]),
+          (0...address.bytes.count * 8).contains(prefix)
+        else { return nil }
+
+        var bytes = address.bytes
+        let completeBytes = prefix / 8
+        let remainingBits = prefix % 8
+        if remainingBits > 0 {
+          let mask = UInt8(truncatingIfNeeded: 0xFF << (8 - remainingBits))
+          bytes[completeBytes] &= mask
+          if completeBytes + 1 < bytes.count {
+            for index in (completeBytes + 1)..<bytes.count { bytes[index] = 0 }
+          }
+        } else if completeBytes < bytes.count {
+          for index in completeBytes..<bytes.count { bytes[index] = 0 }
+        }
+        family = address.version
+        self.bytes = bytes
+        self.prefix = prefix
+        rawValue = value
+      }
+
+      func contains(_ other: CIDR) -> Bool {
+        guard family == other.family, prefix <= other.prefix else { return false }
+        let completeBytes = prefix / 8
+        guard bytes.prefix(completeBytes) == other.bytes.prefix(completeBytes) else {
+          return false
+        }
+        let remainingBits = prefix % 8
+        guard remainingBits > 0 else { return true }
+        let mask = UInt8(truncatingIfNeeded: 0xFF << (8 - remainingBits))
+        return bytes[completeBytes] & mask == other.bytes[completeBytes] & mask
+      }
+
+      func isSubset(of other: CIDR) -> Bool {
+        other.contains(self)
+      }
+
+      func isDisjoint(with other: CIDR) -> Bool {
+        guard family == other.family else { return true }
+        return !contains(other) && !other.contains(self)
+      }
+    }
+
+    var addressFamily: AddressFamily
+    var privacy: Privacy
+    var predicateFacts: [SymbolicPredicate: Bool]
+    private var includedCIDRs: [CIDR]
+    private var excludedCIDRs: [CIDR]
+
+    init(context: RoutingInspectionContext) {
+      if let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) {
+        addressFamily = address.version == 4 ? .ipv4 : .ipv6
+        privacy = address.isPrivate ? .private : .public
+      } else {
+        addressFamily = .unknown
+        privacy = .unknown
+      }
+      predicateFacts = [:]
+      includedCIDRs = []
+      excludedCIDRs = []
+    }
+
+    func knownValue(for predicate: SymbolicPredicate) -> Bool? {
+      if let fact = predicateFacts[predicate] { return fact }
+      switch predicate {
+      case .ipVersion(let values):
+        guard values.allSatisfy({ $0 == 4 || $0 == 6 }) else { return nil }
+        switch addressFamily {
+        case .ipv4: return values.contains(4)
+        case .ipv6: return values.contains(6)
+        case .unknown: return nil
+        }
+      case .ipIsPrivate(let expected):
+        switch privacy {
+        case .private: return expected
+        case .public: return !expected
+        case .unknown: return nil
+        }
+      case .ipCIDR(let values):
+        let cidrs = values.compactMap(CIDR.init)
+        guard cidrs.count == values.count, !cidrs.isEmpty else { return nil }
+        let facts = cidrs.map(membership(of:))
+        if facts.contains(true) { return true }
+        if facts.allSatisfy({ $0 == false }) { return false }
+        return nil
+      case .negated(let predicate):
+        return knownValue(for: predicate).map { !$0 }
+      }
+    }
+
+    func branches(for predicate: SymbolicPredicate) -> [Branch] {
+      switch predicate {
+      case .ipVersion(let values):
+        let valid = Set(values.filter { $0 == 4 || $0 == 6 })
+        guard !valid.isEmpty else { return [] }
+        var branches: [Branch] = []
+        if valid.contains(4), let context = applying(predicate, matches: true, family: .ipv4) {
+          branches.append(
+            Branch(context: context, condition: SBMText.localized("IPv4"))
+          )
+        }
+        if valid.contains(6), let context = applying(predicate, matches: true, family: .ipv6) {
+          branches.append(
+            Branch(context: context, condition: SBMText.localized("IPv6"))
+          )
+        }
+        if !valid.contains(4), let context = applying(predicate, matches: false, family: .ipv4) {
+          branches.append(
+            Branch(context: context, condition: SBMText.localized("IPv4"))
+          )
+        }
+        if !valid.contains(6), let context = applying(predicate, matches: false, family: .ipv6) {
+          branches.append(
+            Branch(context: context, condition: SBMText.localized("IPv6"))
+          )
+        }
+        return unique(branches)
+      case .ipIsPrivate:
+        return [true, false].compactMap { matches in
+          applying(predicate, matches: matches).map {
+            Branch(context: $0, condition: condition(for: predicate, matches: matches))
+          }
+        }
+      case .ipCIDR(let values):
+        let valid = values.compactMap(CIDR.init)
+        guard valid.count == values.count, !valid.isEmpty else { return [] }
+        var branches: [Branch] = valid.compactMap { cidr in
+          applying(.ipCIDR([cidr.rawValue]), matches: true).map {
+            Branch(
+              context: $0,
+              condition: condition(
+                for: .ipCIDR([cidr.rawValue]),
+                matches: true
+              )
+            )
+          }
+        }
+        if let context = applying(predicate, matches: false) {
+          branches.append(
+            Branch(context: context, condition: condition(for: predicate, matches: false))
+          )
+        }
+        return unique(branches)
+      case .negated(let predicate):
+        return branches(for: predicate).map { branch in
+          let matches = branch.context.knownValue(for: .negated(predicate)) ?? true
+          return Branch(
+            context: branch.context,
+            condition: condition(for: .negated(predicate), matches: matches)
+          )
+        }
+      }
+    }
+
+    private func applying(
+      _ predicate: SymbolicPredicate,
+      matches: Bool,
+      family: AddressFamily? = nil
+    ) -> SymbolicContext? {
+      var copy = self
+      if let existing = copy.predicateFacts[predicate], existing != matches { return nil }
+      copy.predicateFacts[predicate] = matches
+      if let family, !copy.setFamily(family) { return nil }
+      switch predicate {
+      case .ipVersion(let values):
+        let valid = Set(values.filter { $0 == 4 || $0 == 6 })
+        let possible = matches ? valid : Set([4, 6]).subtracting(valid)
+        guard !possible.isEmpty else { return nil }
+        if addressFamily != .unknown {
+          let current = addressFamily == .ipv4 ? 4 : 6
+          guard possible.contains(current) else { return nil }
+        }
+        if possible.count == 1, let version = possible.first {
+          if !copy.setFamily(version == 4 ? .ipv4 : .ipv6) { return nil }
+        }
+      case .ipIsPrivate(let expected):
+        let privacy: Privacy = (matches == expected) ? .private : .public
+        if !copy.setPrivacy(privacy) { return nil }
+      case .ipCIDR(let values):
+        let cidrs = values.compactMap(CIDR.init)
+        guard cidrs.count == values.count, !cidrs.isEmpty else { return nil }
+        if matches {
+          guard cidrs.count == 1, copy.addIncluded(cidrs[0]) else { return nil }
+        } else {
+          for cidr in cidrs {
+            guard copy.addExcluded(cidr) else { return nil }
+          }
+        }
+      case .negated:
+        // Inverted predicates reuse the underlying predicate's branches.  The
+        // branch context already records whether the underlying condition
+        // matched, and knownValue(for:) supplies the inverted result.
+        return copy
+      }
+      return copy
+    }
+
+    private mutating func setFamily(_ family: AddressFamily) -> Bool {
+      switch (addressFamily, family) {
+      case (.unknown, _):
+        addressFamily = family
+        return true
+      case (let existing, _) where existing == family:
+        return true
+      default:
+        return false
+      }
+    }
+
+    private mutating func setPrivacy(_ value: Privacy) -> Bool {
+      switch (privacy, value) {
+      case (.unknown, _):
+        privacy = value
+        return true
+      case (let existing, _) where existing == value:
+        return true
+      default:
+        return false
+      }
+    }
+
+    private static let privateCIDRs: [CIDR] = [
+      "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+      "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+    ].compactMap(CIDR.init)
+
+    private func membership(of cidr: CIDR) -> Bool? {
+      if addressFamily != .unknown {
+        let current = addressFamily == .ipv4 ? 4 : 6
+        if current != cidr.family { return false }
+      }
+      if includedCIDRs.contains(where: { $0.isSubset(of: cidr) }) { return true }
+      if includedCIDRs.contains(where: { $0.isDisjoint(with: cidr) }) { return false }
+      if excludedCIDRs.contains(where: { cidr.isSubset(of: $0) }) { return false }
+      return nil
+    }
+
+    private mutating func addIncluded(_ cidr: CIDR) -> Bool {
+      let family: AddressFamily = cidr.family == 4 ? .ipv4 : .ipv6
+      guard setFamily(family), !includedCIDRs.contains(where: { $0.isDisjoint(with: cidr) }),
+        !excludedCIDRs.contains(where: { cidr.isSubset(of: $0) })
+      else { return false }
+      includedCIDRs.append(cidr)
+      if let impliedPrivacy = impliedPrivacy(for: cidr), !setPrivacy(impliedPrivacy) {
+        return false
+      }
+      return true
+    }
+
+    private mutating func addExcluded(_ cidr: CIDR) -> Bool {
+      guard !includedCIDRs.contains(where: { $0.isSubset(of: cidr) }) else { return false }
+      excludedCIDRs.append(cidr)
+      return true
+    }
+
+    private func impliedPrivacy(for cidr: CIDR) -> Privacy? {
+      let sameFamily = Self.privateCIDRs.filter { $0.family == cidr.family }
+      if sameFamily.contains(where: { $0.contains(cidr) }) { return .private }
+      if sameFamily.allSatisfy({ $0.isDisjoint(with: cidr) }) { return .public }
+      return nil
+    }
+
+    private func unique(_ branches: [Branch]) -> [Branch] {
+      var seen = Set<SymbolicContext>()
+      return branches.filter { seen.insert($0.context).inserted }
+    }
+
+    private func condition(for predicate: SymbolicPredicate, matches: Bool) -> String {
+      switch predicate {
+      case .ipVersion(let values):
+        let valid = values.filter { $0 == 4 || $0 == 6 }
+        let selected = matches ? valid : [4, 6].filter { !valid.contains($0) }
+        return selected.map { "IPv\($0)" }.joined(separator: " / ")
+      case .ipIsPrivate(let expected):
+        let isPrivate = matches == expected
+        return SBMText.localized(isPrivate ? "Private address" : "Public address")
+      case .ipCIDR(let values):
+        let cidrs = values.joined(separator: ", ")
+        return SBMText.format(
+          matches ? "IP matches %@" : "IP does not match %@",
+          cidrs
+        )
+      case .negated(let predicate):
+        return condition(for: predicate, matches: !matches)
+      }
+    }
+  }
+
+  private struct Path {
+    let ruleIndex: Int
+    let symbolic: SymbolicContext
+    let conditions: [String]
+  }
+
+  private struct TerminalOutcome {
+    let result: RoutingInspectionResult
+    let conditions: [String]
+  }
+
+  private struct EffectiveOutcome: Hashable {
+    let decision: RoutingInspectionResult.Decision
+    let outboundTag: String?
+
+    init(_ result: RoutingInspectionResult) {
+      decision = result.decision
+      outboundTag = result.decision == .vpn ? result.outboundTag : nil
+    }
+  }
+
+  private struct Evaluation {
+    let outcomes: [TerminalOutcome]
+    let limited: Bool
+    let uncertaintyReason: String?
+    let uncertaintyRuleIndex: Int?
+    let fallback: RoutingInspectionResult.Fallback?
+  }
+
+  private static let symbolicPathLimit = 32
 
   private static let runtimeDependentKeys: Set<String> = [
     "auth_user", "client", "network", "package_name", "port", "port_range", "process_name",
@@ -89,34 +527,198 @@ enum RoutingInspector {
     ruleSetMatches: [String: Bool] = [:]
   ) -> RoutingInspectionResult {
     let rules = route["rules"] as? [[String: Any]] ?? []
-    return inspect(
+    let evaluation = evaluate(
       rules: rules,
       final: route["final"] as? String,
       startingAt: 0,
       context: context,
       outboundDecisions: outboundDecisions,
-      selectorOutbound: selectorOutbound,
-      ruleSetMatches: ruleSetMatches,
-      includeFallback: true
+      ruleSetMatches: ruleSetMatches
     )
+    return summarize(evaluation)
   }
 
-  private static func inspect(
+  private struct PathKey: Hashable {
+    let ruleIndex: Int
+    let symbolic: SymbolicContext
+  }
+
+  private static func evaluate(
     rules: [[String: Any]],
     final: String?,
     startingAt startIndex: Int,
     context: RoutingInspectionContext,
     outboundDecisions: [String: RoutingInspectionResult.Decision],
-    selectorOutbound: String,
-    ruleSetMatches: [String: Bool],
-    includeFallback: Bool
-  ) -> RoutingInspectionResult {
-    for index in startIndex..<rules.count {
+    ruleSetMatches: [String: Bool]
+  ) -> Evaluation {
+    var pending = [
+      Path(
+        ruleIndex: startIndex,
+        symbolic: SymbolicContext(context: context),
+        conditions: []
+      )
+    ]
+    var seen = Set<PathKey>()
+    var outcomes: [TerminalOutcome] = []
+    var limited = false
+    var uncertaintyReason: String?
+    var uncertaintyRuleIndex: Int?
+    var fallback: RoutingInspectionResult.Fallback?
+
+    while let path = pending.popLast() {
+      guard seen.insert(PathKey(ruleIndex: path.ruleIndex, symbolic: path.symbolic)).inserted
+      else { continue }
+      var index = path.ruleIndex
+      var terminated = false
+
+      while index < rules.count {
+        let rule = rules[index]
+        guard isTerminal(rule) else {
+          index += 1
+          continue
+        }
+        switch match(
+          rule,
+          context: context,
+          symbolic: path.symbolic,
+          ruleSetMatches: ruleSetMatches
+        ) {
+        case .no:
+          index += 1
+        case .yes:
+          outcomes.append(
+            TerminalOutcome(
+              result: decision(
+                for: rule,
+                index: index,
+                context: context,
+                outboundDecisions: outboundDecisions,
+                ruleSetMatches: ruleSetMatches
+              ),
+              conditions: path.conditions
+            )
+          )
+          terminated = true
+        case .unknown(let reason, let predicate):
+          if let predicate {
+            uncertaintyReason = uncertaintyReason ?? reason
+            uncertaintyRuleIndex = uncertaintyRuleIndex ?? index
+            let branches = path.symbolic.branches(for: predicate)
+            guard !branches.isEmpty else {
+              index += 1
+              continue
+            }
+            guard outcomes.count + pending.count + branches.count <= symbolicPathLimit else {
+              limited = true
+              terminated = true
+              break
+            }
+            for branch in branches.reversed() {
+              pending.append(
+                Path(
+                  ruleIndex: index,
+                  symbolic: branch.context,
+                  conditions: path.conditions + [branch.condition]
+                )
+              )
+            }
+            terminated = true
+          } else {
+            uncertaintyReason =
+              uncertaintyReason
+              ?? SBMText.format(
+                "Rule %lld may match, but %@.",
+                index + 1,
+                reason
+              )
+            uncertaintyRuleIndex = uncertaintyRuleIndex ?? index
+            let laterResult = deterministicContinuation(
+              rules: rules,
+              final: final,
+              startingAt: index + 1,
+              context: context,
+              symbolic: path.symbolic,
+              outboundDecisions: outboundDecisions,
+              ruleSetMatches: ruleSetMatches
+            )
+            if fallback == nil, let later = laterResult, later.decision != .indeterminate {
+              fallback = RoutingInspectionResult.Fallback(
+                decision: later.decision,
+                matchedRule: later.matchedRule ?? SBMText.localized("A later route"),
+                outboundTag: later.outboundTag
+              )
+            }
+            guard outcomes.count + pending.count + 2 <= symbolicPathLimit else {
+              limited = true
+              terminated = true
+              break
+            }
+            outcomes.append(
+              TerminalOutcome(
+                result: decision(
+                  for: rule,
+                  index: index,
+                  context: context,
+                  outboundDecisions: outboundDecisions,
+                  ruleSetMatches: ruleSetMatches
+                ),
+                conditions: path.conditions + [SBMText.localized("Condition matches")]
+              )
+            )
+            pending.append(
+              Path(
+                ruleIndex: index + 1,
+                symbolic: path.symbolic,
+                conditions: path.conditions + [SBMText.localized("Condition does not match")]
+              )
+            )
+            terminated = true
+          }
+        }
+        if terminated { break }
+      }
+
+      guard !terminated else { continue }
+      outcomes.append(
+        TerminalOutcome(
+          result: finalResult(final: final, outboundDecisions: outboundDecisions),
+          conditions: path.conditions
+        )
+      )
+    }
+    return Evaluation(
+      outcomes: outcomes,
+      limited: limited,
+      uncertaintyReason: uncertaintyReason,
+      uncertaintyRuleIndex: uncertaintyRuleIndex,
+      fallback: fallback
+    )
+  }
+
+  private static func deterministicContinuation(
+    rules: [[String: Any]],
+    final: String?,
+    startingAt startIndex: Int,
+    context: RoutingInspectionContext,
+    symbolic: SymbolicContext,
+    outboundDecisions: [String: RoutingInspectionResult.Decision],
+    ruleSetMatches: [String: Bool]
+  ) -> RoutingInspectionResult? {
+    var index = startIndex
+    while index < rules.count {
       let rule = rules[index]
-      guard isTerminal(rule) else { continue }
-      switch match(rule, context: context, ruleSetMatches: ruleSetMatches) {
-      case .no:
+      guard isTerminal(rule) else {
+        index += 1
         continue
+      }
+      switch match(
+        rule,
+        context: context,
+        symbolic: symbolic,
+        ruleSetMatches: ruleSetMatches
+      ) {
+      case .no:
+        index += 1
       case .yes:
         return decision(
           for: rule,
@@ -125,36 +727,17 @@ enum RoutingInspector {
           outboundDecisions: outboundDecisions,
           ruleSetMatches: ruleSetMatches
         )
-      case .unknown(let reason):
-        let laterResult = inspect(
-          rules: rules,
-          final: final,
-          startingAt: index + 1,
-          context: context,
-          outboundDecisions: outboundDecisions,
-          selectorOutbound: selectorOutbound,
-          ruleSetMatches: ruleSetMatches,
-          includeFallback: false
-        )
-        let fallback: RoutingInspectionResult.Fallback? =
-          includeFallback && laterResult.decision != .indeterminate
-          ? RoutingInspectionResult.Fallback(
-            decision: laterResult.decision,
-            matchedRule: laterResult.matchedRule ?? "A later route",
-            outboundTag: laterResult.outboundTag
-          )
-          : nil
-        return RoutingInspectionResult(
-          decision: .indeterminate,
-          matchedRule: nil,
-          uncertaintyReason: "Rule \(index + 1) may match, but \(reason).",
-          outboundTag: nil,
-          ruleIndex: index,
-          fallback: fallback
-        )
+      case .unknown:
+        return nil
       }
     }
+    return finalResult(final: final, outboundDecisions: outboundDecisions)
+  }
 
+  private static func finalResult(
+    final: String?,
+    outboundDecisions: [String: RoutingInspectionResult.Decision]
+  ) -> RoutingInspectionResult {
     guard let final else {
       return RoutingInspectionResult(
         decision: .indeterminate,
@@ -177,12 +760,122 @@ enum RoutingInspector {
     }
     return RoutingInspectionResult(
       decision: finalDecision,
-      matchedRule: "Final route",
+      matchedRule: SBMText.localized("Final route"),
       uncertaintyReason: nil,
       outboundTag: final,
       ruleIndex: nil,
       fallback: nil
     )
+  }
+
+  private static func summarize(_ evaluation: Evaluation) -> RoutingInspectionResult {
+    if evaluation.limited {
+      return RoutingInspectionResult(
+        decision: .indeterminate,
+        matchedRule: nil,
+        uncertaintyReason: "routing analysis exceeded the supported complexity limit",
+        outboundTag: nil,
+        ruleIndex: nil,
+        fallback: nil,
+        analysisLimited: true
+      )
+    }
+    guard !evaluation.outcomes.isEmpty else {
+      return RoutingInspectionResult(
+        decision: .indeterminate,
+        matchedRule: nil,
+        uncertaintyReason: "the composed route has no feasible symbolic path",
+        outboundTag: nil,
+        ruleIndex: nil,
+        fallback: nil
+      )
+    }
+    let uncertain = evaluation.outcomes.filter { $0.result.decision == .indeterminate }
+    let certain = evaluation.outcomes.filter { $0.result.decision != .indeterminate }
+    if !uncertain.isEmpty {
+      let first = uncertain[0].result
+      let alternatives = makeAlternatives(from: certain)
+      guard !alternatives.isEmpty else { return first }
+      return RoutingInspectionResult(
+        decision: .indeterminate,
+        matchedRule: nil,
+        uncertaintyReason:
+          first.uncertaintyReason
+          ?? normalizedUncertaintyReason(evaluation.uncertaintyReason),
+        outboundTag: nil,
+        ruleIndex: first.ruleIndex ?? evaluation.uncertaintyRuleIndex,
+        fallback: first.fallback ?? evaluation.fallback,
+        alternatives: alternatives
+      )
+    }
+
+    let outcomes = Set(evaluation.outcomes.map { EffectiveOutcome($0.result) })
+    if outcomes.count == 1, let effective = outcomes.first {
+      let decision = effective.decision
+      let matchedRules = Set(evaluation.outcomes.compactMap { $0.result.matchedRule })
+      let outbounds = Set(evaluation.outcomes.compactMap { $0.result.outboundTag })
+      let ruleIndexes = Set(evaluation.outcomes.compactMap { $0.result.ruleIndex })
+      return RoutingInspectionResult(
+        decision: decision,
+        matchedRule: matchedRules.count == 1
+          ? matchedRules.first
+          : SBMText.localized("Multiple routing paths"),
+        uncertaintyReason: nil,
+        outboundTag: outbounds.count == 1 ? outbounds.first : nil,
+        ruleIndex: ruleIndexes.count == 1 ? ruleIndexes.first : nil,
+        fallback: nil,
+        collapsedPathCount: evaluation.outcomes.count > 1 ? evaluation.outcomes.count : 0
+      )
+    }
+
+    return RoutingInspectionResult(
+      decision: .indeterminate,
+      matchedRule: nil,
+      uncertaintyReason: normalizedUncertaintyReason(evaluation.uncertaintyReason),
+      outboundTag: nil,
+      ruleIndex: evaluation.uncertaintyRuleIndex,
+      fallback: evaluation.fallback,
+      alternatives: makeAlternatives(from: evaluation.outcomes)
+    )
+  }
+
+  private static func normalizedUncertaintyReason(_ reason: String?) -> String {
+    guard let reason else { return "routing result depends on unresolved IP conditions" }
+    if reason == "the resolved destination IP" {
+      return "routing result depends on unresolved IP conditions"
+    }
+    return reason
+  }
+
+  private static func makeAlternatives(
+    from outcomes: [TerminalOutcome]
+  ) -> [RoutingInspectionResult.Alternative] {
+    var order: [EffectiveOutcome] = []
+    var grouped: [EffectiveOutcome: [TerminalOutcome]] = [:]
+    for outcome in outcomes {
+      guard outcome.result.decision != .indeterminate else { continue }
+      let effective = EffectiveOutcome(outcome.result)
+      if grouped[effective] == nil { order.append(effective) }
+      grouped[effective, default: []].append(outcome)
+    }
+    return order.compactMap { effective in
+      guard let values = grouped[effective], !values.isEmpty else { return nil }
+      let pathConditions = values.map { value in
+        let condition = value.conditions.joined(separator: " + ")
+        return condition.isEmpty ? SBMText.localized("Possible route") : condition
+      }
+      let conditions = Array(Set(pathConditions)).sorted().joined(separator: " / ")
+      let matchedRules = Set(values.compactMap { $0.result.matchedRule })
+      let outbounds = Set(values.compactMap { $0.result.outboundTag })
+      let indexes = Set(values.compactMap { $0.result.ruleIndex })
+      return RoutingInspectionResult.Alternative(
+        decision: effective.decision,
+        condition: conditions,
+        matchedRule: matchedRules.count == 1 ? matchedRules.first : nil,
+        outboundTag: outbounds.count == 1 ? outbounds.first : nil,
+        ruleIndex: indexes.count == 1 ? indexes.first : nil
+      )
+    }
   }
 
   static func parseInput(
@@ -304,7 +997,8 @@ enum RoutingInspector {
           return values.first(where: ip.matches(cidr:)) ?? first
         }
         if key == "rule_set" {
-          return values.first(where: { ruleSetMatches[$0] == true }) ?? "Configured rule-set"
+          return values.first(where: { ruleSetMatches[$0] == true })
+            ?? SBMText.localized("Configured rule-set")
         }
         if key == "process_path" {
           return URL(fileURLWithPath: first).lastPathComponent
@@ -316,7 +1010,9 @@ enum RoutingInspector {
       return key
     }
     let summary =
-      descriptions.isEmpty ? "Rule \(index + 1)" : descriptions.joined(separator: " + ")
+      descriptions.isEmpty
+      ? SBMText.format("Rule %lld", index + 1)
+      : descriptions.joined(separator: " + ")
     if let stage = rule["_sbm_stage"] as? String {
       return "\(stage): \(summary)"
     }
@@ -326,87 +1022,132 @@ enum RoutingInspector {
   private static func match(
     _ rule: [String: Any],
     context: RoutingInspectionContext,
+    symbolic: SymbolicContext,
     ruleSetMatches: [String: Bool]
   ) -> Match {
     let base: Match
     if (rule["type"] as? String) == "logical" {
-      base = matchLogical(rule, context: context, ruleSetMatches: ruleSetMatches)
+      base = matchLogical(
+        rule,
+        context: context,
+        symbolic: symbolic,
+        ruleSetMatches: ruleSetMatches
+      )
     } else {
-      base = matchFlat(rule, context: context, ruleSetMatches: ruleSetMatches)
+      base = matchFlat(
+        rule,
+        context: context,
+        symbolic: symbolic,
+        ruleSetMatches: ruleSetMatches
+      )
     }
     guard (rule["invert"] as? Bool) == true else { return base }
     return switch base {
     case .yes: .no
     case .no: .yes
-    case .unknown(let reason): .unknown(reason)
+    case .unknown(let reason, let predicate): .unknown(reason: reason, predicate: predicate)
     }
   }
 
   private static func matchLogical(
     _ rule: [String: Any],
     context: RoutingInspectionContext,
+    symbolic: SymbolicContext,
     ruleSetMatches: [String: Bool]
   ) -> Match {
     guard let mode = rule["mode"] as? String,
       ["and", "or"].contains(mode),
       let children = rule["rules"] as? [[String: Any]],
       !children.isEmpty
-    else { return .unknown("a malformed logical rule") }
+    else { return .unknown(reason: "a malformed logical rule", predicate: nil) }
 
     var unknownReason: String?
+    var unknownPredicate: SymbolicPredicate?
     for child in children {
-      switch match(child, context: context, ruleSetMatches: ruleSetMatches) {
+      switch match(
+        child,
+        context: context,
+        symbolic: symbolic,
+        ruleSetMatches: ruleSetMatches
+      ) {
       case .yes where mode == "or": return .yes
       case .no where mode == "and": return .no
-      case .unknown(let reason): unknownReason = unknownReason ?? reason
+      case .unknown(let reason, let predicate):
+        unknownReason = unknownReason ?? reason
+        unknownPredicate = unknownPredicate ?? predicate
       default: break
       }
     }
-    if let unknownReason { return .unknown(unknownReason) }
+    if let unknownReason {
+      return .unknown(reason: unknownReason, predicate: unknownPredicate)
+    }
     return mode == "and" ? .yes : .no
   }
 
   private static func matchFlat(
     _ rule: [String: Any],
     context: RoutingInspectionContext,
+    symbolic: SymbolicContext,
     ruleSetMatches: [String: Bool]
   ) -> Match {
     let structuralKeys: Set<String> = [
       "action", "outbound", "invert", "type", "mode", "rules", "_sbm_stage",
     ]
     let destinationKeys = destinationAddressKeys.filter { rule[$0] != nil }.sorted()
-    let destinationMatch = matchAny(keys: destinationKeys, rule: rule, context: context)
+    let destinationMatch = matchAny(
+      keys: destinationKeys,
+      rule: rule,
+      context: context,
+      symbolic: symbolic
+    )
     var unknownReason: String?
+    var unknownPredicate: SymbolicPredicate?
     for key in rule.keys.sorted()
     where !structuralKeys.contains(key)
       && !destinationAddressKeys.contains(key)
       && key != "rule_set"
       && key != "rule_set_ip_cidr_match_source"
     {
-      let result = matchCondition(key: key, value: rule[key] as Any, context: context)
+      let result = matchCondition(
+        key: key,
+        value: rule[key] as Any,
+        context: context,
+        symbolic: symbolic
+      )
       switch result {
       case .no: return .no
-      case .unknown(let reason): unknownReason = unknownReason ?? reason
+      case .unknown(let reason, let predicate):
+        unknownReason = unknownReason ?? reason
+        unknownPredicate = unknownPredicate ?? predicate
       case .yes: break
       }
     }
     if let ruleSets = rule["rule_set"] {
       let tags = stringValues(ruleSets)
-      guard !tags.isEmpty else { return .unknown("the rule-set condition is invalid") }
+      guard !tags.isEmpty else {
+        return .unknown(reason: "the rule-set condition is invalid", predicate: nil)
+      }
       if tags.contains(where: { ruleSetMatches[$0] == true }) {
         // A rule-set is an OR group, combined with the outer conditions above.
       } else if tags.allSatisfy({ ruleSetMatches[$0] == false }) {
         return .no
       } else {
-        return .unknown("the active rule-set cache is required for \(quotedList(tags))")
+        return .unknown(
+          reason: "the active rule-set cache is required for \(quotedList(tags))",
+          predicate: nil
+        )
       }
     }
     switch destinationMatch {
     case .no: return .no
-    case .unknown(let reason): unknownReason = unknownReason ?? reason
+    case .unknown(let reason, let predicate):
+      unknownReason = unknownReason ?? reason
+      unknownPredicate = unknownPredicate ?? predicate
     case .yes: break
     }
-    return unknownReason.map(Match.unknown) ?? .yes
+    return unknownReason.map {
+      .unknown(reason: $0, predicate: unknownPredicate)
+    } ?? .yes
   }
 
   static func referencedRuleSetTags(in route: [String: Any]) -> [String] {
@@ -432,48 +1173,76 @@ enum RoutingInspector {
   }
 
   private static func matchAny(
-    keys: [String], rule: [String: Any], context: RoutingInspectionContext
+    keys: [String],
+    rule: [String: Any],
+    context: RoutingInspectionContext,
+    symbolic: SymbolicContext
   ) -> Match {
     guard !keys.isEmpty else { return .yes }
     var unknownReason: String?
+    var unknownPredicate: SymbolicPredicate?
     for key in keys {
-      switch matchCondition(key: key, value: rule[key] as Any, context: context) {
+      switch matchCondition(
+        key: key,
+        value: rule[key] as Any,
+        context: context,
+        symbolic: symbolic
+      ) {
       case .yes: return .yes
-      case .unknown(let reason): unknownReason = unknownReason ?? reason
+      case .unknown(let reason, let predicate):
+        unknownReason = unknownReason ?? reason
+        unknownPredicate = unknownPredicate ?? predicate
       case .no: break
       }
     }
-    return unknownReason.map(Match.unknown) ?? .no
+    return unknownReason.map {
+      .unknown(reason: $0, predicate: unknownPredicate)
+    } ?? .no
   }
 
   private static func matchCondition(
     key: String,
     value: Any,
-    context: RoutingInspectionContext
+    context: RoutingInspectionContext,
+    symbolic: SymbolicContext
   ) -> Match {
     switch key {
     case "process_path":
       let paths = Set(
         stringValues(value).map { URL(fileURLWithPath: $0).standardizedFileURL.path })
-      guard !paths.isEmpty else { return .unknown("the process path condition is invalid") }
+      guard !paths.isEmpty else {
+        return .unknown(reason: "the process path condition is invalid", predicate: nil)
+      }
       if let applicationPath = context.applicationPath {
         return paths.contains(applicationPath) ? .yes : .no
       }
       if paths.isSubset(of: context.defaultApplicationPaths) { return .no }
-      return .unknown("select an application to evaluate the process path condition")
+      return .unknown(
+        reason: "select an application to evaluate the process path condition",
+        predicate: nil
+      )
     case "process_name":
       guard let applicationPath = context.applicationPath else {
-        return .unknown("select an application to evaluate the process name condition")
+        return .unknown(
+          reason: "select an application to evaluate the process name condition",
+          predicate: nil
+        )
       }
       return stringValues(value).contains(URL(fileURLWithPath: applicationPath).lastPathComponent)
         ? .yes : .no
     case "process_path_regex":
       guard let applicationPath = context.applicationPath else {
-        return .unknown("select an application to evaluate the process path condition")
+        return .unknown(
+          reason: "select an application to evaluate the process path condition",
+          predicate: nil
+        )
       }
       for pattern in stringValues(value) {
         guard let expression = try? NSRegularExpression(pattern: pattern) else {
-          return .unknown("the process path regular expression is invalid")
+          return .unknown(
+            reason: "the process path regular expression is invalid",
+            predicate: nil
+          )
         }
         let range = NSRange(
           applicationPath.startIndex..<applicationPath.endIndex, in: applicationPath)
@@ -483,12 +1252,16 @@ enum RoutingInspector {
     default:
       break
     }
-    if runtimeDependentKeys.contains(key) { return .unknown(runtimeReason(for: key)) }
+    if runtimeDependentKeys.contains(key) {
+      return .unknown(reason: runtimeReason(for: key), predicate: nil)
+    }
     switch key {
     case "clash_mode":
       return stringValues(value).contains(context.mode.rawValue) ? .yes : .no
     case "inbound":
-      guard let inboundTag = context.inboundTag else { return .unknown("the runtime inbound") }
+      guard let inboundTag = context.inboundTag else {
+        return .unknown(reason: "the runtime inbound", predicate: nil)
+      }
       return stringValues(value).contains(inboundTag) ? .yes : .no
     case "domain":
       guard let domain = context.domain else { return .no }
@@ -503,31 +1276,74 @@ enum RoutingInspector {
       guard let domain = context.domain else { return .no }
       for pattern in stringValues(value) {
         guard let expression = try? NSRegularExpression(pattern: pattern) else {
-          return .unknown("an invalid domain regular expression")
+          return .unknown(reason: "an invalid domain regular expression", predicate: nil)
         }
         let range = NSRange(domain.startIndex..<domain.endIndex, in: domain)
         if expression.firstMatch(in: domain, range: range) != nil { return .yes }
       }
       return .no
     case "ip_cidr":
-      guard let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) else {
-        return context.domain == nil ? .no : .unknown("the resolved destination IP")
+      let values = stringValues(value)
+      guard !values.isEmpty else { return .no }
+      if let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) {
+        return values.contains(where: address.matches(cidr:)) ? .yes : .no
       }
-      return stringValues(value).contains(where: address.matches(cidr:)) ? .yes : .no
+      guard context.domain != nil else { return .no }
+      if let known = symbolic.knownValue(for: .ipCIDR(values)) {
+        return known ? .yes : .no
+      }
+      return .unknown(
+        reason: "the resolved destination IP",
+        predicate: .ipCIDR(values)
+      )
     case "ip_version":
-      guard let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) else {
-        return .unknown("the resolved destination IP")
+      let values = integerValues(value)
+      guard !values.isEmpty else { return .no }
+      guard values.allSatisfy({ $0 == 4 || $0 == 6 }) else {
+        return .unknown(
+          reason: "condition \"ip_version\" is not supported by Routing Inspector",
+          predicate: nil
+        )
       }
-      return integerValues(value).contains(address.version) ? .yes : .no
+      if let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) {
+        return values.contains(address.version) ? .yes : .no
+      }
+      guard context.domain != nil else { return .no }
+      if let known = symbolic.knownValue(for: .ipVersion(values)) {
+        return known ? .yes : .no
+      }
+      switch symbolic.addressFamily {
+      case .ipv4: return values.contains(4) ? .yes : .no
+      case .ipv6: return values.contains(6) ? .yes : .no
+      case .unknown: break
+      }
+      return .unknown(reason: "the resolved destination IP", predicate: .ipVersion(values))
     case "ip_is_private":
-      guard boolValue(value) == true else { return .unknown("an invalid private-IP condition") }
-      guard let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) else {
-        // Domain inspection deliberately explains hostname policy without a DNS probe.
-        return context.domain == nil ? .no : .unknown("the resolved destination IP")
+      guard let expected = boolValue(value) else {
+        return .unknown(reason: "an invalid private-IP condition", predicate: nil)
       }
-      return address.isPrivate ? .yes : .no
+      if let ipAddress = context.ipAddress, let address = IPAddress.parse(ipAddress) {
+        return address.isPrivate == expected ? .yes : .no
+      }
+      guard context.domain != nil else { return .no }
+      if let known = symbolic.knownValue(for: .ipIsPrivate(expected)) {
+        return known ? .yes : .no
+      }
+      switch symbolic.privacy {
+      case .private: return expected ? .yes : .no
+      case .public: return expected ? .no : .yes
+      case .unknown: break
+      }
+      // Domain inspection deliberately explains hostname policy without a DNS probe.
+      return .unknown(
+        reason: "the resolved destination IP",
+        predicate: .ipIsPrivate(expected)
+      )
     default:
-      return .unknown("condition \"\(key)\" is not supported by Routing Inspector")
+      return .unknown(
+        reason: "condition \"\(key)\" is not supported by Routing Inspector",
+        predicate: nil
+      )
     }
   }
 
@@ -557,7 +1373,8 @@ enum RoutingInspector {
 
   private static func integerValues(_ value: Any) -> [Int] {
     if let number = value as? NSNumber { return [number.intValue] }
-    return (value as? [NSNumber] ?? []).map(\.intValue)
+    if let numbers = value as? [NSNumber] { return numbers.map(\.intValue) }
+    return value as? [Int] ?? []
   }
 
   private static func boolValue(_ value: Any) -> Bool? {
@@ -583,7 +1400,8 @@ struct ComposedRoutingInspection {
 
   static func make(
     profile: CoreProfile,
-    selectedNode: ProxyNodeID = .auto
+    selectedNode: ProxyNodeID = .auto,
+    ipv6Enabled: Bool = false
   ) throws -> ComposedRoutingInspection {
     switch profile {
     case .compatibility(let compatibility):
@@ -592,7 +1410,11 @@ struct ComposedRoutingInspection {
         "default_domain_resolver": "dns-local",
         "final": "proxy-selector",
       ]
-      var rules = managedRules(proxyOutbound: "proxy-selector", directOutbound: "direct")
+      var rules = managedRules(
+        proxyOutbound: "proxy-selector",
+        directOutbound: "direct",
+        ipv6Enabled: ipv6Enabled
+      )
       rules.append(
         contentsOf: websiteRules(
           compatibility.websiteRoutingRules,
@@ -624,7 +1446,7 @@ struct ComposedRoutingInspection {
         "auto": .vpn,
         "proxy-selector": .vpn,
       ]
-      var names = ["auto": "Auto (chosen automatically)"]
+      var names = ["auto": SBMText.localized("Auto")]
       for connection in compatibility.connections {
         decisions[connection.id.rawValue] = .vpn
         names[connection.id.rawValue] = connection.displayName
@@ -644,7 +1466,11 @@ struct ComposedRoutingInspection {
           as? [String: Any]
       else { throw RoutingInspectionFailure.unavailable }
       var route = root["route"] as? [String: Any] ?? [:]
-      var rules = managedRules(proxyOutbound: native.selectorTag, directOutbound: "sbm-direct")
+      var rules = managedRules(
+        proxyOutbound: native.selectorTag,
+        directOutbound: "sbm-direct",
+        ipv6Enabled: ipv6Enabled
+      )
       rules.append(
         contentsOf: websiteRules(
           native.websiteRoutingRules,
@@ -684,9 +1510,7 @@ struct ComposedRoutingInspection {
       var names = Dictionary(uniqueKeysWithValues: native.nodes.map { ($0.id.rawValue, $0.name) })
       if let chosen {
         let chosenName = names[chosen.rawValue] ?? chosen.rawValue
-        names[native.selectorTag] =
-          chosen.kind(in: native.nodes) == .automatic
-          ? "\(chosenName) (chosen automatically)" : chosenName
+        names[native.selectorTag] = chosenName
       }
       return ComposedRoutingInspection(
         route: route,
@@ -699,28 +1523,72 @@ struct ComposedRoutingInspection {
   }
 
   func presentation(for result: RoutingInspectionResult) -> String {
+    if !result.alternatives.isEmpty {
+      var lines = result.alternatives.map {
+        SBMText.format(
+          "%@: %@",
+          $0.condition,
+          decisionSummary($0.decision, outbound: $0.outboundTag)
+        )
+      }
+      if let reason = result.uncertaintyReason,
+        !reason.hasPrefix("routing result depends on unresolved IP conditions")
+      {
+        lines.append(conciseUncertainty(for: reason))
+      }
+      return lines.joined(separator: "\n")
+    }
     guard result.decision != .indeterminate else {
+      if result.analysisLimited {
+        return SBMText.localized("Routing analysis exceeded the supported complexity limit")
+      }
       var lines = [conciseUncertainty(for: result.uncertaintyReason)]
       if let fallback = result.fallback {
         lines.append(
-          "Otherwise: \(decisionSummary(fallback.decision, outbound: fallback.outboundTag)) · \(fallback.matchedRule)"
+          SBMText.format(
+            "Otherwise: %@ · %@",
+            decisionSummary(fallback.decision, outbound: fallback.outboundTag),
+            fallback.matchedRule
+          )
         )
       }
       return lines.joined(separator: "\n")
     }
     let decision = decisionSummary(result.decision, outbound: result.outboundTag)
-    let matched = result.matchedRule ?? "Final route"
-    return "\(decision)\nMatched: \(matched)"
+    let matched = result.matchedRule ?? SBMText.localized("Final route")
+    return SBMText.format("%@\nMatched: %@", decision, matched)
   }
 
   func details(for result: RoutingInspectionResult, contextLabel: String) -> String {
-    var lines = ["Traffic from: \(contextLabel)"]
-    if let ruleIndex = result.ruleIndex { lines.append("Rule: \(ruleIndex + 1)") }
-    if let outbound = result.outboundTag { lines.append("Outbound: \(outbound)") }
-    if let reason = result.uncertaintyReason { lines.append("Reason: \(reason)") }
+    var lines = [SBMText.format("Traffic from: %@", contextLabel)]
+    if result.collapsedPathCount > 1 {
+      lines.append(SBMText.localized("Multiple routing paths lead to the same result"))
+    }
+    if let ruleIndex = result.ruleIndex {
+      lines.append(SBMText.format("Rule: %lld", ruleIndex + 1))
+    }
+    if let outbound = result.outboundTag {
+      lines.append(SBMText.format("Outbound: %@", outbound))
+    }
+    if let reason = result.uncertaintyReason {
+      lines.append(SBMText.format("Reason: %@", localizedReason(reason)))
+    }
     if let fallback = result.fallback {
       lines.append(
-        "If not matched: \(decisionSummary(fallback.decision, outbound: fallback.outboundTag)) · \(fallback.matchedRule)"
+        SBMText.format(
+          "If not matched: %@ · %@",
+          decisionSummary(fallback.decision, outbound: fallback.outboundTag),
+          fallback.matchedRule
+        )
+      )
+    }
+    for alternative in result.alternatives {
+      lines.append(
+        SBMText.format(
+          "Possible route: %@ → %@",
+          alternative.condition,
+          decisionSummary(alternative.decision, outbound: alternative.outboundTag)
+        )
       )
     }
     return lines.joined(separator: "\n")
@@ -733,35 +1601,114 @@ struct ComposedRoutingInspection {
     guard decision == .vpn, let outbound, let server = vpnServerNames[outbound] else {
       return decision.label
     }
-    return "PROXY · \(server.replacingOccurrences(of: " (chosen automatically)", with: ""))"
+    return SBMText.format("PROXY · %@", server)
   }
 
   private func conciseUncertainty(for reason: String?) -> String {
     let value = reason?.lowercased() ?? ""
+    if value.contains("complexity limit") {
+      return SBMText.localized("Routing analysis exceeded the supported complexity limit")
+    }
+    if value.contains("unresolved ip conditions") {
+      return SBMText.localized("Routing result depends on unresolved IP conditions")
+    }
     if value.contains("resolved destination ip") {
-      return "Depends on resolved IP"
+      return SBMText.localized("Depends on resolved IP")
     }
     if value.contains("active rule-set cache") {
-      return "Depends on active rule-set data"
+      return SBMText.localized("Depends on active rule-set data")
     }
     if value.contains("process path") || value.contains("application") {
-      return "Depends on application context"
+      return SBMText.localized("Depends on application context")
     }
     if value.contains("protocol") || value.contains("network") || value.contains("port") {
-      return "Depends on connection context"
+      return SBMText.localized("Depends on connection context")
     }
     if value.contains("final outbound") || value.contains("outbound") {
-      return "Depends on outbound classification"
+      return SBMText.localized("Depends on outbound classification")
     }
-    return "Additional routing context is required"
+    return SBMText.localized("Additional routing context is required")
+  }
+
+  private func localizedReason(_ reason: String) -> String {
+    switch reason {
+    case "routing analysis exceeded the supported complexity limit":
+      return SBMText.localized("Routing analysis exceeded the supported complexity limit")
+    case "routing result depends on unresolved IP conditions":
+      return SBMText.localized("Routing result depends on unresolved IP conditions")
+    case "the composed route has no feasible symbolic path":
+      return SBMText.localized("the composed route has no feasible symbolic path")
+    case "the resolved destination IP":
+      return SBMText.localized("the resolved destination IP")
+    case "the active rule-set cache":
+      return SBMText.localized("the active rule-set cache")
+    case "the runtime inbound":
+      return SBMText.localized("the runtime inbound")
+    case "the process path condition is invalid":
+      return SBMText.localized("the process path condition is invalid")
+    case "select an application to evaluate the process path condition":
+      return SBMText.localized("select an application to evaluate the process path condition")
+    case "select an application to evaluate the process name condition":
+      return SBMText.localized("select an application to evaluate the process name condition")
+    case "the process path regular expression is invalid":
+      return SBMText.localized("the process path regular expression is invalid")
+    case "the rule-set condition is invalid":
+      return SBMText.localized("the rule-set condition is invalid")
+    case "an invalid domain regular expression":
+      return SBMText.localized("an invalid domain regular expression")
+    case "an invalid private-IP condition":
+      return SBMText.localized("an invalid private-IP condition")
+    case "a malformed logical rule":
+      return SBMText.localized("a malformed logical rule")
+    case "the rule needs a running process, but no application was supplied":
+      return SBMText.localized(
+        "the rule needs a running process, but no application was supplied"
+      )
+    case "the rule needs sniffed protocol information, which is unavailable before traffic exists":
+      return SBMText.localized(
+        "the rule needs sniffed protocol information, which is unavailable before traffic exists"
+      )
+    case "the rule needs network or port information, which was not supplied":
+      return SBMText.localized("the rule needs network or port information, which was not supplied")
+    case "the rule needs the runtime source address, which was not supplied":
+      return SBMText.localized("the rule needs the runtime source address, which was not supplied")
+    default:
+      break
+    }
+
+    let runtimePrefix = "the rule needs runtime "
+    let runtimeSuffix = " information, which was not supplied"
+    if reason.hasPrefix(runtimePrefix), reason.hasSuffix(runtimeSuffix) {
+      let key = String(
+        reason.dropFirst(runtimePrefix.count).dropLast(runtimeSuffix.count)
+      )
+      return SBMText.format(
+        "the rule needs runtime %@ information, which was not supplied", key
+      )
+    }
+
+    let ruleSetPrefix = "the active rule-set cache is required for "
+    if reason.hasPrefix(ruleSetPrefix) {
+      let tags = String(reason.dropFirst(ruleSetPrefix.count))
+      return SBMText.format("the active rule-set cache is required for %@", tags)
+    }
+
+    let conditionPrefix = "condition \""
+    let conditionSuffix = "\" is not supported by Routing Inspector"
+    if reason.hasPrefix(conditionPrefix), reason.hasSuffix(conditionSuffix) {
+      let key = String(reason.dropFirst(conditionPrefix.count).dropLast(conditionSuffix.count))
+      return SBMText.format("condition \"%@\" is not supported by Routing Inspector", key)
+    }
+
+    return reason
   }
 
   private static func managedRules(
     proxyOutbound: String,
-    directOutbound: String
+    directOutbound: String,
+    ipv6Enabled: Bool
   ) -> [[String: Any]] {
-    [
-      ["ip_version": 6, "action": "reject"],
+    var rules: [[String: Any]] = [
       ["action": "sniff"],
       ["protocol": "dns", "action": "hijack-dns"],
       [
@@ -780,6 +1727,10 @@ struct ComposedRoutingInspection {
         "outbound": directOutbound,
       ],
     ]
+    if !ipv6Enabled {
+      rules.insert(["ip_version": 6, "action": "reject"], at: 0)
+    }
+    return rules
   }
 
   private static func applicationRules(
@@ -898,14 +1849,19 @@ enum RoutingInspectionFailure: LocalizedError {
 
   var errorDescription: String? {
     switch self {
-    case .invalidInput: return "Enter one domain name or IP address."
-    case .unavailable: return "The selected profile has no inspectable composed route."
+    case .invalidInput: return SBMText.localized("Enter one domain name or IP address.")
+    case .unavailable:
+      return SBMText.localized("The selected profile has no inspectable composed route.")
     case .activeRuleSetDataUnavailable(let reason):
       let bounded = reason?
         .replacingOccurrences(of: "\n", with: " ")
         .trimmingCharacters(in: .whitespacesAndNewlines)
-      guard let bounded, !bounded.isEmpty else { return "Active rule-set data is unavailable." }
-      return "Active rule-set data is unavailable: \(String(bounded.prefix(240)))"
+      guard let bounded, !bounded.isEmpty else {
+        return SBMText.localized("Active rule-set data is unavailable.")
+      }
+      return SBMText.format(
+        "Active rule-set data is unavailable: %@", String(bounded.prefix(240))
+      )
     }
   }
 }

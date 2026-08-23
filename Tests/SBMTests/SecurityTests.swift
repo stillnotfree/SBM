@@ -56,8 +56,8 @@ private struct ReleasedV9VLESS: Decodable {
 }
 
 @Test func currentIPCShapeRequiresTheNewProtocolBoundary() throws {
-  #expect(HelperConstants.protocolVersion == 10)
-  #expect(HelperConstants.helperRevision == 50)
+  #expect(HelperConstants.protocolVersion == 11)
+  #expect(HelperConstants.helperRevision == 54)
 
   let profile = CoreProfile.compatibility(
     VPNProfile(
@@ -111,6 +111,21 @@ private struct ReleasedV9VLESS: Decodable {
   )
   let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: data)
   #expect(decoded.latencyIntervalMinutes == 10)
+  #expect(!decoded.ipv6Enabled)
+}
+
+@Test func profileLibraryPersistsDisabledIPv6Preference() throws {
+  let library = ProfileLibrary(
+    profiles: [ManagedProfile(name: "IPv6")],
+    selectedProfileID: nil,
+    ipv6Enabled: false
+  )
+  let decoded = try JSONDecoder().decode(
+    ProfileLibrary.self,
+    from: JSONEncoder().encode(library)
+  )
+  #expect(decoded == library)
+  #expect(!decoded.ipv6Enabled)
 }
 
 @Test func immediatelyPreviousLibrarySchemaMigratesCurrentConnectionModel() throws {
@@ -165,13 +180,44 @@ private struct ReleasedV9VLESS: Decodable {
   let data = Data(
     """
     {
+      "profile": {
+        "compatibility": {
+          "_0": {
+            "connections": [
+              {
+                "id": "legacy-node",
+                "displayName": "Legacy node",
+                "outbound": {
+                  "kind": "shadowsocks",
+                  "shadowsocks": {
+                    "server": "198.51.100.10",
+                    "port": 443,
+                    "method": "aes-256-gcm",
+                    "password": "fixture-password"
+                  }
+                }
+              }
+            ],
+            "nodeGroups": [],
+            "applicationRoutingRules": [],
+            "websiteRoutingRules": []
+          }
+        }
+      },
+      "activeProfileID": "11111111-1111-4111-8111-111111111111",
       "mode": "Rule",
       "selectedNode": "auto",
       "selectorTag": "proxy-selector",
-      "nodes": [],
+      "nodes": [
+        { "id": "auto", "name": "Auto", "kind": "automatic" },
+        { "id": "legacy-node", "name": "Legacy node", "kind": "shadowsocks" }
+      ],
       "desiredRunning": true,
+      "automaticRecoveryAttempted": false,
+      "deferredRuntimeApplyPending": false,
       "localSOCKSEnabled": false,
       "localSOCKSPort": 1082,
+      "latencyTestURL": "https://www.gstatic.com/generate_204",
       "apiSecret": "test-secret"
     }
     """.utf8
@@ -180,6 +226,36 @@ private struct ReleasedV9VLESS: Decodable {
   #expect(state.desiredRunning)
   #expect(!state.automaticRecoveryAttempted)
   #expect(!state.deferredRuntimeApplyPending)
+  #expect(!state.ipv6Enabled)
+  #expect(!state.activeIPv6PolicyKnown)
+  #expect(state.activeIPv6Enabled == nil)
+  #expect(state.activeIPv6Policy == nil)
+
+  var unrelated = state
+  unrelated.mode = .direct
+  let roundTripped = try JSONDecoder().decode(
+    PersistentState.self,
+    from: JSONEncoder().encode(unrelated)
+  )
+  #expect(roundTripped.mode == .direct)
+  #expect(!roundTripped.ipv6Enabled)
+  #expect(!roundTripped.activeIPv6PolicyKnown)
+  #expect(roundTripped.activeIPv6Enabled == nil)
+
+  let knownCurrentState = try JSONDecoder().decode(
+    PersistentState.self,
+    from: Data(
+      """
+      {
+        "ipv6Enabled": false,
+        "apiSecret": "current-fixture"
+      }
+      """.utf8
+    )
+  )
+  #expect(!knownCurrentState.ipv6Enabled)
+  #expect(!knownCurrentState.activeIPv6PolicyKnown)
+  #expect(knownCurrentState.activeIPv6Policy == nil)
 }
 
 @Test func legacyManagedLibraryMigratesExactAggregateIDsAndAtomicallyRewrites() throws {
@@ -409,7 +485,7 @@ private struct ReleasedV9VLESS: Decodable {
 @Test func profileLibraryRejectsUnknownOrSchemaMismatchedManagedConnectionEncoding() throws {
   let future = Data(
     """
-    {"schemaVersion":6,"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
+    {"schemaVersion":7,"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
     """.utf8)
   #expect(throws: DecodingError.self) {
     try JSONDecoder().decode(ProfileLibrary.self, from: future)
@@ -884,20 +960,12 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
     .map { String(format: "%02x", $0) }.joined()
   #expect(digest == CoreBuildInfo.signedSHA256)
 
-  let process = Process()
-  let output = Pipe()
-  process.executableURL = core
-  process.arguments = ["version"]
-  process.standardOutput = output
-  process.standardError = output
-  try process.run()
-  process.waitUntilExit()
-  let versionOutput = String(
-    decoding: output.fileHandleForReading.readDataToEndOfFile(),
-    as: UTF8.self
+  let result = try TestProcessSupport.run(
+    executableURL: core,
+    arguments: ["version"]
   )
-  #expect(process.terminationStatus == 0)
-  #expect(versionOutput.hasPrefix("sing-box version \(CoreBuildInfo.version)\n"))
+  #expect(result.status == 0)
+  #expect(result.output.hasPrefix("sing-box version \(CoreBuildInfo.version)\n"))
 }
 
 @Test func profileStoreWritesCredentialsWithUserOnlyPermissions() throws {

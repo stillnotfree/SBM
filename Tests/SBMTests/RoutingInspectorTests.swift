@@ -5,7 +5,7 @@ import Testing
 @testable import SBM
 @testable import SBMHelper
 
-@Test func privateIPRuleWithoutResolvedAddressIsIndeterminateAndShowsLaterFallback() {
+@Test func privateIPRuleWithoutResolvedAddressShowsConditionalAlternatives() {
   let result = RoutingInspector.inspect(
     route: [
       "rules": [
@@ -19,8 +19,13 @@ import Testing
     selectorOutbound: "proxy"
   )
   #expect(result.decision == .indeterminate)
-  #expect(result.uncertaintyReason?.contains("resolved destination IP") == true)
-  #expect(result.fallback?.decision == .vpn)
+  #expect(result.uncertaintyReason?.contains("unresolved IP conditions") == true)
+  #expect(result.fallback == nil)
+  #expect(result.alternatives.count == 2)
+  #expect(
+    result.alternatives.contains { $0.decision == .direct && $0.condition == "Private address" }
+  )
+  #expect(result.alternatives.contains { $0.decision == .vpn && $0.condition == "Public address" })
 }
 
 @Test func privateIPRuleEvaluatesConcreteIPv4AndIPv6Addresses() {
@@ -119,6 +124,23 @@ private actor InspectorRuleSetMatcherSpy {
   }
 
   func count() -> Int { requests.count }
+}
+
+private actor BlockingInspectorRuleSetMatcher {
+  private var continuation: CheckedContinuation<[String: Bool], Never>?
+
+  func match(tags: [String], destination: String) async -> [String: Bool] {
+    return await withCheckedContinuation { continuation in
+      self.continuation = continuation
+    }
+  }
+
+  func isWaiting() -> Bool { continuation != nil }
+
+  func complete() {
+    continuation?.resume(returning: [:])
+    continuation = nil
+  }
 }
 
 private enum InspectorRuleSetMatcherFailure: Error {
@@ -447,10 +469,197 @@ private actor FailingRuleSetMatcher {
   #expect(saves == saveCount)
   #expect(
     model.routingInspectorOutput
-      == "Depends on resolved IP"
+      == "IPv6: REJECT\nIPv4 + Private address: DIRECT\nIPv4 + Public address: PROXY · Auto"
   )
   #expect(model.routingInspectorDetails.contains("Traffic from: Default traffic"))
   await runtime.complete(profileID: profileID)
+}
+
+@Test @MainActor func changingInspectorInputOrApplicationInvalidatesCompletedResult() {
+  let profileID = UUID()
+  let executablePath = "/Applications/Browser.app/Contents/MacOS/Browser"
+  let rule = ApplicationRoutingRule(
+    displayName: "Browser",
+    bundlePath: "/Applications/Browser.app",
+    executablePath: executablePath,
+    target: .selectedProxy
+  )
+  let profile = CoreProfile.compatibility(
+    VPNProfile(
+      connections: [
+        ManagedConnection(
+          id: ProxyNodeID(rawValue: "node-test"),
+          outbound: .shadowsocks(
+            ShadowsocksProfile(
+              server: "198.51.100.10",
+              port: 443,
+              method: "aes-128-gcm",
+              password: "synthetic-test-password"
+            )
+          )
+        )
+      ],
+      applicationRoutingRules: [rule]
+    )
+  )
+  let model = AppModel(
+    profileLibraryLoader: {
+      ProfileLibrary(
+        profiles: [ManagedProfile(id: profileID, name: "Inspector", payload: profile)],
+        selectedProfileID: profileID
+      )
+    },
+    profileLibrarySaver: { _ in },
+    performStartup: false
+  )
+
+  model.routingInspectorInput = "example.com"
+  model.inspectRouting()
+  #expect(model.routingInspectorState.snapshot != nil)
+  #expect(model.routingInspectorOutput != RoutingInspectorState.idleOutput)
+
+  model.routingInspectorInput = "changed.example"
+  #expect(model.routingInspectorState == .idle)
+  #expect(model.routingInspectorOutput == RoutingInspectorState.idleOutput)
+  #expect(model.routingInspectorDetails.isEmpty)
+
+  model.routingInspectorInput = "example.com"
+  model.inspectRouting()
+  model.routingInspectorApplicationID = rule.id
+  #expect(model.routingInspectorState == .idle)
+  #expect(model.routingInspectorOutput == RoutingInspectorState.idleOutput)
+}
+
+@Test @MainActor func changingInspectorProfileNodeOrModeInvalidatesCompletedResult() {
+  let profileAID = UUID()
+  let profileBID = UUID()
+  let profileA = CoreProfile.compatibility(
+    VPNProfile(
+      connections: [
+        ManagedConnection(
+          id: ProxyNodeID(rawValue: "node-a"),
+          outbound: .shadowsocks(
+            ShadowsocksProfile(
+              server: "198.51.100.10",
+              port: 443,
+              method: "aes-128-gcm",
+              password: "synthetic-test-password"
+            )
+          )
+        )
+      ]
+    )
+  )
+  let profileB = CoreProfile.compatibility(
+    VPNProfile(
+      connections: [
+        ManagedConnection(
+          id: ProxyNodeID(rawValue: "node-b"),
+          outbound: .shadowsocks(
+            ShadowsocksProfile(
+              server: "198.51.100.11",
+              port: 443,
+              method: "aes-128-gcm",
+              password: "synthetic-test-password"
+            )
+          )
+        )
+      ]
+    )
+  )
+  let model = AppModel(
+    profileLibraryLoader: {
+      ProfileLibrary(
+        profiles: [
+          ManagedProfile(id: profileAID, name: "A", payload: profileA),
+          ManagedProfile(id: profileBID, name: "B", payload: profileB),
+        ],
+        selectedProfileID: profileAID
+      )
+    },
+    profileLibrarySaver: { _ in },
+    performStartup: false
+  )
+
+  model.routingInspectorInput = "example.com"
+  model.inspectRouting()
+  #expect(model.routingInspectorState.snapshot != nil)
+
+  model.selectedNodeID = ProxyNodeID(rawValue: "node-a")
+  #expect(model.routingInspectorState == .idle)
+  model.inspectRouting()
+  model.routingMode = .direct
+  #expect(model.routingInspectorState == .idle)
+  model.inspectRouting()
+  model.selectProfile(profileBID)
+  #expect(model.routingInspectorState == .idle)
+}
+
+@Test @MainActor func obsoleteActiveRuleSetLookupCannotLeaveCheckingStateOrOverwriteNewInput()
+  async throws
+{
+  let profileID = UUID()
+  let nodeID = ProxyNodeID(rawValue: "node-germany")
+  let policy = try RoutingPolicyParser.parse(
+    Data(contentsOf: URL(fileURLWithPath: "Examples/routing-ru-direct.json"))
+  )
+  let profile = CoreProfile.compatibility(
+    VPNProfile(
+      connections: [
+        ManagedConnection(
+          id: nodeID,
+          displayName: "Germany",
+          outbound: .shadowsocks(
+            ShadowsocksProfile(
+              server: "198.51.100.20",
+              port: 443,
+              method: "aes-128-gcm",
+              password: "synthetic-test-password"
+            )
+          )
+        )
+      ],
+      routingPolicy: policy
+    )
+  )
+  let runtime = InspectorRuntimeSpy()
+  let matcher = BlockingInspectorRuleSetMatcher()
+  let model = AppModel(
+    runtimeSender: { request in await runtime.send(request) },
+    profileLibraryLoader: {
+      ProfileLibrary(
+        profiles: [ManagedProfile(id: profileID, name: "Inspector", payload: profile)],
+        selectedProfileID: profileID
+      )
+    },
+    profileLibrarySaver: { _ in },
+    routingRuleSetMatcher: { tags, destination in
+      await matcher.match(tags: tags, destination: destination)
+    },
+    routingRuleSetRetryDelay: .zero,
+    performStartup: false
+  )
+  model.helperEnabled = true
+  model.helperReachable = true
+  model.helperVersion = HelperConstants.helperVersion
+  model.helperRevision = HelperConstants.helperRevision
+  model.setCoreEnabled(true)
+  for _ in 0..<100 where await runtime.count() == 0 { await Task.yield() }
+  await runtime.complete(profileID: profileID, selectedNode: nodeID)
+  for _ in 0..<100 where !model.coreRunning { await Task.yield() }
+
+  model.routingInspectorInput = "google.com"
+  model.inspectRouting()
+  for _ in 0..<100 where !(await matcher.isWaiting()) { await Task.yield() }
+  #expect(model.routingInspectorOutput == "Checking active rule sets…")
+
+  model.routingInspectorInput = "new.example"
+  #expect(model.routingInspectorState == .idle)
+  #expect(model.routingInspectorOutput == RoutingInspectorState.idleOutput)
+  await matcher.complete()
+  for _ in 0..<100 { await Task.yield() }
+  #expect(model.routingInspectorOutput == RoutingInspectorState.idleOutput)
+  #expect(!model.routingInspectorOutput.contains("Checking active rule sets"))
 }
 
 @Test @MainActor func activeRuleSetInspectionRetriesWithConcreteSelectedNode() async throws {
@@ -514,7 +723,7 @@ private actor FailingRuleSetMatcher {
   #expect(model.selectedNodeID == .auto)
   #expect(
     model.routingInspectorOutput
-      == "Depends on resolved IP"
+      == "IPv6: REJECT\nIPv4 + Private address: DIRECT\nIPv4 + Public address: PROXY · Auto"
   )
 }
 
@@ -720,8 +929,9 @@ private actor FailingRuleSetMatcher {
     domain: "example.com"
   )
   #expect(unresolvedIP.decision == .indeterminate)
-  #expect(unresolvedIP.uncertaintyReason?.contains("resolved destination IP") == true)
-  #expect(unresolvedIP.fallback?.decision == .vpn)
+  #expect(unresolvedIP.uncertaintyReason?.contains("unresolved IP conditions") == true)
+  #expect(unresolvedIP.fallback == nil)
+  #expect(unresolvedIP.alternatives.count == 2)
 }
 
 @Test func routingInspectorDoesNotLetUnrelatedRuntimeRuleHideLaterMatch() {
@@ -779,4 +989,271 @@ private actor FailingRuleSetMatcher {
   let details = composed.details(for: result, contextLabel: "Default traffic")
   #expect(details.contains("Traffic from: Default traffic"))
   #expect(details.contains("Outbound: proxy-selector"))
+}
+
+@Test func routingInspectorSymbolicallySplitsIPv6OffHostname() throws {
+  let result = RoutingInspector.inspect(
+    route: [
+      "rules": [
+        ["ip_version": 6, "action": "reject"],
+        ["ip_version": 4, "action": "route", "outbound": "direct"],
+      ],
+      "final": "proxy",
+    ],
+    context: RoutingInspectionContext(domain: "example.com"),
+    outboundDecisions: ["direct": .direct, "proxy": .vpn],
+    selectorOutbound: "proxy"
+  )
+
+  #expect(result.decision == .indeterminate)
+  let alternatives = try #require(
+    result.alternatives.count == 2 ? result.alternatives : nil
+  )
+  #expect(alternatives[0].condition == "IPv6")
+  #expect(alternatives[0].decision == .reject)
+  #expect(alternatives[1].condition == "IPv4")
+  #expect(alternatives[1].decision == .direct)
+  #expect(
+    !ComposedRoutingInspection(
+      route: [:],
+      outboundDecisions: [:],
+      vpnServerNames: [:],
+      selectorOutbound: "proxy",
+      inboundTag: "tun-in"
+    ).presentation(for: result).contains("Depends on resolved IP")
+  )
+}
+
+@Test func routingInspectorLiteralIPUsesOnlyItsKnownFamily() {
+  let route: [String: Any] = [
+    "rules": [
+      ["ip_version": 6, "action": "reject"],
+      ["ip_version": 4, "action": "route", "outbound": "direct"],
+    ],
+    "final": "proxy",
+  ]
+  let decisions: [String: RoutingInspectionResult.Decision] = [
+    "direct": .direct, "proxy": .vpn,
+  ]
+
+  let ipv4 = RoutingInspector.inspect(
+    route: route,
+    context: RoutingInspectionContext(ipAddress: "203.0.113.8"),
+    outboundDecisions: decisions,
+    selectorOutbound: "proxy"
+  )
+  let ipv6 = RoutingInspector.inspect(
+    route: route,
+    context: RoutingInspectionContext(ipAddress: "2001:db8::8"),
+    outboundDecisions: decisions,
+    selectorOutbound: "proxy"
+  )
+
+  #expect(ipv4.decision == .direct)
+  #expect(ipv4.ruleIndex == 1)
+  #expect(ipv6.decision == .reject)
+  #expect(ipv6.ruleIndex == 0)
+  #expect(ipv4.alternatives.isEmpty)
+  #expect(ipv6.alternatives.isEmpty)
+}
+
+@Test func routingInspectorKeepsMultipleUnresolvedIPPredicatesUseful() {
+  let result = RoutingInspector.inspect(
+    route: [
+      "rules": [
+        ["ip_cidr": ["203.0.113.0/24"], "action": "route", "outbound": "direct"],
+        ["ip_is_private": true, "action": "reject"],
+      ],
+      "final": "proxy",
+    ],
+    context: RoutingInspectionContext(domain: "example.com"),
+    outboundDecisions: ["direct": .direct, "proxy": .vpn],
+    selectorOutbound: "proxy"
+  )
+
+  #expect(result.decision == .indeterminate)
+  #expect(result.alternatives.map(\.decision) == [.direct, .reject, .vpn])
+  #expect(result.uncertaintyReason?.contains("unresolved IP conditions") == true)
+}
+
+@Test func routingInspectorCollapsesConvergentSymbolicPaths() {
+  let result = RoutingInspector.inspect(
+    route: [
+      "rules": [["ip_is_private": true, "action": "route", "outbound": "direct"]],
+      "final": "direct",
+    ],
+    context: RoutingInspectionContext(domain: "example.com"),
+    outboundDecisions: ["direct": .direct],
+    selectorOutbound: "direct"
+  )
+
+  #expect(result.decision == .direct)
+  #expect(result.alternatives.isEmpty)
+  #expect(result.collapsedPathCount == 2)
+}
+
+@Test func routingInspectorCollapsesConvergentGenericUnknownPaths() {
+  let result = inspect(
+    rules: [
+      [
+        "process_path": ["/Applications/Example.app/Contents/MacOS/Example"],
+        "action": "route",
+        "outbound": "direct",
+      ]
+    ],
+    final: "direct",
+    domain: "example.com"
+  )
+
+  #expect(result.decision == .direct)
+  #expect(result.alternatives.isEmpty)
+  #expect(result.collapsedPathCount == 2)
+}
+
+@Test func routingInspectorKeepsDistinctVPNOutboundTagsAsAlternatives() {
+  let result = RoutingInspector.inspect(
+    route: [
+      "rules": [
+        ["ip_version": 6, "action": "route", "outbound": "vpn-a"],
+        ["ip_version": 4, "action": "route", "outbound": "vpn-b"],
+      ],
+      "final": "vpn-a",
+    ],
+    context: RoutingInspectionContext(domain: "example.com"),
+    outboundDecisions: ["vpn-a": .vpn, "vpn-b": .vpn],
+    selectorOutbound: "vpn-a"
+  )
+
+  #expect(result.decision == .indeterminate)
+  #expect(Set(result.alternatives.map(\.outboundTag)) == Set(["vpn-a", "vpn-b"]))
+  #expect(result.alternatives.count == 2)
+}
+
+@Test func routingInspectorPrunesNestedCIDRAndNegativeSetContradictions() {
+  let nested = inspect(
+    rules: [
+      [
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          ["ip_cidr": ["10.1.0.0/16"]],
+          ["ip_cidr": ["10.0.0.0/8"]],
+        ],
+        "action": "route",
+        "outbound": "direct",
+      ]
+    ],
+    final: "proxy-selector",
+    domain: "example.com"
+  )
+  #expect(nested.decision == .indeterminate)
+  #expect(nested.alternatives.contains { $0.decision == .direct })
+
+  let impossible = inspect(
+    rules: [
+      [
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          [
+            "ip_cidr": ["10.0.0.0/8", "192.168.0.0/16"],
+            "invert": true,
+          ],
+          ["ip_cidr": ["10.0.0.0/8"]],
+        ],
+        "action": "route",
+        "outbound": "direct",
+      ]
+    ],
+    final: "proxy-selector",
+    domain: "example.com"
+  )
+  #expect(impossible.decision == .vpn)
+  #expect(impossible.alternatives.isEmpty)
+}
+
+@Test func routingInspectorDerivesPrivateCIDRAndRejectsPublicContradiction() {
+  let impliedPrivate = inspect(
+    rules: [
+      [
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          ["ip_cidr": ["10.0.0.0/8"]],
+          ["ip_is_private": true],
+        ],
+        "action": "route",
+        "outbound": "direct",
+      ]
+    ],
+    final: "proxy-selector",
+    domain: "example.com"
+  )
+  #expect(impliedPrivate.decision == .indeterminate)
+  #expect(impliedPrivate.alternatives.contains { $0.decision == .direct })
+
+  let contradictoryPublic = inspect(
+    rules: [
+      [
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          ["ip_cidr": ["10.0.0.0/8"]],
+          ["ip_is_private": false],
+        ],
+        "action": "route",
+        "outbound": "direct",
+      ]
+    ],
+    final: "proxy-selector",
+    domain: "example.com"
+  )
+  #expect(contradictoryPublic.decision == .vpn)
+  #expect(contradictoryPublic.alternatives.isEmpty)
+}
+
+@Test func routingInspectorPrunesContradictoryFamilyConstraints() {
+  let result = RoutingInspector.inspect(
+    route: [
+      "rules": [
+        [
+          "type": "logical",
+          "mode": "and",
+          "rules": [
+            ["ip_version": 4],
+            ["ip_version": 6],
+          ],
+          "action": "route",
+          "outbound": "direct",
+        ]
+      ],
+      "final": "proxy",
+    ],
+    context: RoutingInspectionContext(domain: "example.com"),
+    outboundDecisions: ["direct": .direct, "proxy": .vpn],
+    selectorOutbound: "proxy"
+  )
+
+  #expect(result.decision == .vpn)
+  #expect(result.alternatives.isEmpty)
+}
+
+@Test func routingInspectorStopsAtBoundedSymbolicComplexity() {
+  let rules: [[String: Any]] = (0..<40).map { index in
+    [
+      "ip_cidr": ["203.0.\(index).0/24"],
+      "action": "route",
+      "outbound": "direct",
+    ]
+  }
+  let result = RoutingInspector.inspect(
+    route: ["rules": rules, "final": "direct"],
+    context: RoutingInspectionContext(domain: "example.com"),
+    outboundDecisions: ["direct": .direct],
+    selectorOutbound: "direct"
+  )
+
+  #expect(result.analysisLimited)
+  #expect(result.decision == .indeterminate)
+  #expect(result.alternatives.isEmpty)
 }

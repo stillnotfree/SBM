@@ -59,17 +59,11 @@ import Testing
 
     let configURL = temporary.appendingPathComponent("\(filename).json")
     try built.data.write(to: configURL)
-    let process = Process()
-    let output = Pipe()
-    process.executableURL = core
-    process.arguments = ["check", "-c", configURL.path]
-    process.standardOutput = output
-    process.standardError = output
-    try process.run()
-    process.waitUntilExit()
-    let message =
-      String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    #expect(process.terminationStatus == 0, Comment(rawValue: message))
+    let result = try TestProcessSupport.run(
+      executableURL: core,
+      arguments: ["check", "-c", configURL.path]
+    )
+    #expect(result.status == 0, Comment(rawValue: result.output))
   }
 }
 

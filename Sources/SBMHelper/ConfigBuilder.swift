@@ -10,7 +10,8 @@ struct ConfigBuilder {
     mode: RoutingMode,
     selectedNode: ProxyNodeID,
     localSOCKSPort: UInt16? = nil,
-    latencyTestURL: String = LatencyTargetPolicy.defaultURL
+    latencyTestURL: String = LatencyTargetPolicy.defaultURL,
+    ipv6Enabled: Bool = false
   ) throws -> BuiltConfiguration {
     let latencyTestURL = try LatencyTargetPolicy.normalized(latencyTestURL)
     switch profile {
@@ -20,7 +21,8 @@ struct ConfigBuilder {
         mode: mode,
         selectedNode: selectedNode,
         localSOCKSPort: localSOCKSPort,
-        latencyTestURL: latencyTestURL
+        latencyTestURL: latencyTestURL,
+        ipv6Enabled: ipv6Enabled
       )
     case .native(let native):
       return try NativeConfigurationComposer(
@@ -31,7 +33,8 @@ struct ConfigBuilder {
         mode: mode,
         selectedNode: selectedNode,
         localSOCKSPort: localSOCKSPort,
-        latencyTestURL: latencyTestURL
+        latencyTestURL: latencyTestURL,
+        ipv6Enabled: ipv6Enabled
       )
     }
   }
@@ -41,7 +44,8 @@ struct ConfigBuilder {
     mode: RoutingMode,
     selectedNode: ProxyNodeID,
     localSOCKSPort: UInt16?,
-    latencyTestURL: String
+    latencyTestURL: String,
+    ipv6Enabled: Bool
   ) throws -> BuiltConfiguration {
     try ProfileValidator.validate(profile)
 
@@ -77,16 +81,19 @@ struct ConfigBuilder {
     for connection in profile.connections {
       switch connection.outbound {
       case .vless(let vless):
-        proxyOutbounds.append([
+        var outbound: [String: Any] = [
           "type": "vless",
           "tag": connection.id.rawValue,
           "server": vless.server,
           "server_port": Int(vless.port),
           "uuid": vless.uuid,
-          "flow": "xtls-rprx-vision",
-          "network": "tcp",
-          "packet_encoding": "xudp",
-          "tls": [
+        ]
+        switch vless.variant {
+        case .reality(let publicKey, let shortID):
+          outbound["flow"] = "xtls-rprx-vision"
+          outbound["network"] = "tcp"
+          outbound["packet_encoding"] = "xudp"
+          outbound["tls"] = [
             "enabled": true,
             "server_name": vless.serverName,
             "utls": [
@@ -95,11 +102,26 @@ struct ConfigBuilder {
             ],
             "reality": [
               "enabled": true,
-              "public_key": vless.publicKey,
-              "short_id": vless.shortID,
+              "public_key": publicKey,
+              "short_id": shortID,
             ],
-          ],
-        ])
+          ]
+        case .tlsGRPC(let serviceName):
+          outbound["tls"] = [
+            "enabled": true,
+            "server_name": vless.serverName,
+            "utls": [
+              "enabled": true,
+              "fingerprint": vless.fingerprint,
+            ],
+          ]
+          outbound["transport"] = [
+            "type": "grpc",
+            "service_name": serviceName,
+          ]
+          outbound["domain_resolver"] = "dns-local"
+        }
+        proxyOutbounds.append(outbound)
       case .hysteria2(let hysteria2):
         var outbound: [String: Any] = [
           "type": "hysteria2",
@@ -133,41 +155,44 @@ struct ConfigBuilder {
       }
     }
 
+    var managedRules: [[String: Any]] = [
+      ["action": "sniff"],
+      ["protocol": "dns", "action": "hijack-dns"],
+      [
+        "clash_mode": RoutingMode.direct.rawValue,
+        "action": "route",
+        "outbound": "direct",
+      ],
+      [
+        "clash_mode": RoutingMode.global.rawValue,
+        "action": "route",
+        "outbound": "proxy-selector",
+      ],
+      [
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct",
+      ],
+    ]
+    if !ipv6Enabled {
+      managedRules.insert(["ip_version": 6, "action": "reject"], at: 0)
+    }
     var route: [String: Any] = [
       "auto_detect_interface": true,
       "default_domain_resolver": "dns-local",
-      "rules": [
-        ["ip_version": 6, "action": "reject"],
-        ["action": "sniff"],
-        ["protocol": "dns", "action": "hijack-dns"],
-        [
-          "clash_mode": RoutingMode.direct.rawValue,
-          "action": "route",
-          "outbound": "direct",
-        ],
-        [
-          "clash_mode": RoutingMode.global.rawValue,
-          "action": "route",
-          "outbound": "proxy-selector",
-        ],
-        [
-          "ip_is_private": true,
-          "action": "route",
-          "outbound": "direct",
-        ],
-      ],
+      "rules": managedRules,
       "final": "proxy-selector",
     ]
     var directDNSRules: [[String: Any]] = []
-    var managedRules = route["rules"] as? [[String: Any]] ?? []
-    managedRules.append(
+    var composedRules = route["rules"] as? [[String: Any]] ?? []
+    composedRules.append(
       contentsOf: try ProfileValidator.websiteRouteRules(
         profile.websiteRoutingRules,
         directOutbound: "direct",
         proxyOutbound: "proxy-selector"
       )
     )
-    managedRules.append(
+    composedRules.append(
       contentsOf: try ProfileValidator.applicationRouteRules(
         profile.applicationRoutingRules,
         directOutbound: "direct",
@@ -175,7 +200,7 @@ struct ConfigBuilder {
         allowedNodeIDs: Set(proxyTags)
       )
     )
-    route["rules"] = managedRules
+    route["rules"] = composedRules
     if let policy = profile.routingPolicy {
       let composer = RoutingPolicyComposer()
       route = try composer.merge(policy, into: route)
@@ -201,34 +226,37 @@ struct ConfigBuilder {
       "server": "dns-remote",
     ])
 
+    var dns: [String: Any] = [
+      "servers": [
+        [
+          "type": "local",
+          "tag": "dns-local",
+        ],
+        [
+          "type": "https",
+          "tag": "dns-remote",
+          "server": "1.1.1.1",
+          "detour": "proxy-selector",
+          "tls": [
+            "enabled": true,
+            "server_name": "cloudflare-dns.com",
+          ],
+        ],
+      ],
+      "rules": dnsRules,
+      "final": "dns-remote",
+      "cache_capacity": 4096,
+    ]
+    if !ipv6Enabled {
+      dns["strategy"] = "ipv4_only"
+    }
     let root: [String: Any] = [
       "log": [
         "level": "error",
         "timestamp": true,
         "output": "/dev/null",
       ],
-      "dns": [
-        "servers": [
-          [
-            "type": "local",
-            "tag": "dns-local",
-          ],
-          [
-            "type": "https",
-            "tag": "dns-remote",
-            "server": "1.1.1.1",
-            "detour": "proxy-selector",
-            "tls": [
-              "enabled": true,
-              "server_name": "cloudflare-dns.com",
-            ],
-          ],
-        ],
-        "rules": dnsRules,
-        "final": "dns-remote",
-        "strategy": "ipv4_only",
-        "cache_capacity": 4096,
-      ],
+      "dns": dns,
       "inbounds": inbounds,
       "outbounds": [
         [
@@ -336,13 +364,24 @@ enum ProfileValidator {
       case .vless(let vless):
         guard vless.port > 0 else { throw CoreFailure.invalidProfile("Server port is invalid.") }
         try validateHost(vless.server, field: "VLESS server")
-        try validateHost(vless.serverName, field: "REALITY server name")
+        try validateHost(
+          vless.serverName,
+          field: vless.variant.isReality ? "REALITY server name" : "VLESS TLS server name"
+        )
         guard UUID(uuidString: vless.uuid) != nil else {
           throw CoreFailure.invalidProfile("VLESS UUID is invalid.")
         }
         try validateToken(vless.fingerprint, field: "fingerprint", maximum: 32)
-        try validateBase64URL(vless.publicKey, field: "REALITY public key")
-        try validateHex(vless.shortID, field: "REALITY short ID")
+        switch vless.variant {
+        case .reality(let publicKey, let shortID):
+          try validateBase64URL(publicKey, field: "REALITY public key")
+          try validateHex(shortID, field: "REALITY short ID")
+        case .tlsGRPC(let serviceName):
+          guard VLESSProfile.supportedFingerprints.contains(vless.fingerprint) else {
+            throw CoreFailure.invalidProfile("VLESS TLS fingerprint is unsupported.")
+          }
+          try validateServiceName(serviceName)
+        }
       case .hysteria2(let hysteria2):
         guard hysteria2.port > 0 else {
           throw CoreFailure.invalidProfile("Server port is invalid.")
@@ -544,6 +583,14 @@ enum ProfileValidator {
       value.unicodeScalars.allSatisfy(allowed.contains)
     else {
       throw CoreFailure.invalidProfile("\(field) is invalid.")
+    }
+  }
+
+  private static func validateServiceName(_ value: String) throws {
+    guard !value.isEmpty, value.utf8.count <= 256,
+      !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+    else {
+      throw CoreFailure.invalidProfile("VLESS gRPC service name is invalid.")
     }
   }
 

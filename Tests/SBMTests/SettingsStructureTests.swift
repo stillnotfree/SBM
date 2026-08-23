@@ -54,6 +54,7 @@ private func settingsSource(_ name: String) throws -> String {
     #"Button("Import Full JSON as New Profile…")"#,
     #"Section("Latency")"#,
     #"Section("Local SOCKS5")"#,
+    "model.ipv6PolicyDescription",
     "private var deferredRuntimeApplyCallout",
     "case .reconnectRequired:",
     "settingsHelperText()",
@@ -61,6 +62,15 @@ private func settingsSource(_ name: String) throws -> String {
     #expect(source.contains(required))
   }
   #expect(source.components(separatedBy: "deferredRuntimeApplyCallout").count - 1 == 4)
+}
+
+@Test func foregroundActivationUsesCurrentAppKitAPI() throws {
+  let app = try settingsSource("SBMApp.swift")
+  let settings = try settingsSource("SettingsView.swift")
+  #expect(app.contains("NSApplication.shared.activate()"))
+  #expect(settings.contains("NSApplication.shared.activate()"))
+  #expect(!app.contains("ignoringOtherApps"))
+  #expect(!settings.contains("ignoringOtherApps"))
 }
 
 @Test func routingTabUsesStableExplicitControlLayout() throws {

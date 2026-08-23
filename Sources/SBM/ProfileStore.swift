@@ -264,16 +264,19 @@ enum ProfileStoreFailure: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .unsafeStorage:
-      "Profile library has unsafe ownership, permissions, or file type."
+      SBMText.localized("Profile library has unsafe ownership, permissions, or file type.")
     case .tooLarge:
-      "Profile library is unexpectedly large and was not loaded."
+      SBMText.localized("Profile library is unexpectedly large and was not loaded.")
     case .unreadable:
-      "Profile library could not be read."
+      SBMText.localized("Profile library could not be read.")
     case .invalidJSON(let preservedName):
       if let preservedName {
-        "Profile library could not be loaded. An unchanged copy was preserved as \(preservedName)."
+        SBMText.format(
+          "Profile library could not be loaded. An unchanged copy was preserved as %@.",
+          preservedName
+        )
       } else {
-        "Profile library could not be loaded."
+        SBMText.localized("Profile library could not be loaded.")
       }
     }
   }

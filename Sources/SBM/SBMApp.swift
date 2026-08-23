@@ -42,7 +42,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct SBMApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-  @State private var model = AppModel()
+  @State private var model = AppModel(environment: .production)
 
   init() {
     NSApplication.shared.setActivationPolicy(.accessory)
@@ -90,9 +90,9 @@ enum SBMWindow: String, CaseIterable {
 
   var title: String {
     switch self {
-    case .profiles: "Settings"
-    case .diagnostics: "Diagnostics"
-    case .about: "About SBM"
+    case .profiles: SBMText.localized("Settings")
+    case .diagnostics: SBMText.localized("Diagnostics")
+    case .about: SBMText.localized("About SBM")
     }
   }
 
@@ -124,7 +124,7 @@ private struct MenuContentView: View {
 
     if let deferred = model.deferredRuntimeApplyPresentation {
       Label(deferred.headline, systemImage: "arrow.triangle.2.circlepath")
-      if deferred.phase == .reconnecting {
+      if deferred.phase == .applying || deferred.phase == .reconnecting {
         ProgressView()
           .controlSize(.small)
       }
@@ -135,12 +135,16 @@ private struct MenuContentView: View {
       Button(deferred.action.title) {
         model.reconnectToApply()
       }
-      .disabled(model.helperSetupInProgress || deferred.phase == .reconnecting)
+      .disabled(
+        model.helperSetupInProgress
+          || model.observedCoreState == .unknown
+          || !deferred.actionEnabled
+      )
     }
 
     Divider()
 
-    Menu("Profile: \(model.selectedProfileName)") {
+    Menu {
       ForEach(model.profiles) { profile in
         Button {
           model.selectProfile(profile.id)
@@ -152,25 +156,29 @@ private struct MenuContentView: View {
           }
         }
       }
+    } label: {
+      Text(SBMText.format("Profile: %@", model.selectedProfileName))
     }
     .disabled(model.helperSetupInProgress)
 
-    Menu("Mode: \(model.routingMode.rawValue)") {
+    Menu {
       ForEach(RoutingMode.allCases, id: \.self) { mode in
         Button {
           model.setRoutingMode(mode)
         } label: {
           if model.routingMode == mode {
-            Label(mode.rawValue, systemImage: "checkmark")
+            Label(SBMText.localized(mode.rawValue), systemImage: "checkmark")
           } else {
-            Text(mode.rawValue)
+            Text(SBMText.localized(mode.rawValue))
           }
         }
       }
+    } label: {
+      Text(SBMText.format("Mode: %@", SBMText.localized(model.routingMode.rawValue)))
     }
     .disabled(model.helperSetupInProgress)
 
-    Menu("Server: \(selectedNodeName)") {
+    Menu {
       if let automaticNode = model.automaticNode {
         serverButton(automaticNode)
       }
@@ -184,6 +192,8 @@ private struct MenuContentView: View {
           }
         }
       }
+    } label: {
+      Text(SBMText.format("Server: %@", selectedNodeName))
     }
     .disabled(model.helperSetupInProgress)
 
@@ -222,7 +232,7 @@ private struct MenuContentView: View {
       Button(
         model.helperSetupInProgress
           ? model.helperStatus
-          : model.helperStatus == "Helper update required"
+          : model.helperUpdateRequired
             ? "Update Background Helper" : "Repair Background Helper"
       ) {
         model.repairHelper()
@@ -254,11 +264,12 @@ private struct MenuContentView: View {
   }
 
   private var selectedNodeName: String {
-    model.nodes.first(where: { $0.id == model.selectedNodeID })?.name ?? "Unknown"
+    model.nodes.first(where: { $0.id == model.selectedNodeID })?.name
+      ?? SBMText.localized("Unknown")
   }
 
   private func presentWindow(_ target: SBMWindow) {
-    NSApplication.shared.activate(ignoringOtherApps: true)
+    NSApplication.shared.activate()
     openWindow(id: target.rawValue)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
       guard
@@ -296,7 +307,9 @@ private struct MenuContentView: View {
       }
     }
     .badge(latency)
-    .accessibilityLabel(selected ? "\(node.name), selected" : node.name)
+    .accessibilityLabel(
+      selected ? SBMText.format("%@, selected", node.name) : node.name
+    )
   }
 
   private func selectionPlaceholderImage() -> NSImage {
@@ -329,7 +342,7 @@ private struct AboutView: View {
 
       Text("SBM")
         .font(.title2.weight(.semibold))
-      Text("Version \(version) (\(build))")
+      Text(SBMText.format("Version %@ (%@)", version, build))
         .foregroundStyle(.secondary)
 
       Text("Native Apple Silicon menu bar client for sing-box.")

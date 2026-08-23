@@ -92,6 +92,13 @@ struct PersistentState: Codable {
   var localSOCKSEnabled = false
   var localSOCKSPort: UInt16 = 1082
   var latencyTestURL = LatencyTargetPolicy.defaultURL
+  /// Desired policy persisted by the app. This is intentionally separate from
+  /// the policy known to be active in a running core.
+  var ipv6Enabled = false
+  /// The active policy is absent when the state predates IPv6 persistence or
+  /// when the helper has not yet observed a successful activation.
+  var activeIPv6Enabled: Bool?
+  var activeIPv6PolicyKnown = false
   var apiSecret = UUID().uuidString.replacingOccurrences(of: "-", with: "")
 
   init() {}
@@ -109,6 +116,9 @@ struct PersistentState: Codable {
     case localSOCKSEnabled
     case localSOCKSPort
     case latencyTestURL
+    case ipv6Enabled
+    case activeIPv6Enabled
+    case activeIPv6PolicyKnown
     case apiSecret
   }
 
@@ -170,13 +180,60 @@ struct PersistentState: Codable {
       try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
       ?? LatencyTargetPolicy.defaultURL
     latencyTestURL = try LatencyTargetPolicy.normalized(storedTarget)
+    let storedIPv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .ipv6Enabled)
+    ipv6Enabled = storedIPv6Enabled ?? false
+    if let storedPolicyKnown =
+      try container.decodeIfPresent(Bool.self, forKey: .activeIPv6PolicyKnown)
+    {
+      let storedActiveIPv6Enabled =
+        try container.decodeIfPresent(Bool.self, forKey: .activeIPv6Enabled)
+      activeIPv6PolicyKnown = storedPolicyKnown && storedActiveIPv6Enabled != nil
+      activeIPv6Enabled = activeIPv6PolicyKnown ? storedActiveIPv6Enabled : nil
+    } else if let storedActiveIPv6Enabled =
+      try container.decodeIfPresent(Bool.self, forKey: .activeIPv6Enabled)
+    {
+      activeIPv6PolicyKnown = true
+      activeIPv6Enabled = storedActiveIPv6Enabled
+    } else {
+      activeIPv6PolicyKnown = false
+      activeIPv6Enabled = nil
+    }
     apiSecret =
       try container.decodeIfPresent(String.self, forKey: .apiSecret)
       ?? UUID().uuidString.replacingOccurrences(of: "-", with: "")
   }
 
+  var activeIPv6Policy: Bool? {
+    guard activeIPv6PolicyKnown else { return nil }
+    return activeIPv6Enabled
+  }
+
   mutating func setLatencyTestURL(_ value: String) throws {
     latencyTestURL = try LatencyTargetPolicy.normalized(value)
+  }
+}
+
+enum ActiveIPv6PolicyTransition {
+  static func afterFreshActivation(desired: Bool) -> (known: Bool, value: Bool?) {
+    (known: true, value: desired)
+  }
+
+  static func afterValidatedByteIdenticalSnapshot(
+    desired: Bool,
+    configurationMatches: Bool
+  ) -> (known: Bool, value: Bool?) {
+    guard configurationMatches else { return (known: false, value: nil) }
+    return (known: true, value: desired)
+  }
+
+  static func afterExistingConfigurationRecovery(
+    activePolicyKnown: Bool,
+    activePolicy: Bool?
+  ) -> (known: Bool, value: Bool?) {
+    guard activePolicyKnown, let activePolicy else {
+      return (known: false, value: nil)
+    }
+    return (known: true, value: activePolicy)
   }
 }
 
@@ -298,6 +355,22 @@ struct CoreActivationTransaction<Candidate> {
   }
 }
 
+struct CoreStopTransaction {
+  static func run(
+    previousState: PersistentState,
+    stopKnownGood: () throws -> Void,
+    save: (PersistentState) throws -> Void
+  ) throws -> PersistentState {
+    try stopKnownGood()
+    var stoppedState = previousState
+    stoppedState.desiredRunning = false
+    stoppedState.automaticRecoveryAttempted = false
+    stoppedState.deferredRuntimeApplyPending = false
+    try save(stoppedState)
+    return stoppedState
+  }
+}
+
 struct CoreFileIdentity: Equatable {
   let size: Int64
   let modificationSeconds: Int64
@@ -380,18 +453,25 @@ final class CoreManager: @unchecked Sendable {
 
   func bootstrap() {
     do {
-      try prepareFilesystem()
+      // Socket activation is not an authenticated lifecycle request.  Load
+      // only safe persisted state here; core installation and reconciliation
+      // happen after HelperServer has authenticated and parsed an action.
+      try prepareFilesystem(installBundledCore: false)
       try enforceLogLimit()
       state = try loadState()
-      if !state.desiredRunning {
-        terminateCore()
-      }
       bootstrapFailure = nil
     } catch {
       bootstrapFailure = error.localizedDescription
       FileHandle.standardError.write(
         Data("Core bootstrap failed: \(error.localizedDescription)\n".utf8))
     }
+  }
+
+  func auditSnapshot() -> HelperCoreAuditState {
+    HelperCoreAuditState(
+      coreRunning: isCoreRunning,
+      desiredRunning: state.desiredRunning
+    )
   }
 
   func status(
@@ -418,6 +498,7 @@ final class CoreManager: @unchecked Sendable {
       mode: state.mode,
       selectedNode: state.selectedNode,
       activeProfileID: state.activeProfileID,
+      activeIPv6Enabled: isCoreRunning ? state.activeIPv6Policy : nil,
       nodes: state.nodes,
       automaticRecoveryExhausted: recoveryExhausted,
       ruleSetMatches: ruleSetMatches,
@@ -428,6 +509,9 @@ final class CoreManager: @unchecked Sendable {
 
   func reconcileDesiredRuntime() throws -> String? {
     guard bootstrapFailure == nil else { return nil }
+    if state.desiredRunning || isCoreRunning {
+      try prepareFilesystem()
+    }
     let recoveryDecision = DesiredRuntimeRecoveryPolicy.decision(
       desiredRunning: state.desiredRunning,
       coreRunning: isCoreRunning,
@@ -467,7 +551,8 @@ final class CoreManager: @unchecked Sendable {
     selectedNode: ProxyNodeID? = nil,
     localSOCKSEnabled: Bool? = nil,
     localSOCKSPort: UInt16? = nil,
-    latencyTestURL: String? = nil
+    latencyTestURL: String? = nil,
+    ipv6Enabled: Bool? = nil
   ) throws -> HelperResponse {
     let normalizedLatencyTestURL = try latencyTestURL.map(LatencyTargetPolicy.normalized)
     let previousState = state
@@ -495,6 +580,9 @@ final class CoreManager: @unchecked Sendable {
       }
       if let normalizedLatencyTestURL {
         requestedState.latencyTestURL = normalizedLatencyTestURL
+      }
+      if let ipv6Enabled {
+        requestedState.ipv6Enabled = ipv6Enabled
       }
       guard let activeProfile = requestedState.profile else {
         throw CoreFailure.profileMissing
@@ -543,8 +631,24 @@ final class CoreManager: @unchecked Sendable {
       state = requestedState
       state.deferredRuntimeApplyPending = false
       if isCoreRunning, !configurationChanged {
+        let validated = try validatedConfiguration(
+          profile: activeProfile,
+          apiSecret: requestedState.apiSecret,
+          state: requestedState
+        )
+        let transition = ActiveIPv6PolicyTransition.afterValidatedByteIdenticalSnapshot(
+          desired: requestedState.ipv6Enabled,
+          configurationMatches: validated.data == previousConfiguration
+        )
+        guard transition.known else {
+          throw CoreFailure.configurationRejected(
+            "The validated runtime snapshot did not match the active configuration."
+          )
+        }
         state.desiredRunning = true
         state.automaticRecoveryAttempted = false
+        state.activeIPv6PolicyKnown = transition.known
+        state.activeIPv6Enabled = transition.value
         try saveState()
         return status(message: "VPN already connected")
       }
@@ -577,6 +681,11 @@ final class CoreManager: @unchecked Sendable {
           try waitForAPI()
           try applyMode(state.mode)
           try applyNode(state.selectedNode)
+          let transition = ActiveIPv6PolicyTransition.afterFreshActivation(
+            desired: state.ipv6Enabled
+          )
+          state.activeIPv6PolicyKnown = transition.known
+          state.activeIPv6Enabled = transition.value
           state.desiredRunning = true
           state.automaticRecoveryAttempted = false
           try saveState()
@@ -631,13 +740,19 @@ final class CoreManager: @unchecked Sendable {
   }
 
   func stop() throws -> HelperResponse {
-    state.desiredRunning = false
-    state.automaticRecoveryAttempted = false
-    try saveState()
-    guard terminateCore(), !isCoreRunning else {
-      throw CoreFailure.coreStopFailed
-    }
-    try persistDeferredRuntimeMarker(false)
+    let previousState = state
+    let stoppedState = try CoreStopTransaction.run(
+      previousState: previousState,
+      stopKnownGood: { [self] in
+        guard terminateCore(), !isCoreRunning else {
+          throw CoreFailure.coreStopFailed
+        }
+      },
+      save: { [self] snapshot in
+        try saveState(snapshot)
+      }
+    )
+    state = stoppedState
     return status(message: "VPN disconnected")
   }
 
@@ -730,6 +845,7 @@ final class CoreManager: @unchecked Sendable {
       mode: state.mode,
       selectedNode: state.selectedNode,
       activeProfileID: state.activeProfileID,
+      activeIPv6Enabled: state.activeIPv6Policy,
       nodes: state.nodes,
       delays: delays,
       message: "Latency updated"
@@ -749,6 +865,7 @@ final class CoreManager: @unchecked Sendable {
       mode: state.mode,
       selectedNode: built.selectedNode,
       activeProfileID: state.activeProfileID,
+      activeIPv6Enabled: isCoreRunning ? state.activeIPv6Policy : nil,
       nodes: built.nodes,
       message: "Profile validated"
     )
@@ -836,7 +953,7 @@ final class CoreManager: @unchecked Sendable {
     return String(decoding: pathBytes, as: UTF8.self) == coreURL.path
   }
 
-  private func prepareFilesystem() throws {
+  private func prepareFilesystem(installBundledCore: Bool = true) throws {
     if pathExistsWithoutFollowingSymlinks(supportDirectory) {
       guard isRootOwnedDirectory(supportDirectory) else {
         throw CoreFailure.coreIntegrity(
@@ -860,7 +977,9 @@ final class CoreManager: @unchecked Sendable {
     ] {
       try requireSecureManagedFileIfPresent(url)
     }
-    try installBundledCoreIfNeeded()
+    if installBundledCore {
+      try installBundledCoreIfNeeded()
+    }
   }
 
   private func installBundledCoreIfNeeded() throws {
@@ -1156,7 +1275,8 @@ final class CoreManager: @unchecked Sendable {
       mode: effectiveState.mode,
       selectedNode: effectiveState.selectedNode,
       localSOCKSPort: effectiveState.localSOCKSEnabled ? effectiveState.localSOCKSPort : nil,
-      latencyTestURL: effectiveState.latencyTestURL
+      latencyTestURL: effectiveState.latencyTestURL,
+      ipv6Enabled: effectiveState.ipv6Enabled
     )
   }
 
@@ -1266,6 +1386,12 @@ final class CoreManager: @unchecked Sendable {
     try waitForAPI()
     try applyMode(state.mode)
     try applyNode(state.selectedNode)
+    let transition = ActiveIPv6PolicyTransition.afterExistingConfigurationRecovery(
+      activePolicyKnown: state.activeIPv6PolicyKnown,
+      activePolicy: state.activeIPv6Enabled
+    )
+    state.activeIPv6PolicyKnown = transition.known
+    state.activeIPv6Enabled = transition.value
     try saveState()
   }
 

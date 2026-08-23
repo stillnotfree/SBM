@@ -1,10 +1,15 @@
 import Darwin
 import Foundation
+import OSLog
 import SBMShared
 
 private final class HelperServer {
   private let socketName = "Listener"
   private let manager = CoreManager()
+  private let auditLogger = Logger(
+    subsystem: "com.stillnotfree.sbm.helper",
+    category: "ipc-audit"
+  )
 
   func run() throws {
     guard geteuid() == 0 else {
@@ -88,10 +93,14 @@ private final class HelperServer {
   }
 
   private func handle(_ descriptor: Int32) {
+    var peer: HelperPeerIdentity?
+    var request: HelperRequest?
+    let before = manager.auditSnapshot()
     let response: HelperResponse
     do {
-      try authenticatePeer(descriptor)
-      let request = try readRequest(from: descriptor)
+      peer = try authenticatePeer(descriptor)
+      request = try readRequest(from: descriptor)
+      guard let request else { throw HelperFailure.emptyRequest }
       guard request.protocolVersion == HelperConstants.protocolVersion else {
         throw HelperFailure.protocolMismatch
       }
@@ -107,7 +116,8 @@ private final class HelperServer {
           selectedNode: request.node,
           localSOCKSEnabled: request.localSOCKSEnabled,
           localSOCKSPort: request.localSOCKSPort,
-          latencyTestURL: request.latencyTestURL
+          latencyTestURL: request.latencyTestURL,
+          ipv6Enabled: request.ipv6Enabled
         )
       case .stop:
         response = try manager.stop()
@@ -149,10 +159,30 @@ private final class HelperServer {
         mode: current.mode,
         selectedNode: current.selectedNode,
         activeProfileID: current.activeProfileID,
+        activeIPv6Enabled: current.activeIPv6Enabled,
         nodes: current.nodes,
         runtimeOutcome: current.runtimeOutcome,
         message: error.localizedDescription
       )
+    }
+
+    if let peer, let request {
+      let after = manager.auditSnapshot()
+      let record = HelperAuditRecord(
+        action: request.action,
+        stopReason: request.stopReason
+          ?? (request.action == .shutdown ? .appTermination : nil),
+        peer: peer,
+        before: before,
+        after: after,
+        result: HelperAuditFormatter.result(
+          action: request.action,
+          response: response,
+          before: before,
+          after: after
+        )
+      )
+      auditLogger.notice("\(HelperAuditFormatter.message(record), privacy: .public)")
     }
 
     guard var encoded = try? JSONEncoder().encode(response) else { return }
@@ -173,29 +203,37 @@ private final class HelperServer {
     }
   }
 
-  private func authenticatePeer(_ descriptor: Int32) throws {
+  private func authenticatePeer(_ descriptor: Int32) throws -> HelperPeerIdentity {
     var uid: uid_t = 0
     var gid: gid_t = 0
     guard getpeereid(descriptor, &uid, &gid) == 0 else {
       throw HelperFailure.systemCall("getpeereid", errno)
     }
-    guard uid != 0 else { return }
-    guard let account = getpwuid(uid),
-      let adminGroup = getgrnam("admin")
-    else { throw HelperFailure.unauthorizedPeer }
+    if uid != 0 {
+      guard let account = getpwuid(uid),
+        let adminGroup = getgrnam("admin")
+      else { throw HelperFailure.unauthorizedPeer }
 
-    var groupCount: Int32 = 16
-    var groups = [Int32](repeating: 0, count: Int(groupCount))
-    let userName = account.pointee.pw_name
-    let primaryGroup = Int32(account.pointee.pw_gid)
-    var result = getgrouplist(userName, primaryGroup, &groups, &groupCount)
-    if result == -1 {
-      groups = [Int32](repeating: 0, count: Int(groupCount))
-      result = getgrouplist(userName, primaryGroup, &groups, &groupCount)
+      var groupCount: Int32 = 16
+      var groups = [Int32](repeating: 0, count: Int(groupCount))
+      let userName = account.pointee.pw_name
+      let primaryGroup = Int32(account.pointee.pw_gid)
+      var result = getgrouplist(userName, primaryGroup, &groups, &groupCount)
+      if result == -1 {
+        groups = [Int32](repeating: 0, count: Int(groupCount))
+        result = getgrouplist(userName, primaryGroup, &groups, &groupCount)
+      }
+      guard result >= 0,
+        groups.prefix(Int(groupCount)).contains(Int32(adminGroup.pointee.gr_gid))
+      else { throw HelperFailure.unauthorizedPeer }
     }
-    guard result >= 0,
-      groups.prefix(Int(groupCount)).contains(Int32(adminGroup.pointee.gr_gid))
-    else { throw HelperFailure.unauthorizedPeer }
+
+    let pid = HelperPeerIdentityResolver.processID(for: descriptor)
+    return HelperPeerIdentity(
+      pid: pid,
+      uid: uid,
+      executablePath: HelperPeerIdentityResolver.executablePath(for: pid)
+    )
   }
 
   private func readRequest(from descriptor: Int32) throws -> HelperRequest {

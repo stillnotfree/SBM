@@ -85,17 +85,11 @@ import Testing
   let configURL = temporary.appendingPathComponent("config.json")
   try built.data.write(to: configURL)
 
-  let process = Process()
-  let output = Pipe()
-  process.executableURL = core
-  process.arguments = ["check", "-c", configURL.path]
-  process.standardOutput = output
-  process.standardError = output
-  try process.run()
-  process.waitUntilExit()
-  let message =
-    String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-  #expect(process.terminationStatus == 0, Comment(rawValue: message))
+  let result = try TestProcessSupport.run(
+    executableURL: core,
+    arguments: ["check", "-c", configURL.path]
+  )
+  #expect(result.status == 0, Comment(rawValue: result.output))
 }
 
 @Test func managedShadowsocksConfigurationUsesStableTagAndExactOutbound() throws {
@@ -249,17 +243,11 @@ import Testing
 
     let configURL = temporary.appendingPathComponent("config.json")
     try built.data.write(to: configURL)
-    let process = Process()
-    let output = Pipe()
-    process.executableURL = core
-    process.arguments = ["check", "-c", configURL.path]
-    process.standardOutput = output
-    process.standardError = output
-    try process.run()
-    process.waitUntilExit()
-    let message =
-      String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    #expect(process.terminationStatus == 0, Comment(rawValue: message))
+    let result = try TestProcessSupport.run(
+      executableURL: core,
+      arguments: ["check", "-c", configURL.path]
+    )
+    #expect(result.status == 0, Comment(rawValue: result.output))
   }
 }
 
@@ -385,17 +373,11 @@ import Testing
 
   let configURL = temporary.appendingPathComponent("config.json")
   try built.data.write(to: configURL)
-  let process = Process()
-  let output = Pipe()
-  process.executableURL = core
-  process.arguments = ["check", "-c", configURL.path]
-  process.standardOutput = output
-  process.standardError = output
-  try process.run()
-  process.waitUntilExit()
-  let message =
-    String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-  #expect(process.terminationStatus == 0, Comment(rawValue: message))
+  let result = try TestProcessSupport.run(
+    executableURL: core,
+    arguments: ["check", "-c", configURL.path]
+  )
+  #expect(result.status == 0, Comment(rawValue: result.output))
 }
 
 @Test func routingPolicyRejectsUnmanagedOutbounds() throws {
@@ -487,17 +469,11 @@ import Testing
   let configURL = temporary.appendingPathComponent("config.json")
   try built.data.write(to: configURL)
   let project = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-  let process = Process()
-  let output = Pipe()
-  process.executableURL = project.appendingPathComponent(".vendor/sing-box")
-  process.arguments = ["check", "-c", configURL.path]
-  process.standardOutput = output
-  process.standardError = output
-  try process.run()
-  process.waitUntilExit()
-  let message =
-    String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-  #expect(process.terminationStatus == 0, Comment(rawValue: message))
+  let result = try TestProcessSupport.run(
+    executableURL: project.appendingPathComponent(".vendor/sing-box"),
+    arguments: ["check", "-c", configURL.path]
+  )
+  #expect(result.status == 0, Comment(rawValue: result.output))
 }
 
 @Test func nativeProfileExposesUserspaceEndpointAndPassesCoreCheck() throws {
@@ -546,17 +522,11 @@ import Testing
   let configURL = temporary.appendingPathComponent("config.json")
   try built.data.write(to: configURL)
   let project = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-  let process = Process()
-  let output = Pipe()
-  process.executableURL = project.appendingPathComponent(".vendor/sing-box")
-  process.arguments = ["check", "-c", configURL.path]
-  process.standardOutput = output
-  process.standardError = output
-  try process.run()
-  process.waitUntilExit()
-  let message =
-    String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-  #expect(process.terminationStatus == 0, Comment(rawValue: message))
+  let result = try TestProcessSupport.run(
+    executableURL: project.appendingPathComponent(".vendor/sing-box"),
+    arguments: ["check", "-c", configURL.path]
+  )
+  #expect(result.status == 0, Comment(rawValue: result.output))
 }
 
 @Test func nativeProfileRejectsPrivilegedLocalPaths() throws {
@@ -1141,4 +1111,64 @@ import Testing
     outbounds.first { ($0["tag"] as? String) == "provided-auto" })
   #expect(imported["url"] as? String == "https://profile.example.test/own-target")
   #expect(!outbounds.contains { ($0["tag"] as? String) == "sbm-auto" })
+}
+
+@Test func managedTLSGRPCConfigurationUsesTLSUTLSAndPinnedGRPCTransport() throws {
+  let profile = VPNProfile(connections: [
+    ManagedConnection(
+      id: ProxyNodeID(rawValue: "node-grpc"),
+      displayName: "TLS gRPC",
+      outbound: .vless(
+        VLESSProfile(
+          server: "grpc.example.test",
+          port: 443,
+          uuid: "00000000-0000-4000-8000-000000000001",
+          serverName: "grpc.example.test",
+          fingerprint: "chrome",
+          variant: .tlsGRPC(serviceName: "edge-service")
+        )
+      )
+    )
+  ])
+  let temporary = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMGRPC-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: temporary) }
+
+  let built = try ConfigBuilder(
+    cachePath: temporary.appendingPathComponent("cache.db").path,
+    apiSecret: "test-api-secret"
+  ).makeConfiguration(
+    profile: .compatibility(profile),
+    mode: .rule,
+    selectedNode: .auto
+  )
+  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
+  let outbounds = try #require(root["outbounds"] as? [[String: Any]])
+  let grpc = try #require(outbounds.first { ($0["tag"] as? String) == "node-grpc" })
+  #expect(grpc["type"] as? String == "vless")
+  #expect(grpc["domain_resolver"] as? String == "dns-local")
+  #expect(grpc["flow"] == nil)
+  #expect(grpc["network"] == nil)
+  #expect(grpc["packet_encoding"] == nil)
+  let tls = try #require(grpc["tls"] as? [String: Any])
+  #expect(tls["enabled"] as? Bool == true)
+  #expect(tls["server_name"] as? String == "grpc.example.test")
+  #expect(tls["reality"] == nil)
+  let utls = try #require(tls["utls"] as? [String: Any])
+  #expect(utls["enabled"] as? Bool == true)
+  #expect(utls["fingerprint"] as? String == "chrome")
+  let transport = try #require(grpc["transport"] as? [String: Any])
+  #expect(transport["type"] as? String == "grpc")
+  #expect(transport["service_name"] as? String == "edge-service")
+  #expect(transport["mode"] == nil)
+
+  let configURL = temporary.appendingPathComponent("config.json")
+  try built.data.write(to: configURL)
+  let project = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+  let result = try TestProcessSupport.run(
+    executableURL: project.appendingPathComponent(".vendor/sing-box"),
+    arguments: ["check", "-c", configURL.path]
+  )
+  #expect(result.status == 0, Comment(rawValue: result.output))
 }

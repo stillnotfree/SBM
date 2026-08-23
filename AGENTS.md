@@ -30,7 +30,6 @@
 - `Resources/`: bundle metadata, icon assets, and launchd plist.
 - `Core.lock`: exact reviewed upstream core version and input digests.
 - `ARCHITECTURE.md`: current security and process-boundary design.
-- `docs/research/`: evidence that can inform work but is not product policy.
 
 ## Security invariants
 

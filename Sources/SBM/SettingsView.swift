@@ -382,7 +382,7 @@ struct SettingsView: View {
               }
             }
           Picker(
-            "Route for \(rule.domain)",
+            SBMText.format("Route for %@", rule.domain),
             selection: Binding(
               get: { rule.target },
               set: { model.setWebsiteRoutingTarget(rule.id, target: $0) }
@@ -400,7 +400,7 @@ struct SettingsView: View {
             Button(role: .destructive) {
               model.removeWebsiteRoutingRule(rule.id)
             } label: {
-              Label("Remove \(rule.domain)", systemImage: "trash")
+              Label(SBMText.format("Remove %@", rule.domain), systemImage: "trash")
                 .labelStyle(.iconOnly)
             }
             .frame(width: routingActionButtonWidth)
@@ -563,6 +563,7 @@ struct SettingsView: View {
       deferredRuntimeApplyCallout
       latencySection
       localSOCKSSection
+      ipv6Section
       Section("Advanced Profile Import") {
         Button("Import Full JSON as New Profile…") {
           jsonImportKind = .nativeProfile
@@ -598,7 +599,7 @@ struct SettingsView: View {
               && model.latencyTestURLDraft == LatencyTargetPolicy.defaultURL
           )
         Spacer()
-        if model.latencyApplyInProgress { ProgressView().controlSize(.small) }
+        applyProgress(model.latencyApplyInProgress)
         Button("Apply") { _ = model.applyLatencySettings() }
           .keyboardShortcut(.defaultAction)
           .disabled(
@@ -640,7 +641,7 @@ struct SettingsView: View {
       }
       HStack {
         Spacer()
-        if model.localSOCKSApplyInProgress { ProgressView().controlSize(.small) }
+        applyProgress(model.localSOCKSApplyInProgress)
         Button("Apply") { _ = model.applyLocalSOCKSSettings() }
           .keyboardShortcut(.defaultAction)
           .disabled(
@@ -666,9 +667,35 @@ struct SettingsView: View {
     }
   }
 
+  private var ipv6Section: some View {
+    Section("Network Policy") {
+      settingsRow("IPv6") {
+        Toggle(
+          "IPv6",
+          isOn: Binding(
+            get: { model.ipv6Enabled },
+            set: { model.setIPv6Enabled($0) }
+          )
+        )
+        .labelsHidden()
+      }
+      Text(model.ipv6PolicyDescription).settingsHelperText()
+    }
+  }
+
   private var statusColor: Color {
     model.subscriptionStatusLevel == .warning
       ? .orange : model.subscriptionStatusLevel == .success ? .green : .secondary
+  }
+
+  private func applyProgress(_ isVisible: Bool) -> some View {
+    ZStack {
+      ProgressView()
+        .controlSize(.small)
+        .opacity(isVisible ? 1 : 0)
+    }
+    .frame(width: 16, height: 16)
+    .accessibilityHidden(!isVisible)
   }
 
   private var deferredRuntimeApplyCallout: some View {
@@ -680,11 +707,15 @@ struct SettingsView: View {
             Text(presentation.headline)
               .font(.callout.weight(.medium))
             Spacer()
-            if presentation.phase == .reconnecting {
+            if presentation.phase == .applying || presentation.phase == .reconnecting {
               ProgressView().controlSize(.small)
             }
             Button(presentation.action.title) { model.reconnectToApply() }
-              .disabled(presentation.phase == .reconnecting || model.helperSetupInProgress)
+              .disabled(
+                !presentation.actionEnabled
+                  || model.observedCoreState == .unknown
+                  || model.helperSetupInProgress
+              )
           }
           if let error = model.deferredRuntimeApplyError {
             Label(error, systemImage: "exclamationmark.triangle")
@@ -702,33 +733,38 @@ struct SettingsView: View {
   @ViewBuilder private func routingMutationFeedback(
     _ status: RoutingMutationPresentation
   ) -> some View {
-    switch status.state {
-    case .saved:
-      if let message = status.message {
-        Text(message).font(.caption).foregroundStyle(.secondary)
-      }
-    case .applying:
-      HStack(spacing: 6) {
+    HStack(spacing: 6) {
+      switch status.state {
+      case .saved:
+        if let message = status.message {
+          Text(message).font(.caption).foregroundStyle(.secondary)
+        }
+      case .applying:
         ProgressView().controlSize(.small)
         Text(status.message ?? "Routing change applying…")
+          .font(.caption).foregroundStyle(.secondary)
+      case .failed:
+        if let message = status.message {
+          Label(message, systemImage: "exclamationmark.triangle")
+            .font(.caption).foregroundStyle(.orange)
+            .textSelection(.enabled)
+        }
+      case .reconnectRequired:
+        Text("Saved; reconnect to apply")
+          .font(.caption).foregroundStyle(.secondary)
       }
-      .font(.caption).foregroundStyle(.secondary)
-    case .failed:
-      if let message = status.message {
-        Label(message, systemImage: "exclamationmark.triangle")
-          .font(.caption).foregroundStyle(.orange)
-          .textSelection(.enabled)
-      }
-    case .reconnectRequired:
-      EmptyView()
+      Spacer(minLength: 0)
     }
+    .frame(maxWidth: .infinity, minHeight: 18, alignment: .leading)
   }
 
   private func selectRoutedApplication(for ruleID: UUID? = nil) {
     let panel = NSOpenPanel()
-    panel.title = "Choose an Application"
-    panel.prompt = ruleID == nil ? "Add" : "Change"
-    panel.message = "Choose a macOS application. SBM will use its declared main executable."
+    panel.title = SBMText.localized("Choose an Application")
+    panel.prompt = SBMText.localized(ruleID == nil ? "Add" : "Change")
+    panel.message = SBMText.localized(
+      "Choose a macOS application. SBM will use its declared main executable."
+    )
     panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
     panel.allowedContentTypes = [.applicationBundle]
     panel.allowsMultipleSelection = false
@@ -749,7 +785,7 @@ struct SettingsView: View {
       }
       return
     }
-    NSApplication.shared.activate(ignoringOtherApps: true)
+    NSApplication.shared.activate()
     guard panel.runModal() == .OK, let url = panel.url else { return }
     if let ruleID {
       model.replaceApplicationRoutingRule(ruleID, from: url)

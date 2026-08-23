@@ -316,6 +316,11 @@ private enum DeferredMarkerTestError: Error {
   case coreStillRunning
 }
 
+private enum StopTransactionTestError: Error {
+  case stop
+  case persistence
+}
+
 @Test func deferredCandidatePersistsMarkerOnlyAfterValidationAndKeepsActiveState() throws {
   var state = PersistentState()
   let activeProfileID = UUID(uuidString: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")!
@@ -426,4 +431,49 @@ private enum DeferredMarkerTestError: Error {
     )
       == .applied
   )
+}
+
+@Test func failedCoreStopDoesNotPersistDesiredStateChange() {
+  var previous = PersistentState()
+  previous.desiredRunning = true
+  previous.automaticRecoveryAttempted = true
+  previous.deferredRuntimeApplyPending = true
+  var saves = 0
+
+  #expect(throws: StopTransactionTestError.self) {
+    try CoreStopTransaction.run(
+      previousState: previous,
+      stopKnownGood: { throw StopTransactionTestError.stop },
+      save: { _ in saves += 1 }
+    )
+  }
+
+  #expect(previous.desiredRunning)
+  #expect(previous.automaticRecoveryAttempted)
+  #expect(previous.deferredRuntimeApplyPending)
+  #expect(saves == 0)
+}
+
+@Test func successfulCoreStopPersistsOnlyAfterStopProof() throws {
+  var previous = PersistentState()
+  previous.desiredRunning = true
+  previous.automaticRecoveryAttempted = true
+  previous.deferredRuntimeApplyPending = true
+  var stopProven = false
+  var persisted: PersistentState?
+
+  let stopped = try CoreStopTransaction.run(
+    previousState: previous,
+    stopKnownGood: { stopProven = true },
+    save: { snapshot in
+      #expect(stopProven)
+      persisted = snapshot
+    }
+  )
+
+  #expect(!stopped.desiredRunning)
+  #expect(!stopped.automaticRecoveryAttempted)
+  #expect(!stopped.deferredRuntimeApplyPending)
+  #expect(persisted?.desiredRunning == false)
+  #expect(previous.desiredRunning)
 }

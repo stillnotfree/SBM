@@ -4,10 +4,18 @@
 <dict>
     <key>CFBundleDisplayName</key>
     <string>SBM</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
     <key>CFBundleExecutable</key>
     <string>SBM</string>
     <key>CFBundleIdentifier</key>
     <string>com.stillnotfree.sbm</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>ru</string>
+        <string>zh-Hans</string>
+    </array>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -15,9 +23,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.14</string>
+    <string>1.1.15</string>
     <key>CFBundleVersion</key>
-    <string>52</string>
+    <string>53</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSUIElement</key>

@@ -95,20 +95,22 @@ enum HelperLifecycleFailure: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .approvalRequired:
-      "Approve SBMHelper in System Settings, then return to SBM."
+      SBMText.localized("Approve SBMHelper in System Settings, then return to SBM.")
     case .registrationDidNotFinish:
-      "macOS did not enable the background helper. Approve it in System Settings, then return to SBM."
+      SBMText.localized(
+        "macOS did not enable the background helper. Approve it in System Settings, then return to SBM."
+      )
     case .replacementDidNotFinish(let detail):
       if let detail, !detail.isEmpty {
-        "macOS did not finish replacing the background helper: \(detail)"
+        SBMText.format("macOS did not finish replacing the background helper: %@", detail)
       } else {
-        "macOS did not finish replacing the background helper."
+        SBMText.localized("macOS did not finish replacing the background helper.")
       }
     case .startupTimedOut(let detail):
       if let detail, !detail.isEmpty {
-        "The background helper did not start: \(detail)"
+        SBMText.format("The background helper did not start: %@", detail)
       } else {
-        "The background helper did not start."
+        SBMText.localized("The background helper did not start.")
       }
     }
   }

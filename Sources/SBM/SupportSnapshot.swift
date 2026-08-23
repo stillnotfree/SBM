@@ -211,20 +211,44 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
 
   var statusText: String {
     var lines = [
-      "SBM support snapshot (observations only)",
-      "Schema: \(schemaVersion)",
-      "Captured: \(capturedAt)",
-      "Active DNS/network probes run: no",
-      "App: \(app.version) (\(app.build))",
-      "macOS: \(app.macOS)",
-      "Helper: \(helper.state.rawValue)",
-      "Helper version: \(helper.version ?? "unknown"), revision: \(helper.revision.map(String.init) ?? "unknown")",
-      "Core: \(core.state.rawValue), \(core.version ?? "unknown")",
-      "Routing mode: \(routingMode.rawValue)",
-      "Profile: \(profile.kind.rawValue), updated \(profile.updatedAt ?? "never")",
-      "Profile library: \(profile.libraryAvailable ? "available" : "unavailable"), sources: \(profile.sourceCount)\(profile.sourceCountCapped ? "+" : "")",
-      "Local SOCKS5: \(localSOCKS.enabled ? "enabled on 127.0.0.1:\(localSOCKS.port ?? 0)" : "disabled")",
-      "Selected protocol: \(selectedProtocolKind?.rawValue ?? "none")",
+      SBMText.localized("SBM support snapshot (observations only)"),
+      SBMText.format("Schema: %@", String(schemaVersion)),
+      SBMText.format("Captured: %@", capturedAt),
+      SBMText.localized("Active DNS/network probes run: no"),
+      SBMText.format("App: %@ (%@)", app.version, app.build),
+      SBMText.format("macOS: %@", app.macOS),
+      SBMText.format("Helper: %@", helper.state.rawValue),
+      SBMText.format(
+        "Helper version: %@, revision: %@",
+        helper.version ?? SBMText.localized("unknown"),
+        helper.revision.map(String.init) ?? SBMText.localized("unknown")
+      ),
+      SBMText.format(
+        "Core: %@, %@",
+        core.state.rawValue,
+        core.version ?? SBMText.localized("unknown")
+      ),
+      SBMText.format("Routing mode: %@", SBMText.localized(routingMode.rawValue)),
+      SBMText.format(
+        "Profile: %@, updated %@",
+        profile.kind.rawValue,
+        profile.updatedAt ?? SBMText.localized("never")
+      ),
+      SBMText.format(
+        "Profile library: %@, sources: %@",
+        SBMText.localized(profile.libraryAvailable ? "available" : "unavailable"),
+        "\(profile.sourceCount)\(profile.sourceCountCapped ? "+" : "")"
+      ),
+      SBMText.format(
+        "Local SOCKS5: %@",
+        localSOCKS.enabled
+          ? SBMText.format("enabled on 127.0.0.1:%@", String(localSOCKS.port ?? 0))
+          : SBMText.localized("disabled")
+      ),
+      SBMText.format(
+        "Selected protocol: %@",
+        selectedProtocolKind?.rawValue ?? SBMText.localized("none")
+      ),
     ]
     for summary in protocolSummaries {
       let range: String
@@ -233,18 +257,31 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
       {
         range = minimum == maximum ? "\(minimum) ms" : "\(minimum)-\(maximum) ms"
       } else {
-        range = "not measured"
+        range = SBMText.localized("not measured")
       }
       lines.append(
-        "\(summary.kind.rawValue): \(summary.nodeCount) nodes, \(summary.delays.measuredCount) measured, \(summary.delays.unmeasuredCount) unmeasured, \(range)"
+        SBMText.format(
+          "%@: %@ nodes, %@ measured, %@ unmeasured, %@",
+          summary.kind.rawValue,
+          String(summary.nodeCount),
+          String(summary.delays.measuredCount),
+          String(summary.delays.unmeasuredCount),
+          range
+        )
       )
     }
-    if nodeObservationsCapped { lines.append("Node observations: capped") }
-    lines.append(lastError.map { "Last error: \($0)" } ?? "No current error.")
+    if nodeObservationsCapped { lines.append(SBMText.localized("Node observations: capped")) }
+    lines.append(
+      lastError.map { SBMText.format("Last error: %@", $0) }
+        ?? SBMText.localized("No current error.")
+    )
     let output = lines.joined(separator: "\n")
     guard output.utf8.count <= Self.maximumTextBytes else {
-      return
-        "SBM support snapshot (observations only)\nSnapshot text omitted: too large\nActive DNS/network probes run: no"
+      return [
+        SBMText.localized("SBM support snapshot (observations only)"),
+        SBMText.localized("Snapshot text omitted: too large"),
+        SBMText.localized("Active DNS/network probes run: no"),
+      ].joined(separator: "\n")
     }
     return output
   }
@@ -253,12 +290,17 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
     var lines = [statusText]
     let suffix =
       recentErrorsTruncated
-      ? " (\(recentErrors.count) of \(recentErrorCount) exported; truncated)" : ""
-    lines.append("Recent errors: \(recentErrorCount)\(suffix)")
+      ? SBMText.format(
+        " (%@ of %@ exported; truncated)",
+        String(recentErrors.count),
+        String(recentErrorCount)
+      ) : ""
+    lines.append(SBMText.format("Recent errors: %@%@", String(recentErrorCount), suffix))
     lines.append(contentsOf: recentErrors.map { "- \($0)" })
     let output = lines.joined(separator: "\n")
     guard output.utf8.count <= Self.maximumTextBytes else {
-      return statusText + "\nRecent errors: truncated to preserve the current status"
+      return statusText + "\n"
+        + SBMText.localized("Recent errors: truncated to preserve the current status")
     }
     return output
   }

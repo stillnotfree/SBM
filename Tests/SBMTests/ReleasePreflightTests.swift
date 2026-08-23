@@ -177,9 +177,7 @@ private final class ReleasePreflightFixture {
     metadataOnly: Bool = true,
     environment: [String: String]? = nil
   ) throws -> (status: Int32, output: String) {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/swift")
-    process.arguments = [
+    var arguments = [
       FileManager.default.currentDirectoryPath + "/scripts/release-preflight.swift",
       "--root",
       root.path,
@@ -187,18 +185,15 @@ private final class ReleasePreflightFixture {
       tag,
     ]
     if metadataOnly {
-      process.arguments?.append("--metadata-only")
+      arguments.append("--metadata-only")
     }
-    process.environment = environment
-    let output = Pipe()
-    process.standardOutput = output
-    process.standardError = output
-    try process.run()
-    process.waitUntilExit()
-    return (
-      process.terminationStatus,
-      String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    let result = try TestProcessSupport.run(
+      executableURL: URL(fileURLWithPath: "/usr/bin/swift"),
+      arguments: arguments,
+      currentDirectoryURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+      environment: environment
     )
+    return (result.status, result.output)
   }
 
   func write(_ contents: String, to relativePath: String) throws {
@@ -211,13 +206,12 @@ private final class ReleasePreflightFixture {
   }
 
   func git(_ arguments: [String]) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["git"] + arguments
-    process.currentDirectoryURL = root
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
+    let result = try TestProcessSupport.run(
+      executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+      arguments: ["git"] + arguments,
+      currentDirectoryURL: root
+    )
+    guard result.status == 0 else {
       throw CocoaError(.fileWriteUnknown)
     }
   }

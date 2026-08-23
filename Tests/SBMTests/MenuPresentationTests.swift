@@ -58,3 +58,20 @@ import Testing
   #expect(stopped.headline == "Changes ready to apply")
   #expect(stopped.action.title == "Reconnect to Apply")
 }
+
+@Test func deferredRuntimeApplyKeepsStableApplyingPresentationAndDisablesAction() {
+  let applying = DeferredRuntimeApplyPresentation(
+    headline: "Applying…",
+    action: .reconnect,
+    phase: .applying
+  )
+  #expect(applying.headline == "Applying…")
+  #expect(!applying.actionEnabled)
+
+  let pending = DeferredRuntimeApplyPresentation(
+    headline: DeferredRuntimeApplyPresentation.changesReadyToApply,
+    action: .reconnect,
+    phase: .pending
+  )
+  #expect(pending.actionEnabled)
+}

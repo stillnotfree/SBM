@@ -231,6 +231,38 @@ import Testing
   #expect(compatibility.connections.map(\.kind) == [.vless, .hysteria2, .shadowsocks])
 }
 
+@Test func interleavedSubscriptionPreservesRecognizedSourceOrder() throws {
+  let realityQuery = [
+    URLQueryItem(name: "flow", value: "xtls-rprx-vision"),
+    URLQueryItem(name: "security", value: "reality"),
+    URLQueryItem(name: "sni", value: "reality.example.test"),
+    URLQueryItem(name: "fp", value: "chrome"),
+    URLQueryItem(
+      name: "pbk",
+      value: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU"
+    ),
+    URLQueryItem(name: "sid", value: "bb6b725b"),
+    URLQueryItem(name: "type", value: "tcp"),
+  ]
+  let links = [
+    makeVLESSLink(uuid: syntheticUUID(300), queryItems: realityQuery, fragment: "VLESS A"),
+    makeHysteria2Link(host: "hy-a.example.test", fragment: "Hysteria B"),
+    makeVLESSLink(uuid: syntheticUUID(301), queryItems: realityQuery, fragment: "VLESS C"),
+    "ss://aes-128-gcm:password@ss.example.test:443/#Shadowsocks D",
+  ].joined(separator: "\n")
+
+  let profile = try SubscriptionClient.parsePayload(links)
+  guard case .compatibility(let compatibility) = profile else {
+    Issue.record("Expected a compatibility subscription")
+    return
+  }
+  #expect(compatibility.connections.map(\.kind) == [.vless, .hysteria2, .vless, .shadowsocks])
+  #expect(
+    compatibility.connections.map(\.displayName)
+      == ["VLESS A", "Hysteria B", "VLESS C", "Shadowsocks D"]
+  )
+}
+
 @Test func reconciliationPreservesStableIDsAcrossRenameReorderAndDuplicates() throws {
   let outbound = ManagedOutbound.shadowsocks(
     ShadowsocksProfile(
@@ -456,6 +488,7 @@ import Testing
   }
   #expect(profile.vless.count == 1)
   #expect(profile.hysteria2.count == 1)
+  #expect(profile.connections.map(\.kind) == [.vless, .hysteria2])
   #expect(result.skippedTransports == ["xhttp": 1])
   #expect(result.warningDescription?.contains("2 connections imported") == true)
   #expect(result.warningDescription?.contains("1 XHTTP connection skipped") == true)
@@ -494,6 +527,25 @@ import Testing
   ] {
     #expect(!warning.contains(secret))
   }
+}
+
+@Test func invalidRecognizedSubscriptionLineDoesNotDisturbNeighboringOrder() throws {
+  let validVLESS =
+    "vless://5efab93b-90d0-4904-93d6-44b4f0b00001@203.0.113.10:443?flow=xtls-rprx-vision&security=reality&sni=www.debian.org&fp=firefox&pbk=Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU&sid=bb6b725b&type=tcp#VLESS"
+  let invalidHysteria =
+    "hysteria2://password@invalid.example.test:443/?sni=invalid.example.test&obfs=unsupported#Invalid"
+  let validShadowsocks = "ss://aes-128-gcm:password@ss.example.test:443/#Shadowsocks"
+
+  let result = try SubscriptionClient.parsePayloadResult(
+    [validVLESS, invalidHysteria, validShadowsocks].joined(separator: "\n")
+  )
+  guard case .compatibility(let profile) = result.profile else {
+    Issue.record("Expected a compatibility subscription")
+    return
+  }
+  #expect(profile.connections.map(\.kind) == [.vless, .shadowsocks])
+  #expect(profile.connections.map(\.displayName) == ["VLESS", "Shadowsocks"])
+  #expect(result.skippedInvalidConnections[.hysteria2] == 1)
 }
 
 @Test func allInvalidRecognizedLinksStillFailClosed() {
@@ -682,6 +734,56 @@ private actor SubscriptionFetchCounter {
   #expect(groups[1].nodes == [compatibility.connections[1].id])
 }
 
+@Test func profileAggregatorPreservesParsedOrderWithinAndAcrossSources() throws {
+  let realityQuery = [
+    URLQueryItem(name: "flow", value: "xtls-rprx-vision"),
+    URLQueryItem(name: "security", value: "reality"),
+    URLQueryItem(name: "sni", value: "reality.example.test"),
+    URLQueryItem(name: "fp", value: "chrome"),
+    URLQueryItem(
+      name: "pbk",
+      value: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU"
+    ),
+    URLQueryItem(name: "sid", value: "bb6b725b"),
+    URLQueryItem(name: "type", value: "tcp"),
+  ]
+  let first = try SubscriptionClient.parsePayload(
+    [
+      makeVLESSLink(uuid: syntheticUUID(302), queryItems: realityQuery, fragment: "First VLESS"),
+      makeHysteria2Link(host: "first-hy.example.test", fragment: "First HY2"),
+    ].joined(separator: "\n")
+  )
+  let second = try SubscriptionClient.parsePayload(
+    [
+      "ss://aes-128-gcm:password@second-ss.example.test:443/#Second SS",
+      makeVLESSLink(uuid: syntheticUUID(303), queryItems: realityQuery, fragment: "Second VLESS"),
+    ].joined(separator: "\n")
+  )
+
+  let merged = try ProfileAggregator.merge(
+    sources: [
+      ManagedSource(name: "First", value: "ss://first", payload: first),
+      ManagedSource(name: "Second", value: "ss://second", payload: second),
+    ],
+    routingPolicy: nil
+  )
+  guard case .compatibility(let compatibility) = merged else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(
+    compatibility.connections.map(\.displayName)
+      == ["First VLESS", "First HY2", "Second SS", "Second VLESS"]
+  )
+  #expect(
+    compatibility.nodeGroups?.map(\.nodes)
+      == [
+        Array(compatibility.connections[0..<2].map(\.id)),
+        Array(compatibility.connections[2..<4].map(\.id)),
+      ]
+  )
+}
+
 @Test func profileAggregatorAppliesPerSourceExcludeRegex() throws {
   let payload = try SubscriptionClient.parsePayload(
     """
@@ -859,4 +961,308 @@ private actor SubscriptionFetchCounter {
   #expect(throws: SubscriptionFailure.self) {
     try SubscriptionClient.parsePayload(body)
   }
+}
+
+@Test func hysteria2FMCompatibilityMapsOnlyTheConfirmedShapes() throws {
+  let fmSalamander = #"{"udp":[{"type":"salamander","settings":{"password":"fm-salamander"}}]}"#
+  let fmLink = makeHysteria2Link(fm: fmSalamander)
+  let parsed = try SubscriptionClient.parsePayload(fmLink)
+  guard case .compatibility(let profile) = parsed else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(profile.hysteria2.first?.obfsPassword == "fm-salamander")
+
+  let matching = makeHysteria2Link(
+    fm: fmSalamander,
+    obfsPassword: "fm-salamander"
+  )
+  let matchingProfile = try SubscriptionClient.parsePayload(matching)
+  guard case .compatibility(let matchingCompatibility) = matchingProfile else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(matchingCompatibility.hysteria2.first?.obfsPassword == "fm-salamander")
+
+  let conflicting = makeHysteria2Link(
+    fm: fmSalamander,
+    obfsPassword: "different-salamander"
+  )
+  #expect(throws: SubscriptionFailure.ambiguousHysteria2FM) {
+    try SubscriptionClient.parsePayload(conflicting)
+  }
+
+  let fmQuic = #"{"quicParams":{"maxIncomingStreams":32}}"#
+  let quicProfile = try SubscriptionClient.parsePayload(makeHysteria2Link(fm: fmQuic))
+  let built = try ConfigBuilder(cachePath: "/tmp/sbm-fm-cache", apiSecret: "test-secret")
+    .makeConfiguration(profile: quicProfile, mode: .rule, selectedNode: .auto)
+  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
+  let outbounds = try #require(root["outbounds"] as? [[String: Any]])
+  let hysteria = try #require(outbounds.first { ($0["type"] as? String) == "hysteria2" })
+  #expect(hysteria["obfs"] == nil)
+  #expect(!String(data: built.data, encoding: .utf8)!.contains("maxIncomingStreams"))
+
+  for invalid in [
+    #"{"quicParams":{"maxIncomingStreams":1,"extra":true}}"#,
+    #"{"quicParams":{"maxIncomingStreams":1.5}}"#,
+    #"{"udp":[{"type":"salamander","settings":{"password":"x"}},{"type":"other","settings":{}}]}"#,
+    #"{"unknown":{"password":"fm-secret"}}"#,
+  ] {
+    #expect(throws: SubscriptionFailure.invalidHysteria2FM) {
+      try SubscriptionClient.parsePayload(makeHysteria2Link(fm: invalid))
+    }
+  }
+}
+
+@Test func hysteria2FMDiagnosticsNeverExposeRawSecrets() throws {
+  let secret = "fm-diagnostic-secret"
+  let invalid = makeHysteria2Link(
+    fm: #"{"unknown":{"password":"fm-diagnostic-secret"}}"#
+  )
+  let valid = makeHysteria2Link(host: "valid-hy.example.test")
+  let result = try SubscriptionClient.parsePayloadResult(valid + "\n" + invalid)
+  let warning = try #require(result.warningDescription)
+  #expect(warning.contains("unsupported or malformed fm"))
+  #expect(!warning.contains(secret))
+}
+
+@Test func realitySpiderXIsValidatedAndDoesNotChangeRuntimeSemantics() throws {
+  let common = [
+    URLQueryItem(name: "flow", value: "xtls-rprx-vision"),
+    URLQueryItem(name: "security", value: "reality"),
+    URLQueryItem(name: "sni", value: "reality.example.test"),
+    URLQueryItem(name: "fp", value: "chrome"),
+    URLQueryItem(name: "pbk", value: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU"),
+    URLQueryItem(name: "sid", value: "bb6b725b"),
+    URLQueryItem(name: "type", value: "tcp"),
+  ]
+  let without = makeVLESSLink(queryItems: common)
+  let withSpiderX = makeVLESSLink(
+    queryItems: common + [URLQueryItem(name: "spx", value: "/fallback")]
+  )
+  let withoutProfile = try SubscriptionClient.parsePayload(without)
+  let withProfile = try SubscriptionClient.parsePayload(withSpiderX)
+  #expect(withoutProfile == withProfile)
+
+  let withoutBuilt = try ConfigBuilder(cachePath: "/tmp/sbm-spx-cache", apiSecret: "test-secret")
+    .makeConfiguration(profile: withoutProfile, mode: .rule, selectedNode: .auto)
+  let withBuilt = try ConfigBuilder(cachePath: "/tmp/sbm-spx-cache", apiSecret: "test-secret")
+    .makeConfiguration(profile: withProfile, mode: .rule, selectedNode: .auto)
+  #expect(withoutBuilt.data == withBuilt.data)
+
+  for invalid in ["fallback", "", "\n/fallback"] {
+    #expect(throws: SubscriptionFailure.invalidVLESS) {
+      try SubscriptionClient.parsePayload(
+        makeVLESSLink(queryItems: common + [URLQueryItem(name: "spx", value: invalid)])
+      )
+    }
+  }
+}
+
+@Test func vlessTLSGRPCSupportsGunAndRejectsXrayOnlyModes() throws {
+  let base = [
+    URLQueryItem(name: "encryption", value: "none"),
+    URLQueryItem(name: "security", value: "tls"),
+    URLQueryItem(name: "type", value: "grpc"),
+    URLQueryItem(name: "serviceName", value: "edge-service"),
+    URLQueryItem(name: "sni", value: "grpc.example.test"),
+    URLQueryItem(name: "fp", value: "firefox"),
+  ]
+  let omittedMode = try SubscriptionClient.parsePayload(makeVLESSLink(queryItems: base))
+  guard case .compatibility(let compatibility) = omittedMode,
+    case .vless(let vless) = try #require(compatibility.connections.first?.outbound)
+  else {
+    Issue.record("Expected a VLESS compatibility connection")
+    return
+  }
+  #expect(vless.variant == .tlsGRPC(serviceName: "edge-service"))
+  #expect(vless.grpcServiceName == "edge-service")
+  #expect(vless.publicKey.isEmpty)
+
+  _ = try SubscriptionClient.parsePayload(
+    makeVLESSLink(queryItems: base + [URLQueryItem(name: "mode", value: "gun")])
+  )
+  for mode in ["multi", "guna"] {
+    let link = makeVLESSLink(queryItems: base + [URLQueryItem(name: "mode", value: mode)])
+    #expect(throws: SubscriptionFailure.unsupportedVLESSGRPCMode) {
+      try SubscriptionClient.parsePayload(link)
+    }
+    let result = try SubscriptionClient.parsePayloadResult(
+      makeVLESSLink(queryItems: base) + "\n" + link
+    )
+    #expect(result.skippedReasons[.unsupportedVLESSGRPCMode] == 1)
+    #expect(result.warningDescription?.contains("unsupported mode") == true)
+  }
+
+  #expect(throws: SubscriptionFailure.unsupportedVLESSParameter) {
+    try SubscriptionClient.parsePayload(
+      makeVLESSLink(
+        queryItems: base.filter { $0.name != "serviceName" }
+      )
+    )
+  }
+  #expect(throws: SubscriptionFailure.unsupportedVLESSParameter) {
+    try SubscriptionClient.parsePayload(
+      makeVLESSLink(
+        queryItems: base + [URLQueryItem(name: "flow", value: "xtls-rprx-vision")]
+      )
+    )
+  }
+}
+
+@Test func observedMixedSubscriptionTopologyImportsThirteenAndSkipsTwentyXHTTP() throws {
+  let realityBase = [
+    URLQueryItem(name: "flow", value: "xtls-rprx-vision"),
+    URLQueryItem(name: "security", value: "reality"),
+    URLQueryItem(name: "sni", value: "reality.example.test"),
+    URLQueryItem(name: "fp", value: "chrome"),
+    URLQueryItem(name: "pbk", value: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU"),
+    URLQueryItem(name: "sid", value: "bb6b725b"),
+    URLQueryItem(name: "type", value: "tcp"),
+  ]
+  let realities = (0..<3).map { index in
+    makeVLESSLink(
+      uuid: syntheticUUID(index),
+      host: "203.0.113.\(10 + index)",
+      queryItems: realityBase
+        + (index < 2
+          ? [URLQueryItem(name: "spx", value: "/fallback")]
+          : [])
+    )
+  }
+  let grpc = makeVLESSLink(
+    uuid: syntheticUUID(3),
+    host: "203.0.113.20",
+    queryItems: [
+      URLQueryItem(name: "encryption", value: "none"),
+      URLQueryItem(name: "security", value: "tls"),
+      URLQueryItem(name: "type", value: "grpc"),
+      URLQueryItem(name: "serviceName", value: "edge-service"),
+      URLQueryItem(name: "sni", value: "grpc.example.test"),
+      URLQueryItem(name: "fp", value: "chrome"),
+      URLQueryItem(name: "mode", value: "gun"),
+    ]
+  )
+  let hysteria = (0..<7).map { index in
+    makeHysteria2Link(host: "hy\(index).example.test")
+  }
+  let salamander = makeHysteria2Link(
+    host: "hy-salamander.example.test",
+    fm: #"{"udp":[{"type":"salamander","settings":{"password":"fm-salamander"}}]}"#
+  )
+  let quic = makeHysteria2Link(
+    host: "hy-quic.example.test",
+    fm: #"{"quicParams":{"maxIncomingStreams":32}}"#
+  )
+  let xhttp = (0..<20).map { index in
+    makeVLESSLink(
+      uuid: syntheticUUID(100 + index),
+      host: "198.51.100.\(index + 1)",
+      queryItems: [URLQueryItem(name: "type", value: "xhttp")]
+    )
+  }
+
+  let result = try SubscriptionClient.parsePayloadResult(
+    (realities + [grpc] + hysteria + [salamander, quic] + xhttp).joined(separator: "\n")
+  )
+  guard case .compatibility(let profile) = result.profile else {
+    Issue.record("Expected a compatibility profile")
+    return
+  }
+  #expect(profile.connections.count == 13)
+  #expect(result.skippedTransports == ["xhttp": 20])
+  #expect(result.warningDescription?.contains("20 XHTTP connections skipped") == true)
+}
+
+@Test func managedVLESSVariantsPreserveLegacyRealityAndRoundTripGRPC() throws {
+  let reality = VLESSProfile(
+    server: "203.0.113.10",
+    port: 443,
+    uuid: syntheticUUID(200),
+    serverName: "reality.example.test",
+    fingerprint: "chrome",
+    publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
+    shortID: "bb6b725b"
+  )
+  let realityObject = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(reality)) as? [String: Any]
+  )
+  #expect(realityObject["security"] == nil)
+  #expect(realityObject["publicKey"] as? String == reality.publicKey)
+  #expect(
+    try JSONDecoder().decode(VLESSProfile.self, from: JSONEncoder().encode(reality)) == reality)
+
+  let grpc = VLESSProfile(
+    server: "grpc.example.test",
+    port: 443,
+    uuid: syntheticUUID(201),
+    serverName: "grpc.example.test",
+    fingerprint: "firefox",
+    variant: .tlsGRPC(serviceName: "edge-service")
+  )
+  let connection = ManagedConnection(
+    id: ProxyNodeID(rawValue: "legacy-node"), displayName: "gRPC", outbound: .vless(grpc))
+  let profile = CoreProfile.compatibility(VPNProfile(connections: [connection]))
+  let roundTripped = try JSONDecoder().decode(
+    CoreProfile.self,
+    from: JSONEncoder().encode(profile)
+  )
+  #expect(roundTripped == profile)
+  #expect(
+    connection.semanticIdentity
+      == ManagedConnection(id: connection.id, displayName: "Renamed", outbound: .vless(grpc))
+      .semanticIdentity)
+  let grpcObject = try #require(
+    JSONSerialization.jsonObject(with: JSONEncoder().encode(grpc)) as? [String: Any]
+  )
+  #expect(grpcObject["security"] as? String == "tls")
+  #expect(grpcObject["type"] as? String == "grpc")
+  #expect(grpcObject["publicKey"] == nil)
+  #expect(grpcObject["shortID"] == nil)
+}
+
+private func syntheticUUID(_ index: Int) -> String {
+  String(format: "00000000-0000-4000-8000-%012x", index + 1)
+}
+
+private func makeVLESSLink(
+  uuid: String = syntheticUUID(999),
+  host: String = "203.0.113.10",
+  queryItems: [URLQueryItem],
+  fragment: String = "Synthetic"
+) -> String {
+  var components = URLComponents()
+  components.scheme = "vless"
+  components.user = uuid
+  components.host = host
+  components.port = 443
+  components.queryItems = queryItems
+  components.fragment = fragment
+  return components.string!
+}
+
+private func makeHysteria2Link(
+  host: String = "hy.example.test",
+  fm: String? = nil,
+  obfsPassword: String? = nil,
+  fragment: String = "Synthetic Hysteria2"
+) -> String {
+  var components = URLComponents()
+  components.scheme = "hysteria2"
+  components.user = "hy-password"
+  components.host = host
+  components.port = 443
+  var queryItems = [URLQueryItem(name: "sni", value: host)]
+  if let obfsPassword {
+    queryItems += [
+      URLQueryItem(name: "obfs", value: "salamander"),
+      URLQueryItem(name: "obfs-password", value: obfsPassword),
+    ]
+  }
+  if let fm {
+    queryItems.append(URLQueryItem(name: "fm", value: fm))
+  }
+  components.queryItems = queryItems
+  components.fragment = fragment
+  return components.string!
 }

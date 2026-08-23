@@ -181,10 +181,11 @@ private struct LegacyProfileLibraryDTO: Decodable {
   let localSOCKSPort: UInt16
   let latencyIntervalMinutes: Int
   let latencyTestURL: String
+  let ipv6Enabled: Bool
 
   private enum CodingKeys: String, CodingKey {
     case profiles, selectedProfileID, localSOCKSEnabled, localSOCKSPort, latencyIntervalMinutes,
-      latencyTestURL
+      latencyTestURL, ipv6Enabled
   }
 
   init(from decoder: Decoder) throws {
@@ -200,6 +201,7 @@ private struct LegacyProfileLibraryDTO: Decodable {
       try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
         ?? LatencyTargetPolicy.defaultURL
     )
+    ipv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .ipv6Enabled) ?? false
   }
 
   func currentLibrary() -> ProfileLibrary {
@@ -209,7 +211,8 @@ private struct LegacyProfileLibraryDTO: Decodable {
       localSOCKSEnabled: localSOCKSEnabled,
       localSOCKSPort: localSOCKSPort,
       latencyIntervalMinutes: latencyIntervalMinutes,
-      latencyTestURL: latencyTestURL
+      latencyTestURL: latencyTestURL,
+      ipv6Enabled: ipv6Enabled
     )
   }
 }
@@ -275,10 +278,11 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
   var localSOCKSPort: UInt16
   var latencyIntervalMinutes: Int
   var latencyTestURL: String
+  var ipv6Enabled: Bool
   /// Not encoded. ProfileStore writes the upgraded schema before it is used.
   var requiresMigration = false
 
-  static let currentSchemaVersion = 5
+  static let currentSchemaVersion = 6
 
   private enum CodingKeys: String, CodingKey {
     case profiles
@@ -287,6 +291,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
     case localSOCKSPort
     case latencyIntervalMinutes
     case latencyTestURL
+    case ipv6Enabled
     case schemaVersion
   }
 
@@ -296,7 +301,8 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
     localSOCKSEnabled: Bool = false,
     localSOCKSPort: UInt16 = 1082,
     latencyIntervalMinutes: Int = 10,
-    latencyTestURL: String = LatencyTargetPolicy.defaultURL
+    latencyTestURL: String = LatencyTargetPolicy.defaultURL,
+    ipv6Enabled: Bool = false
   ) {
     self.profiles = profiles
     self.selectedProfileID = selectedProfileID
@@ -304,6 +310,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
     self.localSOCKSPort = localSOCKSPort
     self.latencyIntervalMinutes = max(latencyIntervalMinutes, 1)
     self.latencyTestURL = latencyTestURL
+    self.ipv6Enabled = ipv6Enabled
   }
 
   init(from decoder: Decoder) throws {
@@ -324,6 +331,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
       localSOCKSPort = legacy.localSOCKSPort
       latencyIntervalMinutes = legacy.latencyIntervalMinutes
       latencyTestURL = legacy.latencyTestURL
+      ipv6Enabled = legacy.ipv6Enabled
       requiresMigration = true
       return
     }
@@ -340,6 +348,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
       try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
       ?? LatencyTargetPolicy.defaultURL
     latencyTestURL = try LatencyTargetPolicy.normalized(storedTarget)
+    ipv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .ipv6Enabled) ?? false
     if version < Self.currentSchemaVersion {
       requiresMigration = true
     }
@@ -353,6 +362,7 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
     try container.encode(localSOCKSPort, forKey: .localSOCKSPort)
     try container.encode(latencyIntervalMinutes, forKey: .latencyIntervalMinutes)
     try container.encode(latencyTestURL, forKey: .latencyTestURL)
+    try container.encode(ipv6Enabled, forKey: .ipv6Enabled)
     try container.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
   }
 

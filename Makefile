@@ -2,7 +2,7 @@ SHELL := /bin/zsh
 
 APP_NAME := SBM
 BUNDLE_NAME := SBM
-APP_VERSION := 1.1.14
+APP_VERSION := 1.1.15
 include Core.lock
 CORE_ARCHIVE := .vendor/sing-box-$(CORE_VERSION)-darwin-arm64.tar.gz
 CORE_UPSTREAM_BINARY := .vendor/sing-box-upstream
@@ -10,12 +10,13 @@ CORE_BINARY := .vendor/sing-box
 CORE_DIGEST_FILE := .vendor/sing-box.signed.sha256
 CORE_BUILD_INFO := Sources/SBMShared/CoreBuildInfo.swift
 BUILD_DIR := .build/arm64-apple-macosx/release
+RESOURCE_BUNDLE := $(BUILD_DIR)/SBM_SBM.bundle
 DIST_DIR := dist
 APP_BUNDLE := $(DIST_DIR)/$(BUNDLE_NAME).app
 DMG := $(DIST_DIR)/$(APP_NAME)-$(APP_VERSION)-arm64.dmg
 ASSET_INFO_PLIST := $(DIST_DIR)/asset-info.plist
 
-.PHONY: build core app dmg clean release-check
+.PHONY: build core app validate-packaged-localization dmg clean release-check
 
 release-check:
 	@if [[ -z "$${TAG:-}" ]]; then \
@@ -70,9 +71,13 @@ app: build
 	cp "$(BUILD_DIR)/SBM" "$(APP_BUNDLE)/Contents/MacOS/SBM"
 	cp "$(BUILD_DIR)/SBMHelper" "$(APP_BUNDLE)/Contents/Resources/SBMHelper"
 	cp "$(CORE_BINARY)" "$(APP_BUNDLE)/Contents/Resources/sing-box"
+	cp -R "$(RESOURCE_BUNDLE)/en.lproj" "$(APP_BUNDLE)/Contents/Resources/"
+	cp -R "$(RESOURCE_BUNDLE)/ru.lproj" "$(APP_BUNDLE)/Contents/Resources/"
+	cp -R "$(RESOURCE_BUNDLE)/zh-hans.lproj" "$(APP_BUNDLE)/Contents/Resources/zh-Hans.lproj"
 	cp THIRD_PARTY_NOTICES.md "$(APP_BUNDLE)/Contents/Resources/THIRD_PARTY_NOTICES.md"
 	cp Resources/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	cp Resources/com.stillnotfree.sbm.helper.plist "$(APP_BUNDLE)/Contents/Library/LaunchDaemons/"
+	$(MAKE) validate-packaged-localization
 	xcrun actool \
 		--compile "$(APP_BUNDLE)/Contents/Resources" \
 		--platform macosx \
@@ -86,6 +91,9 @@ app: build
 	codesign --force --sign - --identifier com.stillnotfree.sbm.helper "$(APP_BUNDLE)/Contents/Resources/SBMHelper"
 	codesign --force --sign - "$(APP_BUNDLE)"
 	codesign --verify --deep --strict --verbose=2 "$(APP_BUNDLE)"
+
+validate-packaged-localization:
+	swift scripts/validate-packaged-localization.swift --app "$(APP_BUNDLE)"
 
 dmg: app
 	rm -rf "$(DIST_DIR)/dmg-root" "$(DMG)"

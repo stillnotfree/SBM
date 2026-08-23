@@ -100,6 +100,18 @@ private actor HelperStatusSequence {
   }
 }
 
+@MainActor
+private func waitForRuntimeRequest(
+  _ runtime: ControlledHelperResponses,
+  count: Int = 1
+) async -> Bool {
+  for _ in 0..<1_000 {
+    if await runtime.pendingCount() >= count { return true }
+    try? await Task.sleep(for: .milliseconds(1))
+  }
+  return false
+}
+
 private actor FailingThenStoppedStatus {
   private var attempt = 0
 
@@ -289,6 +301,7 @@ private func hardeningModel(
       mode: request.mode ?? .rule,
       selectedNode: request.node ?? .auto,
       activeProfileID: request.profileID,
+      activeIPv6Enabled: request.action == .start ? (request.ipv6Enabled ?? false) : nil,
       message: "runtime"
     )
   },
@@ -303,6 +316,7 @@ private func hardeningModel(
     HelperResponse(
       success: true,
       coreRunning: true,
+      activeIPv6Enabled: true,
       delays: [NodeDelay(node: node, milliseconds: 20)],
       message: "latency"
     )
@@ -430,7 +444,9 @@ private func hardeningModel(
     payload: hardeningPayload("old.example.test")
   )
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
     manager: SubscriptionManager { value, headers in try await fetcher.fetch(value, headers) }
   )
 
@@ -482,11 +498,17 @@ private func hardeningModel(
     name: "A", sources: [source], payload: hardeningPayload("old.example.test")
   )
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
     manager: SubscriptionManager { value, headers in try await fetcher.fetch(value, headers) },
     lifecycleSender: { _, _ in
       HelperResponse(
-        success: true, coreRunning: true, activeProfileID: profile.id, message: "status")
+        success: true,
+        coreRunning: true,
+        activeProfileID: profile.id,
+        activeIPv6Enabled: true,
+        message: "status")
     },
     runtimeSender: { request in try await runtime.send(request) }
   )
@@ -1140,6 +1162,7 @@ private func hardeningModel(
       mode: .rule,
       selectedNode: .auto,
       activeProfileID: profile.id,
+      activeIPv6Enabled: true,
       message: "old status"
     )
   )
@@ -1244,7 +1267,9 @@ private func hardeningModel(
     )
   )
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
     lifecycleSender: { request, _ in try await status.send(request) },
     runtimeSender: { request in try await runtime.send(request) },
     latencySender: { node in try await latency.send(HelperRequest(action: .testLatency, node: node))
@@ -1257,6 +1282,7 @@ private func hardeningModel(
       success: true,
       coreRunning: true,
       activeProfileID: profile.id,
+      activeIPv6Enabled: true,
       message: "running"
     )
   )
@@ -1270,6 +1296,7 @@ private func hardeningModel(
     HelperResponse(
       success: true,
       coreRunning: true,
+      activeIPv6Enabled: true,
       delays: [NodeDelay(node: node, milliseconds: 10)],
       message: "stale latency"
     )
@@ -1470,6 +1497,19 @@ private func hardeningModel(
     )
   )
   while !model.coreRunning { await Task.yield() }
+
+  #expect(await waitForRuntimeRequest(runtime))
+  #expect((await runtime.nextRequest()).action == .start)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: false,
+      message: "legacy IPv6 policy recovered"
+    )
+  )
+  while model.runtimeApplyStatus == .applying { await Task.yield() }
 
   model.setCoreEnabled(false)
   #expect(await runtime.nextRequest().action == .stop)
@@ -1726,13 +1766,16 @@ private func hardeningModel(
     payload: initialPayload
   )
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
     manager: SubscriptionManager { value, headers in try await fetcher.fetch(value, headers) },
     lifecycleSender: { _, _ in
       HelperResponse(
         success: true,
         coreRunning: true,
         activeProfileID: profile.id,
+        activeIPv6Enabled: true,
         message: "running"
       )
     },
@@ -1862,6 +1905,7 @@ private func hardeningModel(
         success: true,
         coreRunning: true,
         activeProfileID: profile.id,
+        activeIPv6Enabled: true,
         message: "running"
       )
     },
@@ -1899,13 +1943,16 @@ private func hardeningModel(
     payload: hardeningPayload("old.example.test")
   )
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
     manager: SubscriptionManager { value, headers in try await fetcher.fetch(value, headers) },
     lifecycleSender: { _, _ in
       HelperResponse(
         success: true,
         coreRunning: true,
         activeProfileID: profile.id,
+        activeIPv6Enabled: true,
         message: "running"
       )
     },
@@ -1974,10 +2021,13 @@ private func hardeningModel(
     success: true,
     coreRunning: true,
     activeProfileID: profile.id,
+    activeIPv6Enabled: true,
     message: "active"
   )
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
     lifecycleSender: { _, _ in appliedResponse },
     runtimeStateReader: { appliedResponse }
   )
@@ -2005,11 +2055,14 @@ private func hardeningModel(
     success: true,
     coreRunning: true,
     activeProfileID: profile.id,
+    activeIPv6Enabled: true,
     message: "applied"
   )
   let statuses = HelperStatusSequence([deferredResponse, appliedResponse])
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
     lifecycleSender: { _, _ in await statuses.next() }
   )
 
@@ -2047,11 +2100,14 @@ func authoritativeStatusAfterDeferredRoutingMutationDoesNotResurrectPendingPrese
     success: true,
     coreRunning: true,
     activeProfileID: profileID,
+    activeIPv6Enabled: true,
     runtimeOutcome: .applied,
     message: "active"
   )
   let model = hardeningModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profileID, ipv6Enabled: true
+    ),
     lifecycleSender: { _, _ in applied },
     runtimeSender: { request in try await runtime.send(request) }
   )
@@ -2086,4 +2142,335 @@ func authoritativeStatusAfterDeferredRoutingMutationDoesNotResurrectPendingPrese
   #expect(model.websiteRoutingStatus.state == .failed)
   #expect(model.websiteRoutingStatus.message?.contains("valid hostname") == true)
   #expect(model.subscriptionStatus != DeferredRuntimeApplyPresentation.changesReadyToApply)
+}
+
+@Test @MainActor
+func activeIPv6PolicyStaysAuthoritativeAcrossUnknownAndReconnect() async {
+  let profile = ManagedProfile(
+    name: "IPv6",
+    payload: hardeningPayload("active.example.test")
+  )
+  let runtime = ControlledHelperResponses()
+  let statuses = HelperStatusSequence([
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      message: "recovered"
+    )
+  ])
+  let model = hardeningModel(
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
+    lifecycleSender: { _, _ in await statuses.next() },
+    runtimeSender: { request in try await runtime.send(request) },
+    runtimeStateReader: {
+      HelperResponse(
+        success: true,
+        coreRunning: true,
+        activeProfileID: profile.id,
+        activeIPv6Enabled: false,
+        runtimeOutcome: .applied,
+        message: "confirmed"
+      )
+    }
+  )
+
+  model.setCoreEnabled(true)
+  #expect((await runtime.nextRequest()).ipv6Enabled == true)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      message: "active"
+    )
+  )
+  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  #expect(model.activeIPv6Enabled == true)
+
+  model.observedCoreState = .unknown
+  model.setIPv6Enabled(false)
+  #expect(model.activeIPv6Enabled == nil)
+  #expect(model.ipv6PolicyDescription.contains("unknown"))
+  #expect(await runtime.pendingCount() == 0)
+
+  model.refresh()
+  let recoveryRequest = await runtime.nextRequest()
+  #expect(recoveryRequest.action == .start)
+  #expect(recoveryRequest.ipv6Enabled == false)
+  #expect(model.activeIPv6Enabled == true)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      runtimeOutcome: .reconnectRequired,
+      message: "Changes ready to apply"
+    )
+  )
+  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  #expect(model.runtimeApplyStatus == .reconnectRequired)
+  #expect(model.activeIPv6Enabled == true)
+  #expect(model.ipv6PolicyDescription.contains("still enabled"))
+
+  model.reconnectToApply()
+  #expect((await runtime.nextRequest()).action == .stop)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: false,
+      activeIPv6Enabled: nil,
+      message: "stopped"
+    )
+  )
+  #expect((await runtime.nextRequest()).action == .start)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: false,
+      runtimeOutcome: .applied,
+      message: "started"
+    )
+  )
+  for _ in 0..<1_000 {
+    if model.runtimeApplyStatus == .active, model.deferredRuntimeApplyPresentation == nil {
+      break
+    }
+    await Task.yield()
+  }
+  #expect(model.activeIPv6Enabled == false)
+  #expect(model.runtimeApplyStatus == .active)
+  #expect(model.deferredRuntimeApplyPresentation == nil)
+  #expect(model.ipv6PolicyDescription.contains("rejected"))
+}
+
+@Test @MainActor
+func relaunchWithSavedIPv6OffConvergesToActiveOnWithoutRedundantSubmission() async {
+  let profile = ManagedProfile(
+    name: "Relaunch",
+    payload: hardeningPayload("active.example.test")
+  )
+  let runtime = ControlledHelperResponses()
+  let statuses = HelperStatusSequence([
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      message: "active"
+    )
+  ])
+  let model = hardeningModel(
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: false
+    ),
+    lifecycleSender: { _, _ in await statuses.next() },
+    runtimeSender: { request in try await runtime.send(request) }
+  )
+
+  model.refresh()
+  let request = await runtime.nextRequest()
+  #expect(request.action == .start)
+  #expect(request.ipv6Enabled == false)
+  #expect(model.activeIPv6Enabled == true)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: false,
+      message: "active"
+    )
+  )
+  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  #expect(model.activeIPv6Enabled == false)
+  #expect(model.runtimeApplyStatus == .active)
+}
+
+@Test @MainActor
+func matchingActiveIPv6PolicyNeedsNoApplyAndStoppedCoreDoesNotStart() async {
+  let profile = ManagedProfile(
+    name: "Matching",
+    payload: hardeningPayload("active.example.test")
+  )
+  let runtime = ControlledHelperResponses()
+  let statuses = HelperStatusSequence([
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      message: "active"
+    )
+  ])
+  let model = hardeningModel(
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
+    lifecycleSender: { _, _ in await statuses.next() },
+    runtimeSender: { request in try await runtime.send(request) }
+  )
+
+  model.refresh()
+  while model.isStatusRefreshInProgress { await Task.yield() }
+  #expect(model.activeIPv6Enabled == true)
+  #expect(await runtime.pendingCount() == 0)
+
+  model.observedCoreState = .stopped
+  model.setIPv6Enabled(false)
+  #expect(await runtime.pendingCount() == 0)
+  #expect(model.activeIPv6Enabled == nil)
+}
+
+@Test @MainActor
+func runningLegacyCoreReceivesOneFullSnapshotAndPublishesKnownIPv6Policy() async {
+  let profile = ManagedProfile(
+    name: "Legacy IPv6",
+    payload: hardeningPayload("legacy.example.test")
+  )
+  let runtime = ControlledHelperResponses()
+  let statuses = HelperStatusSequence([
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: nil,
+      message: "legacy active policy unknown"
+    ),
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      message: "active"
+    ),
+  ])
+  let model = hardeningModel(
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profile.id, ipv6Enabled: true
+    ),
+    lifecycleSender: { _, _ in await statuses.next() },
+    runtimeSender: { request in try await runtime.send(request) }
+  )
+
+  model.refresh()
+  let request = await runtime.nextRequest()
+  #expect(request.action == .start)
+  #expect(request.profile != nil)
+  #expect(request.ipv6Enabled == true)
+  #expect(model.activeIPv6Enabled == nil)
+  #expect(model.ipv6PolicyDescription.contains("reconciling"))
+
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      message: "active"
+    )
+  )
+  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  #expect(model.activeIPv6Enabled == true)
+
+  model.refresh()
+  while model.isStatusRefreshInProgress { await Task.yield() }
+  #expect(await runtime.pendingCount() == 0)
+  #expect(model.activeIPv6Enabled == true)
+}
+
+@Test @MainActor
+func runningLegacyCoreKeepsUnknownPolicyUntilExplicitReconnect() async {
+  let profile = ManagedProfile(
+    name: "Legacy reconnect",
+    payload: hardeningPayload("legacy-reconnect.example.test")
+  )
+  let runtime = ControlledHelperResponses()
+  let statuses = HelperStatusSequence([
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: nil,
+      message: "legacy active policy unknown"
+    ),
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: nil,
+      runtimeOutcome: .reconnectRequired,
+      message: "legacy active policy unknown"
+    ),
+  ])
+  let model = hardeningModel(
+    library: ProfileLibrary(profiles: [profile], selectedProfileID: profile.id),
+    lifecycleSender: { _, _ in await statuses.next() },
+    runtimeSender: { request in try await runtime.send(request) },
+    runtimeStateReader: {
+      HelperResponse(
+        success: true,
+        coreRunning: true,
+        activeProfileID: profile.id,
+        activeIPv6Enabled: true,
+        runtimeOutcome: .applied,
+        message: "confirmed"
+      )
+    }
+  )
+
+  model.refresh()
+  #expect(await waitForRuntimeRequest(runtime))
+  guard await runtime.pendingCount() > 0 else { return }
+  #expect((await runtime.nextRequest()).action == .start)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: nil,
+      runtimeOutcome: .reconnectRequired,
+      message: "Changes ready to apply"
+    )
+  )
+  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  #expect(model.runtimeApplyStatus == .reconnectRequired)
+  #expect(model.activeIPv6Enabled == nil)
+  #expect(model.ipv6PolicyDescription.contains("reconciling"))
+
+  model.refresh()
+  while model.isStatusRefreshInProgress { await Task.yield() }
+  #expect(await runtime.pendingCount() == 0)
+
+  model.reconnectToApply()
+  #expect(await waitForRuntimeRequest(runtime))
+  guard await runtime.pendingCount() > 0 else { return }
+  #expect((await runtime.nextRequest()).action == .stop)
+  await runtime.completeNext(
+    HelperResponse(success: true, coreRunning: false, activeIPv6Enabled: nil, message: "stopped")
+  )
+  #expect((await runtime.nextRequest()).action == .start)
+  await runtime.completeNext(
+    HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profile.id,
+      activeIPv6Enabled: true,
+      runtimeOutcome: .applied,
+      message: "started"
+    )
+  )
+  for _ in 0..<1_000 {
+    if model.runtimeApplyStatus == .active { break }
+    await Task.yield()
+  }
+  #expect(model.activeIPv6Enabled == true)
+  #expect(model.runtimeApplyStatus == .active)
 }

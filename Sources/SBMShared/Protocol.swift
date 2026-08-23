@@ -2,9 +2,9 @@ import CryptoKit
 import Foundation
 
 public enum HelperConstants {
-  public static let protocolVersion = 10
+  public static let protocolVersion = 11
   public static let helperVersion = "1.1.3"
-  public static let helperRevision = 50
+  public static let helperRevision = 54
   public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.sock"
   public static let daemonPlistName = "com.stillnotfree.sbm.helper.plist"
 }
@@ -20,6 +20,15 @@ public enum HelperAction: String, Codable, Sendable {
   case validateProfile
   case matchRuleSets
   case shutdown
+}
+
+public enum HelperStopReason: String, Codable, Sendable {
+  case userDisconnect
+  case reconnectToApply
+  case helperReplacement
+  case appTermination
+  case automaticRecovery
+  case other
 }
 
 public enum HelperRuntimeOutcome: String, Codable, Equatable, Sendable {
@@ -92,14 +101,45 @@ public struct ProxyNodeDescriptor: Codable, Equatable, Hashable, Sendable {
   }
 }
 
+public enum VLESSProfileVariant: Equatable, Sendable {
+  case reality(publicKey: String, shortID: String)
+  case tlsGRPC(serviceName: String)
+
+  public var isReality: Bool {
+    if case .reality = self { return true }
+    return false
+  }
+}
+
 public struct VLESSProfile: Codable, Equatable, Sendable {
+  public static let supportedFingerprints: Set<String> = [
+    "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random",
+    "randomized",
+  ]
+
   public let server: String
   public let port: UInt16
   public let uuid: String
   public let serverName: String
   public let fingerprint: String
-  public let publicKey: String
-  public let shortID: String
+  public let variant: VLESSProfileVariant
+
+  /// Compatibility views for the released REALITY-shaped model. They are
+  /// empty for TLS + gRPC and must not be used to build that variant.
+  public var publicKey: String {
+    guard case .reality(let publicKey, _) = variant else { return "" }
+    return publicKey
+  }
+
+  public var shortID: String {
+    guard case .reality(_, let shortID) = variant else { return "" }
+    return shortID
+  }
+
+  public var grpcServiceName: String? {
+    guard case .tlsGRPC(let serviceName) = variant else { return nil }
+    return serviceName
+  }
 
   public init(
     server: String,
@@ -110,13 +150,89 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
     publicKey: String,
     shortID: String
   ) {
+    self.init(
+      server: server,
+      port: port,
+      uuid: uuid,
+      serverName: serverName,
+      fingerprint: fingerprint,
+      variant: .reality(publicKey: publicKey, shortID: shortID)
+    )
+  }
+
+  public init(
+    server: String,
+    port: UInt16,
+    uuid: String,
+    serverName: String,
+    fingerprint: String,
+    variant: VLESSProfileVariant
+  ) {
     self.server = server
     self.port = port
     self.uuid = uuid
     self.serverName = serverName
     self.fingerprint = fingerprint
-    self.publicKey = publicKey
-    self.shortID = shortID
+    self.variant = variant
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case server, port, uuid, serverName, fingerprint, publicKey, shortID
+    case security, type, serviceName
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    server = try container.decode(String.self, forKey: .server)
+    port = try container.decode(UInt16.self, forKey: .port)
+    uuid = try container.decode(String.self, forKey: .uuid)
+    serverName = try container.decode(String.self, forKey: .serverName)
+    fingerprint = try container.decode(String.self, forKey: .fingerprint)
+
+    if let security = try container.decodeIfPresent(String.self, forKey: .security) {
+      guard security == "tls",
+        try container.decode(String.self, forKey: .type) == "grpc"
+      else {
+        throw DecodingError.dataCorruptedError(
+          forKey: .security,
+          in: container,
+          debugDescription: "Unsupported VLESS managed security or transport."
+        )
+      }
+      variant = .tlsGRPC(serviceName: try container.decode(String.self, forKey: .serviceName))
+    } else {
+      if let type = try container.decodeIfPresent(String.self, forKey: .type), type != "tcp" {
+        throw DecodingError.dataCorruptedError(
+          forKey: .type,
+          in: container,
+          debugDescription: "Unsupported VLESS managed transport."
+        )
+      }
+      variant = .reality(
+        publicKey: try container.decode(String.self, forKey: .publicKey),
+        shortID: try container.decode(String.self, forKey: .shortID)
+      )
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(server, forKey: .server)
+    try container.encode(port, forKey: .port)
+    try container.encode(uuid, forKey: .uuid)
+    try container.encode(serverName, forKey: .serverName)
+    try container.encode(fingerprint, forKey: .fingerprint)
+    switch variant {
+    case .reality(let publicKey, let shortID):
+      // Keep the released current-profile-library representation byte-for-byte
+      // equivalent in meaning and readable by older migration DTOs.
+      try container.encode(publicKey, forKey: .publicKey)
+      try container.encode(shortID, forKey: .shortID)
+    case .tlsGRPC(let serviceName):
+      try container.encode("tls", forKey: .security)
+      try container.encode("grpc", forKey: .type)
+      try container.encode(serviceName, forKey: .serviceName)
+    }
   }
 }
 
@@ -342,11 +458,19 @@ public enum ManagedOutbound: Codable, Equatable, Sendable {
   public var semanticIdentity: String {
     switch self {
     case .vless(let value):
-      return canonicalIdentity([
-        "vless", canonicalHost(value.server), String(value.port), value.uuid.lowercased(),
-        canonicalHost(value.serverName), value.fingerprint, value.publicKey,
-        value.shortID.lowercased(),
-      ])
+      switch value.variant {
+      case .reality(let publicKey, let shortID):
+        // Preserve the identity formula used by released REALITY profiles.
+        return canonicalIdentity([
+          "vless", canonicalHost(value.server), String(value.port), value.uuid.lowercased(),
+          canonicalHost(value.serverName), value.fingerprint, publicKey, shortID.lowercased(),
+        ])
+      case .tlsGRPC(let serviceName):
+        return canonicalIdentity([
+          "vless", "tls-grpc", canonicalHost(value.server), String(value.port),
+          value.uuid.lowercased(), canonicalHost(value.serverName), value.fingerprint, serviceName,
+        ])
+      }
     case .hysteria2(let value):
       return canonicalIdentity([
         "hysteria2", canonicalHost(value.server), String(value.port), value.password,
@@ -681,8 +805,10 @@ public struct HelperRequest: Codable, Sendable {
   public let localSOCKSEnabled: Bool?
   public let localSOCKSPort: UInt16?
   public let latencyTestURL: String?
+  public let ipv6Enabled: Bool?
   public let ruleSetTags: [String]?
   public let routingDestination: String?
+  public let stopReason: HelperStopReason?
 
   public init(
     action: HelperAction,
@@ -693,8 +819,10 @@ public struct HelperRequest: Codable, Sendable {
     localSOCKSEnabled: Bool? = nil,
     localSOCKSPort: UInt16? = nil,
     latencyTestURL: String? = nil,
+    ipv6Enabled: Bool? = nil,
     ruleSetTags: [String]? = nil,
-    routingDestination: String? = nil
+    routingDestination: String? = nil,
+    stopReason: HelperStopReason? = nil
   ) {
     self.protocolVersion = HelperConstants.protocolVersion
     self.action = action
@@ -705,8 +833,10 @@ public struct HelperRequest: Codable, Sendable {
     self.localSOCKSEnabled = localSOCKSEnabled
     self.localSOCKSPort = localSOCKSPort
     self.latencyTestURL = latencyTestURL
+    self.ipv6Enabled = ipv6Enabled
     self.ruleSetTags = ruleSetTags
     self.routingDestination = routingDestination
+    self.stopReason = stopReason
   }
 }
 
@@ -720,6 +850,9 @@ public struct HelperResponse: Codable, Sendable {
   public let mode: RoutingMode
   public let selectedNode: ProxyNodeID
   public let activeProfileID: UUID?
+  /// The IPv6 policy in the configuration currently used by a running core.
+  /// `nil` means the core is stopped or the authoritative policy is unknown.
+  public let activeIPv6Enabled: Bool?
   public let nodes: [ProxyNodeDescriptor]
   public let delays: [NodeDelay]
   /// `true` requires an explicit user connection before recovery can retry.
@@ -735,6 +868,7 @@ public struct HelperResponse: Codable, Sendable {
     mode: RoutingMode = .rule,
     selectedNode: ProxyNodeID = .auto,
     activeProfileID: UUID? = nil,
+    activeIPv6Enabled: Bool? = nil,
     nodes: [ProxyNodeDescriptor] = [],
     delays: [NodeDelay] = [],
     automaticRecoveryExhausted: Bool = false,
@@ -751,6 +885,7 @@ public struct HelperResponse: Codable, Sendable {
     self.mode = mode
     self.selectedNode = selectedNode
     self.activeProfileID = activeProfileID
+    self.activeIPv6Enabled = activeIPv6Enabled
     self.nodes = nodes
     self.delays = delays
     self.automaticRecoveryExhausted = automaticRecoveryExhausted
@@ -769,6 +904,7 @@ public struct HelperResponse: Codable, Sendable {
     case mode
     case selectedNode
     case activeProfileID
+    case activeIPv6Enabled
     case nodes
     case delays
     case automaticRecoveryExhausted
@@ -788,6 +924,7 @@ public struct HelperResponse: Codable, Sendable {
     mode = try container.decode(RoutingMode.self, forKey: .mode)
     selectedNode = try container.decode(ProxyNodeID.self, forKey: .selectedNode)
     activeProfileID = try container.decodeIfPresent(UUID.self, forKey: .activeProfileID)
+    activeIPv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .activeIPv6Enabled)
     nodes = try container.decode([ProxyNodeDescriptor].self, forKey: .nodes)
     delays = try container.decode([NodeDelay].self, forKey: .delays)
     automaticRecoveryExhausted =

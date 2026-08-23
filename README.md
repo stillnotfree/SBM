@@ -17,8 +17,23 @@
 </p>
 
 <p align="center">
-  English · <a href="README_RU.md">Русский</a>
+  English · <a href="README_RU.md">Русский</a> · <a href="README_ZH-CN.md">简体中文</a>
 </p>
+
+<p align="center">
+  TUN-only routing for VLESS + REALITY/TCP, the supported VLESS TLS/gRPC subset,
+  Hysteria2, Shadowsocks, HTTPS subscriptions, native sing-box JSON, and
+  per-site or per-application rules.
+</p>
+
+## Screenshots
+
+<div align="center">
+  <img src="docs/menu.png" width="48%" alt="SBM menu bar menu">
+  <img src="docs/settings-profiles.png" width="48%" alt="SBM profile settings">
+  <img src="docs/settings-routing.png" width="48%" alt="SBM routing settings">
+  <img src="docs/settings-advanced.png" width="48%" alt="SBM advanced settings">
+</div>
 
 > **Development disclosure:** this project was vibe-coded and generated
 > primarily by an AI coding agent (OpenAI Codex), under human direction,
@@ -26,7 +41,7 @@
 > audit.
 
 Unless a feature is explicitly stated in release notes, this README describes
-the current source tree and does not assert its availability in the v1.1.14
+the current source tree and does not assert its availability in the v1.1.15
 release.
 
 ## Highlights
@@ -42,7 +57,7 @@ release.
 - Native sing-box JSON profiles for protocols not represented by compact links.
 - Always-available diagnostics with 50 bounded, deduplicated, redacted recent errors.
 - No system-proxy mode, dashboard, traffic statistics, telemetry, or access logging.
-- IPv4 user-traffic policy: IPv6 stays captured by the managed TUN and is rejected locally before traffic sniffing.
+- One global IPv6 policy switch, disabled by default: keep IPv6 captured by the managed TUN, or fail closed locally before traffic sniffing.
 
 ## Install
 
@@ -169,7 +184,11 @@ name or scan bundles for other executables. Application rules do not create a
 separate DNS policy.
 
 Routing Inspector explains deterministic domain or IP decisions from the final
-composed route without DNS, network, process, or persistence probes.
+composed route without DNS, network, process, or persistence probes. For a
+hostname without a resolved address, it explores bounded symbolic alternatives
+for supported IPv4/IPv6 and private/public predicates and shows the conditions
+next to each possible result. It reports an unresolved-IP limitation only when
+the remaining route cannot be made more precise locally.
 `Default traffic` means traffic that does not match a configured application
 override; selecting an application evaluates its exact stored executable path.
 The primary result is PROXY, DIRECT, or REJECT. For remote rule-sets, the helper
@@ -206,15 +225,16 @@ the previous working configuration and core.
 In Rule mode, imported DNS servers and routing rules remain authoritative below
 SBM's mandatory and first-class routing layers. The
 imported `route.final` is replaced by the menu-controlled selector, so unmatched
-traffic follows the server selected in SBM. The generated TUN retains IPv4 and
-IPv6 addresses with `auto_route` and `strict_route`, but SBM currently routes
-user traffic over IPv4: IPv6 is captured by the managed TUN and rejected locally
-before the unconditional traffic sniff. This avoids physical IPv6 bypass and
-unreliable Direct behavior; it is not complete IPv6 support. Hostname DNS
-remains intentionally `ipv4_only`, and IPv4 Direct/Proxy/Global semantics are
-unchanged. The Direct and Global modes temporarily prepend app-owned DNS and
-route overrides; switching back to Rule restores the profile's policy without
-rewriting the source profile.
+traffic follows the server selected in SBM. The single global IPv6 switch is
+disabled by default. In either state the generated TUN retains IPv4 and IPv6
+addresses with `auto_route` and `strict_route`; when IPv6 is enabled, SBM does
+not add its app-owned IPv6 reject and does not force a global DNS address-family
+strategy (an imported DNS strategy is preserved). When disabled, IPv6 is
+rejected locally before the unconditional traffic sniff and DNS uses
+`ipv4_only`, preventing physical IPv6 bypass. IPv4 Direct/Proxy/Global and
+existing routing precedence remain unchanged. The Direct and Global modes
+temporarily prepend app-owned DNS and route overrides; switching back to Rule
+restores the profile's policy without rewriting the source profile.
 
 The root helper accepts commands only from local administrator accounts. It
 validates and constrains imported profiles before starting the bundled root-owned
@@ -254,7 +274,7 @@ Before packaging a proposed release, run the local, non-publishing gate with the
 version already set in the repository metadata, for example:
 
 ```sh
-make release-check TAG=v1.1.14
+make release-check TAG=v1.1.15
 ```
 
 It checks release metadata and local verification commands, then builds and
@@ -308,7 +328,9 @@ HTTPS profiles are refreshed on save, on launch, and every six hours while the
 app is running. Individual connection links are local profile sources and are
 not fetched from the network. A changed active profile is validated without
 replacing a running known-good runtime; the helper persists the reconnect-needed
-state while that runtime remains active. **Reconnect to Apply** applies the
+state while that runtime remains active. The active IPv6 policy is reported
+separately from the persisted desired switch, and a known mismatch is sent
+through the same full runtime apply path. **Reconnect to Apply** applies the
 latest candidate through the explicit stop/start transaction.
 
 Profile URLs and cached credentials are stored at
@@ -332,12 +354,15 @@ update.
 
 ## Current status
 
-Version 1.1.14 bundles the pinned stable sing-box 1.13.19 core and is not an
+Version 1.1.15 bundles the pinned stable sing-box 1.13.19 core and is not an
 independently audited security product.
 Multi-source compatibility profiles and individual connection links using VLESS +
-REALITY + Vision or Hysteria2 + TLS with either no obfuscation or Salamander are
-covered by the test suite, including custom request headers, redirects,
-deduplication, single-protocol profiles, and profiles with both protocols.
+REALITY/TCP + Vision, the supported VLESS TLS/gRPC `gun` subset, Hysteria2 + TLS,
+or Shadowsocks are covered by the test suite. Hysteria2 accepts no obfuscation,
+Salamander, and the two bounded provider `fm` compatibility shapes. The
+`quicParams.maxIncomingStreams` tuning is recognized but not representable in
+the generated sing-box config; XHTTP and unsupported Xray-only transport
+semantics remain skipped.
 Generic native JSON profiles are validated automatically against the bundled
 core; a userspace WireGuard endpoint is covered by the test suite. This does
 not claim that every sing-box protocol has been tested against every provider.

@@ -12,7 +12,7 @@ enum RuntimeApplyCoordinatorFailure: LocalizedError, Sendable {
   case superseded
 
   var errorDescription: String? {
-    "The runtime change was superseded by a newer request."
+    SBMText.localized("The runtime change was superseded by a newer request.")
   }
 }
 

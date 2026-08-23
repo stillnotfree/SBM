@@ -362,12 +362,14 @@ enum UpdateFailure: LocalizedError {
 
   var errorDescription: String? {
     switch self {
-    case .releaseUnavailable: "GitHub Releases is unavailable."
-    case .invalidResponse: "GitHub returned an invalid update response."
-    case .verifiedAssetMissing: "The release has no SHA-256 verified Apple Silicon DMG."
-    case .downloadFailed: "The update download failed."
-    case .assetSizeMismatch: "The downloaded update size does not match GitHub."
-    case .assetDigestMismatch: "The downloaded update failed SHA-256 verification."
+    case .releaseUnavailable: SBMText.localized("GitHub Releases is unavailable.")
+    case .invalidResponse: SBMText.localized("GitHub returned an invalid update response.")
+    case .verifiedAssetMissing:
+      SBMText.localized("The release has no SHA-256 verified Apple Silicon DMG.")
+    case .downloadFailed: SBMText.localized("The update download failed.")
+    case .assetSizeMismatch: SBMText.localized("The downloaded update size does not match GitHub.")
+    case .assetDigestMismatch:
+      SBMText.localized("The downloaded update failed SHA-256 verification.")
     }
   }
 }

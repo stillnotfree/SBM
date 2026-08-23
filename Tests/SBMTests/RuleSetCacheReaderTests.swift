@@ -33,17 +33,12 @@ import Testing
     .appendingPathComponent(".vendor/sing-box")
 
   func output(for destination: String) throws -> String {
-    let process = Process()
-    let output = Pipe()
-    process.executableURL = core
-    process.arguments = ["rule-set", "match", "-f", "source", temporary.path, destination]
-    process.standardOutput = output
-    process.standardError = output
-    try process.run()
-    process.waitUntilExit()
-    #expect(process.terminationStatus == 0)
-    return String(
-      data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let result = try TestProcessSupport.run(
+      executableURL: core,
+      arguments: ["rule-set", "match", "-f", "source", temporary.path, destination]
+    )
+    #expect(result.status == 0)
+    return result.output
   }
 
   #expect(try !output(for: "gosuslugi.ru").isEmpty)

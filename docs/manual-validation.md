@@ -32,7 +32,11 @@ Reject for both the apex and a subdomain. Confirm a website Proxy rule overrides
 a broader Direct application rule, and a website rule overrides an imported
 route while mandatory private-address safety remains higher. Compare every
 result with Routing Inspector, noting that hostname-only inspection can be
-indeterminate when a higher `ip_is_private` rule needs the resolved IP.
+conditional when supported `ip_version`, `ip_is_private`, or `ip_cidr` rules
+depend on the unresolved destination: the Inspector should show the feasible
+IPv4/IPv6 or private/public alternatives without DNS. It remains indeterminate
+only when an unsupported or runtime-dependent condition still prevents a local
+decision.
 
 
 ## Runtime routing convergence
@@ -108,7 +112,29 @@ the bounded cache lookup, that Explain performs no download or DNS probe, and
 that a missing/unreadable cache says **active rule-set data is unavailable** with
 only a bounded sanitized reason in Details.
 
+## Localization QA
+
+Repeat the read-only UI pass with the macOS preferred language set to `en`,
+`ru`, and `zh-Hans`; SBM has no in-app language selector. Relaunch between
+locales and check the menu, Settings tabs, subscription/source controls,
+Website/Application Routing, Routing Inspector, Advanced, Diagnostics, About,
+helper/update states, and representative validation errors.
+
+Confirm that no untranslated key, empty translation, clipped label, or broken
+placeholder appears at the documented window sizes. Keep profile names, source
+names, node names, URLs, paths, JSON, raw protocol identifiers, headers, and
+latency numbers unchanged. Set an unsupported locale once and verify the
+interface falls back to English. This check is UI-only: do not install a helper,
+connect a VPN, or fetch a subscription while validating localization.
+
 ## Real-Mac IPv6 matrix
+
+Run the matrix once with the global IPv6 switch **ON** and once with it **OFF**.
+The TUN and route-capture checks are identical in both runs. With IPv6 **ON**,
+literal IPv6 must follow the selected Rule/Global/Direct/app/Website policy,
+and an imported DNS strategy must remain unchanged. With IPv6 **OFF**, literal
+IPv6 must be rejected locally before sniffing and DNS must be `ipv4_only`.
+No physical-interface bypass is acceptable in either run.
 
 For each observation classify the result as **INTENTIONAL DIRECT**, **PROXIED**,
 **BLOCKED/FAIL-CLOSED**, or **UNEXPECTED PHYSICAL BYPASS**. Any last category is
@@ -119,32 +145,32 @@ a release blocker.
 | 1 | TUN IPv4 and IPv6 addresses | Both managed addresses present |
 | 2 | IPv4 routes | Default capture through SBM while connected |
 | 3 | IPv6 routes | Default capture through SBM while connected |
-| 4 | Dual-stack hostname | IPv4 user traffic follows selected route; DNS strategy is IPv4-only |
-| 5 | Literal public IPv6 | BLOCKED/FAIL-CLOSED before traffic sniff |
-| 6 | Forced IPv6 request | Immediate local refusal; no unintended physical bypass |
-| 7 | Rule mode | IPv4 Website/app/imported/final precedence preserved |
-| 8 | Global mode | IPv4 PROXIED; IPv6 BLOCKED/FAIL-CLOSED |
-| 9 | Direct mode | IPv4 INTENTIONAL DIRECT; IPv6 BLOCKED/FAIL-CLOSED |
+| 4 | Dual-stack hostname | IPv4 and IPv6 follow the selected policy; OFF uses `ipv4_only`, ON follows the profile/stack strategy |
+| 5 | Literal public IPv6 | ON follows routing policy; OFF is BLOCKED/FAIL-CLOSED before traffic sniff |
+| 6 | Forced IPv6 request | ON has no physical bypass; OFF is immediately refused locally |
+| 7 | Rule mode | Website/app/imported/final precedence preserved in both states |
+| 8 | Global mode | IPv4 PROXIED; IPv6 PROXIED when ON and BLOCKED/FAIL-CLOSED when OFF |
+| 9 | Direct mode | IPv4 INTENTIONAL DIRECT; IPv6 follows ON policy and is BLOCKED/FAIL-CLOSED when OFF |
 | 10 | Compatibility profile | Same capture and mode semantics |
 | 11 | Native profile | Same app-owned TUN and safety semantics |
-| 12 | Website Proxy | IPv4 PROXIED for apex and subdomain; IPv6 BLOCKED/FAIL-CLOSED |
-| 13 | Website Direct | IPv4 INTENTIONAL DIRECT; IPv6 BLOCKED/FAIL-CLOSED |
+| 12 | Website Proxy | IPv4 and IPv6 PROXIED when ON; IPv6 BLOCKED/FAIL-CLOSED when OFF |
+| 13 | Website Direct | IPv4 and IPv6 INTENTIONAL DIRECT when ON; IPv6 BLOCKED/FAIL-CLOSED when OFF |
 | 14 | Website Reject | BLOCKED/FAIL-CLOSED |
-| 15 | Application Routing | IPv4 target policy applies to exact executable; IPv6 blocked before app rule |
-| 16 | Wi-Fi/network transition | Re-converges without physical IPv6 bypass; IPv6 remains blocked |
-| 17 | Sleep/wake | Re-converges without physical IPv6 bypass; IPv6 remains blocked |
+| 15 | Application Routing | Exact executable target policy applies in both states; OFF rejects IPv6 before the app rule |
+| 16 | Wi-Fi/network transition | Re-converges without physical IPv6 bypass; policy remains selected |
+| 17 | Sleep/wake | Re-converges without physical IPv6 bypass; policy remains selected |
 | 18 | Disconnect cleanup | Managed IPv4/IPv6 routes and TUN removed |
 
 REAL-MAC LIVE IPv6 VALIDATION:
 PARTIALLY PERFORMED
 
-Validated on an IPv4-only underlay:
+Validated on an IPv4-only underlay before this switch was added:
 - installed helper revision 50 confirmed;
 - no physical IPv6 default route;
 - public IPv6 destination routed through the managed utun;
 - forced literal IPv6 rejected immediately before TLS ClientHello;
 - Chrome and Arc successfully fell back to IPv4 for ya.ru.
 
-The complete 18-item matrix, including a real dual-stack underlay, network
-transitions, sleep/wake, and physical-interface packet capture, has not been
-performed.
+The complete two-state matrix (36 observations), including a real dual-stack
+underlay, network transitions, sleep/wake, and physical-interface packet
+capture, has not been performed.

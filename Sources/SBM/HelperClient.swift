@@ -15,15 +15,17 @@ enum HelperClientError: LocalizedError {
 
   var errorDescription: String? {
     switch self {
-    case .socketCreation(let code): "Unable to create helper socket (errno \(code))."
-    case .socketOption(let code): "Unable to secure helper socket timeouts (errno \(code))."
-    case .socketPathTooLong: "Helper socket path is too long."
-    case .connection(let code): "Unable to reach helper (errno \(code))."
-    case .write(let code): "Unable to send helper request (errno \(code))."
-    case .requestTooLarge: "The helper request is too large."
-    case .emptyResponse: "Helper returned an empty response."
-    case .invalidResponse: "Helper returned an invalid response."
-    case .timeout: "The background helper did not respond in time."
+    case .socketCreation(let code):
+      SBMText.format("Unable to create helper socket (errno %lld).", code)
+    case .socketOption(let code):
+      SBMText.format("Unable to secure helper socket timeouts (errno %lld).", code)
+    case .socketPathTooLong: SBMText.localized("Helper socket path is too long.")
+    case .connection(let code): SBMText.format("Unable to reach helper (errno %lld).", code)
+    case .write(let code): SBMText.format("Unable to send helper request (errno %lld).", code)
+    case .requestTooLarge: SBMText.localized("The helper request is too large.")
+    case .emptyResponse: SBMText.localized("Helper returned an empty response.")
+    case .invalidResponse: SBMText.localized("Helper returned an invalid response.")
+    case .timeout: SBMText.localized("The background helper did not respond in time.")
     }
   }
 }

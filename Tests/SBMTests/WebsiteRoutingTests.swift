@@ -155,6 +155,10 @@ private func websiteTestConnection() -> ManagedConnection {
     )
     #expect(result.decision == .indeterminate)
     #expect(result.fallback == nil)
+    #expect(
+      Set(result.alternatives.map(\.decision))
+        == Set([RoutingInspectionResult.Decision.direct, .vpn, .reject])
+    )
   }
 }
 

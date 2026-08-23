@@ -55,21 +55,14 @@ import Testing
 
 private enum PerformanceBaselineFixture {
   static func run(_ arguments: [String]) throws -> (status: Int32, output: String) {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/swift")
-    process.arguments =
-      [
+    let result = try TestProcessSupport.run(
+      executableURL: URL(fileURLWithPath: "/usr/bin/swift"),
+      arguments: [
         FileManager.default.currentDirectoryPath + "/scripts/performance-baseline.swift"
-      ] + arguments
-    let output = Pipe()
-    process.standardOutput = output
-    process.standardError = output
-    try process.run()
-    process.waitUntilExit()
-    return (
-      process.terminationStatus,
-      String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+      ] + arguments,
+      timeoutSeconds: 15
     )
+    return (result.status, result.output)
   }
 }
 

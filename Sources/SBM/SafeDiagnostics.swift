@@ -123,10 +123,12 @@ enum DiagnosticSecrets {
 }
 
 enum SafeDiagnosticError {
+  static let redactedMessage = "Error details redacted."
+
   static func sanitize(_ value: String, secrets: [String]) -> String {
     guard !value.contains("{"), !value.contains("}"),
       !value.contains("["), !value.contains("]")
-    else { return "Error details redacted." }
+    else { return redactedMessage }
     let redacted = SecretRedactor.redact(value, secrets: secrets)
       .replacingOccurrences(of: "\n", with: " ")
       .replacingOccurrences(of: "\r", with: " ")

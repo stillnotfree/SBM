@@ -146,6 +146,54 @@ private func waitForRequestCount(
   #expect(coordinator.status == .active)
 }
 
+@Test @MainActor
+func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "IPv6 race",
+    payload: .compatibility(
+      VPNProfile(connections: [runtimeTestConnection(id: .auto, server: "active.example.test")])
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profileID, ipv6Enabled: true
+    ),
+    sender: sender
+  )
+
+  model.setCoreEnabled(true)
+  await waitForRequestCount(1, sender: sender)
+  model.setIPv6Enabled(false)
+
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      activeIPv6Enabled: true,
+      message: "stale active IPv6"
+    )
+  )
+  await waitForRequestCount(2, sender: sender)
+  #expect(model.activeIPv6Enabled == nil)
+  #expect((await sender.recordedRequests())[1].ipv6Enabled == false)
+
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      activeIPv6Enabled: false,
+      message: "latest active IPv6"
+    )
+  )
+  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  #expect(model.activeIPv6Enabled == false)
+}
+
 @Test @MainActor func replacedPendingGenerationReceivesSupersededCompletion() async {
   let sender = DelayedRuntimeSender()
   let coordinator = RuntimeApplyCoordinator<String, String> { request in
@@ -454,7 +502,10 @@ private func waitForRequestCount(
   model.inspectRouting()
   #expect(model.desiredRuntimeGeneration == generationDuringApply)
   #expect(await sender.requestCount() == 1)
-  #expect(model.routingInspectorOutput == "Depends on resolved IP")
+  #expect(
+    model.routingInspectorOutput
+      == "IPv6: REJECT\nIPv4 + Private address / IPv4 + Public address: DIRECT"
+  )
   #expect(model.routingInspectorDetails.contains("Traffic from: Browser"))
 
   model.setApplicationRoutingTarget(applicationRule.id, target: .selectedProxy)
@@ -626,7 +677,9 @@ func deferredApplicationRoutingKeepsKnownGoodRuntimeUntilExplicitReconnect() asy
   )
   let sender = DelayedHelperSender()
   let model = runtimeTestModel(
-    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profileID, ipv6Enabled: true
+    ),
     sender: sender
   )
   model.coreRunning = true
@@ -685,6 +738,118 @@ func deferredApplicationRoutingKeepsKnownGoodRuntimeUntilExplicitReconnect() asy
   #expect(model.applicationRoutingStatus.state == .saved)
   #expect(model.applicationRoutingStatus.message == nil)
   #expect(model.subscriptionStatus != DeferredRuntimeApplyPresentation.changesReadyToApply)
+}
+
+@Test @MainActor
+func deferredRuntimePresentationSurvivesASecondApplyAttempt() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Modes",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(id: ProxyNodeID(rawValue: "node-mode"), server: "mode.example.test")
+        ]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    sender: sender
+  )
+  model.coreRunning = true
+
+  model.setRoutingMode(.global)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+
+  model.setRoutingMode(.direct)
+  await waitForRequestCount(2, sender: sender)
+  #expect(model.deferredRuntimeApplyPresentation?.headline == "Applying…")
+  #expect(model.deferredRuntimeApplyPresentation?.phase == .applying)
+  #expect(model.deferredRuntimeApplyPresentation?.actionEnabled == false)
+
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+  #expect(model.deferredRuntimeApplyPresentation?.headline == "Changes ready to apply")
+  #expect(model.deferredRuntimeApplyPresentation?.actionEnabled == true)
+}
+
+@Test @MainActor
+func ipv6PreferenceIsSentAsDesiredRuntimeAndLatestChangeWins() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "IPv6",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(id: ProxyNodeID(rawValue: "node-ipv6"), server: "ipv6.example.test")
+        ]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(
+      profiles: [profile], selectedProfileID: profileID, ipv6Enabled: true
+    ),
+    sender: sender
+  )
+  model.coreRunning = true
+
+  model.setIPv6Enabled(false)
+  await waitForRequestCount(1, sender: sender)
+  let disabledRequest = await sender.recordedRequests()[0]
+  #expect(disabledRequest.action == .start)
+  #expect(disabledRequest.ipv6Enabled == false)
+  #expect(!model.ipv6Enabled)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+
+  model.setIPv6Enabled(true)
+  await waitForRequestCount(2, sender: sender)
+  let enabledRequest = await sender.recordedRequests()[1]
+  #expect(enabledRequest.ipv6Enabled == true)
+  #expect(model.ipv6Enabled)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      runtimeOutcome: .reconnectRequired,
+      message: HelperRuntimeOutcome.reconnectRequired.userMessage!
+    )
+  )
+  await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
+  #expect(model.ipv6Enabled)
 }
 
 @Test @MainActor

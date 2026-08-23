@@ -104,7 +104,11 @@ Disconnect remains authoritative across later profile and routing edits and
 suppresses automatic connection for the rest of the app session. Failure to
 read helper status changes the observation to `unknown`; it never proves that
 the root core stopped, and Quit may use its fast path only after a known stopped
-observation.
+observation. Typed helper status carries the active IPv6 policy only while the
+core is running. The app never treats a persisted desired switch as active; a
+known running mismatch is submitted through the same complete runtime
+coordinator, while a deferred candidate leaves the active policy unchanged
+until explicit reconnect.
 
 Subscription synchronization uses stable profile/source UUIDs and
 compare-and-commit after every suspension point. Immediately before each fetch,
@@ -218,11 +222,13 @@ and Reject adds no bypass. The same app-owned layer wraps validated native
 profiles without expanding their capability allowlist.
 
 Both composers replace imported inbounds with a dual-stack TUN using
-`auto_route` and `strict_route`. Hostname DNS remains `ipv4_only`; literal IPv6
-is captured by the managed TUN and rejected locally before the unconditional
-traffic sniff. This prevents physical IPv6 bypass and unreliable Direct
-behavior. It is an intentional IPv4 user-traffic policy, not complete IPv6
-support; IPv4 Direct, Proxy, and Global semantics remain unchanged. Real
+`auto_route` and `strict_route`. The single persisted IPv6 policy switch is
+disabled by default. When enabled, no app-owned IPv6 reject is added and
+SBM-created DNS omits a global address-family strategy; an imported DNS
+strategy is preserved. When disabled, literal IPv6 is captured by the managed
+TUN and rejected locally before the unconditional traffic sniff, and DNS is
+forced to `ipv4_only`. This preserves fail-closed behavior without changing
+existing route precedence or IPv4 Direct, Proxy, and Global semantics. Real
 route-table behavior still requires the separate real-Mac validation matrix and
 is not established by config tests.
 
@@ -268,8 +274,8 @@ exact helper version and revision over authenticated IPC and invokes the
 existing verified replacement flow only when the installed helper is not
 current. Approval is never inferred from elapsed time or process existence.
 Every privileged-helper behavior or shared semantic change advances the
-monotonic helper revision. This build requires IPC protocol 10 and helper
-revision 50 and rejects the previous protocol/revision boundary before runtime
+monotonic helper revision. This build requires IPC protocol 11 and helper
+revision 54 and rejects the previous protocol/revision boundary before runtime
 use.
 
 ## Update model

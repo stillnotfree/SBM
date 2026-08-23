@@ -1,9 +1,10 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.3
 
 import PackageDescription
 
 let package = Package(
   name: "SBM",
+  defaultLocalization: "en",
   platforms: [.macOS(.v26)],
   products: [
     .executable(name: "SBM", targets: ["SBM"]),
@@ -13,7 +14,8 @@ let package = Package(
     .target(name: "SBMShared"),
     .executableTarget(
       name: "SBM",
-      dependencies: ["SBMShared"]
+      dependencies: ["SBMShared"],
+      resources: [.process("Resources")]
     ),
     .executableTarget(
       name: "SBMHelper",

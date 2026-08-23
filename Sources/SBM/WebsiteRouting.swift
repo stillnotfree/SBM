@@ -9,11 +9,13 @@ enum WebsiteRoutingFailure: LocalizedError {
 
   var errorDescription: String? {
     switch self {
-    case .invalidDomain: "Enter a valid hostname without wildcards, paths, or IP addresses."
-    case .unsupportedScheme: "Only HTTP and HTTPS website URLs are accepted."
-    case .credentialsNotAllowed: "Website URLs with embedded credentials are not accepted."
-    case .duplicateDomain: "This website already has a routing rule."
-    case .tooManyRules: "A profile may contain at most 128 website rules."
+    case .invalidDomain:
+      SBMText.localized("Enter a valid hostname without wildcards, paths, or IP addresses.")
+    case .unsupportedScheme: SBMText.localized("Only HTTP and HTTPS website URLs are accepted.")
+    case .credentialsNotAllowed:
+      SBMText.localized("Website URLs with embedded credentials are not accepted.")
+    case .duplicateDomain: SBMText.localized("This website already has a routing rule.")
+    case .tooManyRules: SBMText.localized("A profile may contain at most 128 website rules.")
     }
   }
 }
