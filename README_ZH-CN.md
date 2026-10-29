@@ -33,17 +33,24 @@ SBM 不导入任意 sing-box JSON，也不提供 sing-box 的全部功能。
 
 ## 截图
 
-![SBM 菜单](docs/menu.png)
+<p align="center">
+  <img src="docs/menu.png" alt="SBM 菜单" width="62%">
+</p>
 
-其他设置页面：
+<details>
+<summary>更多截图</summary>
 
-![设置](docs/settings.png)
+<p align="center">
+  <img src="docs/settings.png" alt="设置" width="48%">
+  <img src="docs/settings-profiles.png" alt="配置设置" width="48%">
+</p>
 
-![配置设置](docs/settings-profiles.png)
+<p align="center">
+  <img src="docs/settings-routing.png" alt="路由设置" width="48%">
+  <img src="docs/settings-advanced.png" alt="高级设置" width="48%">
+</p>
 
-![路由设置](docs/settings-routing.png)
-
-![高级设置](docs/settings-advanced.png)
+</details>
 
 ## 从源码构建
 

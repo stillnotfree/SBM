@@ -33,17 +33,24 @@ SBM не импортирует произвольный sing-box JSON и не �
 
 ## Скриншоты
 
-![Меню SBM](docs/menu.png)
+<p align="center">
+  <img src="docs/menu.png" alt="Меню SBM" width="62%">
+</p>
 
-Дополнительные экраны настроек:
+<details>
+<summary>Другие скриншоты</summary>
 
-![Настройки](docs/settings.png)
+<p align="center">
+  <img src="docs/settings.png" alt="Настройки" width="48%">
+  <img src="docs/settings-profiles.png" alt="Профили" width="48%">
+</p>
 
-![Профили](docs/settings-profiles.png)
+<p align="center">
+  <img src="docs/settings-routing.png" alt="Маршрутизация" width="48%">
+  <img src="docs/settings-advanced.png" alt="Расширенные настройки" width="48%">
+</p>
 
-![Маршрутизация](docs/settings-routing.png)
-
-![Расширенные настройки](docs/settings-advanced.png)
+</details>
 
 ## Сборка из исходного кода
 

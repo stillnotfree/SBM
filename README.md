@@ -33,17 +33,24 @@ Updates replace the app through Finder; SBM does not silently replace itself. He
 
 ## Screenshots
 
-![SBM menu](docs/menu.png)
+<p align="center">
+  <img src="docs/menu.png" alt="SBM menu" width="62%">
+</p>
 
-Additional settings:
+<details>
+<summary>More screenshots</summary>
 
-![Settings](docs/settings.png)
+<p align="center">
+  <img src="docs/settings.png" alt="Settings" width="48%">
+  <img src="docs/settings-profiles.png" alt="Profiles settings" width="48%">
+</p>
 
-![Profiles settings](docs/settings-profiles.png)
+<p align="center">
+  <img src="docs/settings-routing.png" alt="Routing settings" width="48%">
+  <img src="docs/settings-advanced.png" alt="Advanced settings" width="48%">
+</p>
 
-![Routing settings](docs/settings-routing.png)
-
-![Advanced settings](docs/settings-advanced.png)
+</details>
 
 ## Build from source
 
