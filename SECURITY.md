@@ -30,7 +30,7 @@ safety rules remain above website and application routing.
 
 Diagnostics retains at most 50 recent errors. Errors are redacted before
 retention and again when text or JSON is copied; subscription URLs, sensitive
-headers, credentials, raw native JSON, profile bodies, helper secrets, and raw
+headers, credentials, profile bodies, helper secrets, and raw
 core logs are excluded. Diagnostics performs no DNS or network probes.
 Error history is byte-budgeted during export so current status is retained and
 truncation is explicit. An unreachable helper produces an unknown core state,

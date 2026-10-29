@@ -42,21 +42,174 @@ enum LocalTCPPortProbe {
   }
 }
 
-private final class DelayResults: @unchecked Sendable {
+final class ManagedCoreChild: @unchecked Sendable {
   private let lock = NSLock()
-  private var values: [ProxyNodeID: Int] = [:]
+  private let exitNotification = DispatchSemaphore(value: 0)
+  private var processIdentifier: pid_t?
+  private var exitStatus: Int32?
+  private var exitSource: DispatchSourceProcess?
 
-  func set(_ value: Int?, for node: ProxyNodeID) {
-    guard let value else { return }
-    lock.lock()
-    values[node] = value
-    lock.unlock()
+  private init(processIdentifier: pid_t) {
+    self.processIdentifier = processIdentifier
   }
 
-  func value(for node: ProxyNodeID) -> Int? {
-    lock.lock()
-    defer { lock.unlock() }
-    return values[node]
+  static func launch(
+    executableURL: URL,
+    arguments: [String],
+    currentDirectoryURL: URL
+  ) throws -> ManagedCoreChild {
+    var fileActions: posix_spawn_file_actions_t?
+    try checkSpawnResult(posix_spawn_file_actions_init(&fileActions))
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+    try checkSpawnResult(
+      currentDirectoryURL.path.withCString {
+        posix_spawn_file_actions_addchdir(&fileActions, $0)
+      })
+    try checkSpawnResult(
+      posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0))
+    try checkSpawnResult(
+      posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0))
+    try checkSpawnResult(
+      posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0))
+
+    var attributes: posix_spawnattr_t?
+    try checkSpawnResult(posix_spawnattr_init(&attributes))
+    defer { posix_spawnattr_destroy(&attributes) }
+    var defaultSignals = sigset_t()
+    _ = sigemptyset(&defaultSignals)
+    _ = sigaddset(&defaultSignals, SIGTERM)
+    try checkSpawnResult(posix_spawnattr_setsigdefault(&attributes, &defaultSignals))
+    var signalMask = sigset_t()
+    _ = sigemptyset(&signalMask)
+    try checkSpawnResult(posix_spawnattr_setsigmask(&attributes, &signalMask))
+    try checkSpawnResult(
+      posix_spawnattr_setflags(
+        &attributes,
+        Int16(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT)
+      ))
+
+    var argumentPointers = ([executableURL.path] + arguments).map { strdup($0) }
+    guard argumentPointers.allSatisfy({ $0 != nil }) else {
+      for pointer in argumentPointers {
+        if let pointer { free(pointer) }
+      }
+      throw CoreFailure.coreLaunchFailed(ENOMEM)
+    }
+    defer {
+      for pointer in argumentPointers {
+        if let pointer { free(pointer) }
+      }
+    }
+    argumentPointers.append(nil)
+
+    var childPID: pid_t = 0
+    let spawnResult = executableURL.path.withCString { executablePath in
+      argumentPointers.withUnsafeBufferPointer { argv in
+        posix_spawn(
+          &childPID,
+          executablePath,
+          &fileActions,
+          &attributes,
+          argv.baseAddress,
+          environ
+        )
+      }
+    }
+    try checkSpawnResult(spawnResult)
+
+    let child = ManagedCoreChild(processIdentifier: childPID)
+    child.monitorExit()
+    _ = child.isRunning
+    return child
+  }
+
+  private static func checkSpawnResult(_ result: Int32) throws {
+    guard result == 0 else { throw CoreFailure.coreLaunchFailed(result) }
+  }
+
+  var pid: pid_t? {
+    lock.withLock { processIdentifier }
+  }
+
+  var isRunning: Bool {
+    lock.withLock {
+      reapIfExitedLocked()
+      return processIdentifier != nil
+    }
+  }
+
+  func waitUntilExit(timeout: TimeInterval) -> Int32? {
+    let currentStatus = lock.withLock { exitStatus }
+    if let currentStatus { return currentStatus }
+
+    if exitNotification.wait(timeout: .now() + timeout) == .timedOut {
+      lock.withLock { reapIfExitedLocked() }
+    }
+    return lock.withLock { exitStatus }
+  }
+
+  @discardableResult
+  func terminate() -> Bool {
+    guard sendSignal(SIGTERM) else { return false }
+    if waitUntilExit(timeout: 3) != nil { return true }
+    guard sendSignal(SIGKILL) else { return false }
+    return waitUntilExit(timeout: 1) != nil
+  }
+
+  private func monitorExit() {
+    guard let processIdentifier = pid else { return }
+    let source = DispatchSource.makeProcessSource(
+      identifier: processIdentifier,
+      eventMask: .exit,
+      queue: .global(qos: .utility)
+    )
+    source.setEventHandler { [weak self] in
+      self?.reapAfterExitEvent()
+    }
+    exitSource = source
+    source.activate()
+  }
+
+  private func sendSignal(_ signal: Int32) -> Bool {
+    lock.withLock {
+      reapIfExitedLocked()
+      guard let processIdentifier else { return true }
+      let result = kill(processIdentifier, signal)
+      return result == 0 || errno == ESRCH
+    }
+  }
+
+  private func reapAfterExitEvent() {
+    lock.withLock { reapIfExitedLocked(blocking: true) }
+  }
+
+  private func reapIfExitedLocked(blocking: Bool = false) {
+    guard let processIdentifier else { return }
+    var waitStatus: Int32 = 0
+    let options = blocking ? 0 : WNOHANG
+    var result: pid_t
+    repeat {
+      result = waitpid(processIdentifier, &waitStatus, options)
+    } while result < 0 && errno == EINTR
+    if result == 0 { return }
+
+    if result == processIdentifier {
+      let terminatingSignal = waitStatus & 0x7f
+      exitStatus = terminatingSignal == 0 ? (waitStatus >> 8) & 0xff : 128 + terminatingSignal
+    } else if result == -1 && errno == ECHILD {
+      // The exact child is no longer waitable; do not retain stale PID authority.
+      exitStatus = -1
+    } else {
+      // An unrecognized observation error is not proof that the child has exited.
+      return
+    }
+
+    self.processIdentifier = nil
+    let source = exitSource
+    exitSource = nil
+    source?.cancel()
+    exitNotification.signal()
   }
 }
 
@@ -77,6 +230,19 @@ enum LatencyDelayRequest {
   }
 }
 
+func parseLatencyHistory(_ data: Data, nodes: [ProxyNodeDescriptor]) throws -> [NodeDelay] {
+  guard data.count <= 1_048_576,
+    let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+    let proxies = response["proxies"] as? [String: Any]
+  else { throw CoreFailure.apiUnavailable }
+
+  return nodes.map { node in
+    let history = (proxies[node.id.rawValue] as? [String: Any])?["history"] as? [[String: Any]]
+    let milliseconds = history?.last?["delay"] as? Int
+    return NodeDelay(node: node.id, milliseconds: milliseconds)
+  }
+}
+
 struct PersistentState: Codable {
   var profile: CoreProfile?
   var activeProfileID: UUID?
@@ -85,6 +251,7 @@ struct PersistentState: Codable {
   var selectorTag = "proxy-selector"
   var nodes: [ProxyNodeDescriptor] = []
   var desiredRunning = false
+  var legacy1115RetirementComplete = false
   var automaticRecoveryAttempted = false
   /// Metadata only: the desired app configuration was validated but deferred
   /// because a known-good core is still running with different bytes.
@@ -92,6 +259,7 @@ struct PersistentState: Codable {
   var localSOCKSEnabled = false
   var localSOCKSPort: UInt16 = 1082
   var latencyTestURL = LatencyTargetPolicy.defaultURL
+  var dnsSettings = ManagedDNSSettings.defaults
   /// Desired policy persisted by the app. This is intentionally separate from
   /// the policy known to be active in a running core.
   var ipv6Enabled = false
@@ -111,11 +279,13 @@ struct PersistentState: Codable {
     case selectorTag
     case nodes
     case desiredRunning
+    case legacy1115RetirementComplete
     case automaticRecoveryAttempted
     case deferredRuntimeApplyPending
     case localSOCKSEnabled
     case localSOCKSPort
     case latencyTestURL
+    case dnsSettings
     case ipv6Enabled
     case activeIPv6Enabled
     case activeIPv6PolicyKnown
@@ -125,16 +295,7 @@ struct PersistentState: Codable {
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     if container.contains(.profile) {
-      do {
-        profile = try container.decode(CoreProfile.self, forKey: .profile)
-      } catch {
-        // Helper state can outlive the profile-library migration. Decode the
-        // released parallel-array shape only at this one-way boundary.
-        let legacy = try LegacyCoreProfileDTO(
-          from: container.superDecoder(forKey: .profile)
-        )
-        profile = legacy.currentProfile()
-      }
+      profile = try container.decode(CoreProfile.self, forKey: .profile)
     } else {
       profile = nil
     }
@@ -168,6 +329,8 @@ struct PersistentState: Codable {
       }
     }
     desiredRunning = try container.decodeIfPresent(Bool.self, forKey: .desiredRunning) ?? false
+    legacy1115RetirementComplete =
+      try container.decodeIfPresent(Bool.self, forKey: .legacy1115RetirementComplete) ?? false
     automaticRecoveryAttempted =
       try container.decodeIfPresent(Bool.self, forKey: .automaticRecoveryAttempted) ?? false
     deferredRuntimeApplyPending =
@@ -180,6 +343,10 @@ struct PersistentState: Codable {
       try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
       ?? LatencyTargetPolicy.defaultURL
     latencyTestURL = try LatencyTargetPolicy.normalized(storedTarget)
+    dnsSettings =
+      container.contains(.dnsSettings)
+      ? try container.decode(ManagedDNSSettings.self, forKey: .dnsSettings).validated()
+      : .defaults
     let storedIPv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .ipv6Enabled)
     ipv6Enabled = storedIPv6Enabled ?? false
     if let storedPolicyKnown =
@@ -279,12 +446,14 @@ enum DesiredRuntimeRecoveryDecision: Equatable {
 
 enum DesiredRuntimeRecoveryPolicy {
   static func decision(
+    recoveryAuthorized: Bool,
     desiredRunning: Bool,
     coreRunning: Bool,
     profileAvailable: Bool,
     configurationAvailable: Bool,
     recoveryAlreadyAttempted: Bool
   ) -> DesiredRuntimeRecoveryDecision {
+    guard recoveryAuthorized else { return .noAction }
     guard desiredRunning else { return .stop }
     guard !coreRunning else { return .noAction }
     guard profileAvailable, configurationAvailable, !recoveryAlreadyAttempted else {
@@ -357,17 +526,15 @@ struct CoreActivationTransaction<Candidate> {
 
 struct CoreStopTransaction {
   static func run(
-    previousState: PersistentState,
+    state: inout PersistentState,
     stopKnownGood: () throws -> Void,
     save: (PersistentState) throws -> Void
-  ) throws -> PersistentState {
+  ) throws {
     try stopKnownGood()
-    var stoppedState = previousState
-    stoppedState.desiredRunning = false
-    stoppedState.automaticRecoveryAttempted = false
-    stoppedState.deferredRuntimeApplyPending = false
-    try save(stoppedState)
-    return stoppedState
+    state.desiredRunning = false
+    state.automaticRecoveryAttempted = false
+    state.deferredRuntimeApplyPending = false
+    try save(state)
   }
 }
 
@@ -421,8 +588,6 @@ final class CoreManager: @unchecked Sendable {
   private lazy var configURL = supportDirectory.appendingPathComponent("config.json")
   private lazy var configBackupURL = supportDirectory.appendingPathComponent("config.json.backup")
   private lazy var stateURL = supportDirectory.appendingPathComponent("state.json")
-  private lazy var pidURL = supportDirectory.appendingPathComponent("sing-box.pid")
-  private lazy var logURL = supportDirectory.appendingPathComponent("sing-box.log")
   private lazy var cacheURL = supportDirectory.appendingPathComponent("cache.db")
   private lazy var coreMetadataURL = supportDirectory.appendingPathComponent("core-metadata.json")
   private lazy var coreBackupURL = supportDirectory.appendingPathComponent("sing-box.backup")
@@ -432,7 +597,8 @@ final class CoreManager: @unchecked Sendable {
   private let expectedCoreSHA256 = CoreBuildInfo.signedSHA256
 
   private var state = PersistentState()
-  private var coreProcess: Process?
+  private var coreProcess: ManagedCoreChild?
+  private var coreMetadata: CoreMetadata?
   private var bootstrapFailure: String?
 
   init() {
@@ -452,13 +618,23 @@ final class CoreManager: @unchecked Sendable {
   }
 
   func bootstrap() {
+    guard Legacy1115Retirement.completionIsValid() else {
+      state = PersistentState()
+      bootstrapFailure = "The one-time legacy helper retirement has not completed."
+      return
+    }
     do {
       // Socket activation is not an authenticated lifecycle request.  Load
       // only safe persisted state here; core installation and reconciliation
       // happen after HelperServer has authenticated and parsed an action.
       try prepareFilesystem(installBundledCore: false)
-      try enforceLogLimit()
-      state = try loadState()
+      coreMetadata = loadCachedMetadataMatchingInstalledCoreIdentity()
+      let loadedState = try loadState()
+      guard loadedState.legacy1115RetirementComplete else {
+        throw CoreFailure.coreIntegrity(
+          "The current helper state has no valid retired-OFF receipt.")
+      }
+      state = loadedState
       bootstrapFailure = nil
     } catch {
       bootstrapFailure = error.localizedDescription
@@ -468,21 +644,64 @@ final class CoreManager: @unchecked Sendable {
   }
 
   func auditSnapshot() -> HelperCoreAuditState {
-    HelperCoreAuditState(
-      coreRunning: isCoreRunning,
+    let coreRunning = isCoreRunning
+    return HelperCoreAuditState(
+      coreRunning: coreRunning,
       desiredRunning: state.desiredRunning
     )
   }
 
+  var legacy1115Retired: Bool {
+    state.legacy1115RetirementComplete
+  }
+
+  func inertLegacyUpgradeResponse(
+    success: Bool = true,
+    message: String = "Waiting for authenticated legacy helper retirement."
+  ) -> HelperResponse {
+    HelperResponse(
+      success: success,
+      coreRunning: false,
+      legacy1115Retired: false,
+      message: message
+    )
+  }
+
+  func finishLegacy1115Upgrade() throws -> HelperResponse {
+    if Legacy1115Retirement.completionIsValid() {
+      let completedState = try loadState()
+      guard completedState.legacy1115RetirementComplete else {
+        throw CoreFailure.coreIntegrity("The current helper did not load its retirement receipt.")
+      }
+      state = completedState
+      bootstrapFailure = nil
+      return status(message: "Legacy helper retired; current helper is stopped.")
+    }
+
+    try Legacy1115Retirement.finish()
+    var completedState = PersistentState()
+    completedState.desiredRunning = false
+    completedState.legacy1115RetirementComplete = true
+    try prepareFilesystem(installBundledCore: false)
+    try saveState(completedState)
+    guard Legacy1115Retirement.completionIsValid() else {
+      throw CoreFailure.coreIntegrity("The durable current retirement receipt failed readback.")
+    }
+    state = completedState
+    bootstrapFailure = nil
+    return status(message: "Legacy helper retired; current helper is stopped.")
+  }
+
   func status(
     message: String = "Helper connected",
-    ruleSetMatches: [RuleSetMatch] = [],
-    runtimeOutcome: HelperRuntimeOutcome? = nil
+    runtimeOutcome: HelperRuntimeOutcome? = nil,
+    observeAutoNode: Bool = false
   ) -> HelperResponse {
+    let coreRunning = isCoreRunning
     let effectiveRuntimeOutcome =
       runtimeOutcome
       ?? DeferredRuntimeMarkerPolicy.outcome(
-        coreRunning: isCoreRunning,
+        coreRunning: coreRunning,
         marker: state.deferredRuntimeApplyPending
       )
     let recoveryExhausted = state.automaticRecoveryAttempted && !state.desiredRunning
@@ -491,32 +710,59 @@ final class CoreManager: @unchecked Sendable {
       ?? (recoveryExhausted
         ? "Automatic VPN recovery is exhausted; connect manually to retry"
         : effectiveRuntimeOutcome.userMessage ?? message)
+    var effectiveAutoNode: ProxyNodeID?
+    if observeAutoNode, coreRunning, state.selectedNode == .auto,
+      case .compatibility(let activeProfile)? = state.profile,
+      let data = try? apiRequest(
+        method: "GET",
+        path: "/proxies/auto",
+        body: nil,
+        timeoutSeconds: 0.25,
+        totalPhaseTimeout: true
+      ),
+      let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+      let rawID = object["now"] as? String
+    {
+      let nodeID = ProxyNodeID(rawValue: rawID)
+      if activeProfile.connections.contains(where: { $0.id == nodeID }),
+        !activeProfile.autoExcludedNodeIDs.contains(nodeID)
+      {
+        effectiveAutoNode = nodeID
+      }
+    }
     return HelperResponse(
       success: bootstrapFailure == nil && !recoveryExhausted,
-      coreRunning: isCoreRunning,
+      coreRunning: coreRunning,
       coreVersion: cachedCoreVersion(),
       mode: state.mode,
       selectedNode: state.selectedNode,
+      effectiveAutoNode: effectiveAutoNode,
       activeProfileID: state.activeProfileID,
-      activeIPv6Enabled: isCoreRunning ? state.activeIPv6Policy : nil,
+      activeIPv6Enabled: coreRunning ? state.activeIPv6Policy : nil,
       nodes: state.nodes,
       automaticRecoveryExhausted: recoveryExhausted,
-      ruleSetMatches: ruleSetMatches,
       runtimeOutcome: effectiveRuntimeOutcome,
+      legacy1115Retired: state.legacy1115RetirementComplete,
       message: effectiveMessage
     )
   }
 
-  func reconcileDesiredRuntime() throws -> String? {
+  func reconcileDesiredRuntime(recoveryAuthorized: Bool) throws -> String? {
+    guard recoveryAuthorized else { return nil }
     guard bootstrapFailure == nil else { return nil }
-    if state.desiredRunning || isCoreRunning {
+    let coreRunning = isCoreRunning
+    if state.desiredRunning && !coreRunning {
       try prepareFilesystem()
     }
+    let configurationAvailable =
+      state.desiredRunning && !coreRunning
+      && pathExistsWithoutFollowingSymlinks(configURL)
     let recoveryDecision = DesiredRuntimeRecoveryPolicy.decision(
+      recoveryAuthorized: recoveryAuthorized,
       desiredRunning: state.desiredRunning,
-      coreRunning: isCoreRunning,
+      coreRunning: coreRunning,
       profileAvailable: state.profile != nil,
-      configurationAvailable: pathExistsWithoutFollowingSymlinks(configURL),
+      configurationAvailable: configurationAvailable,
       recoveryAlreadyAttempted: state.automaticRecoveryAttempted
     )
     switch recoveryDecision {
@@ -552,7 +798,8 @@ final class CoreManager: @unchecked Sendable {
     localSOCKSEnabled: Bool? = nil,
     localSOCKSPort: UInt16? = nil,
     latencyTestURL: String? = nil,
-    ipv6Enabled: Bool? = nil
+    ipv6Enabled: Bool? = nil,
+    dnsSettings: ManagedDNSSettings = .defaults
   ) throws -> HelperResponse {
     let normalizedLatencyTestURL = try latencyTestURL.map(LatencyTargetPolicy.normalized)
     let previousState = state
@@ -584,6 +831,7 @@ final class CoreManager: @unchecked Sendable {
       if let ipv6Enabled {
         requestedState.ipv6Enabled = ipv6Enabled
       }
+      requestedState.dnsSettings = try dnsSettings.validated()
       guard let activeProfile = requestedState.profile else {
         throw CoreFailure.profileMissing
       }
@@ -740,9 +988,8 @@ final class CoreManager: @unchecked Sendable {
   }
 
   func stop() throws -> HelperResponse {
-    let previousState = state
-    let stoppedState = try CoreStopTransaction.run(
-      previousState: previousState,
+    try CoreStopTransaction.run(
+      state: &state,
       stopKnownGood: { [self] in
         guard terminateCore(), !isCoreRunning else {
           throw CoreFailure.coreStopFailed
@@ -752,7 +999,6 @@ final class CoreManager: @unchecked Sendable {
         try saveState(snapshot)
       }
     )
-    state = stoppedState
     return status(message: "VPN disconnected")
   }
 
@@ -811,32 +1057,33 @@ final class CoreManager: @unchecked Sendable {
   }
 
   func testLatency(node requestedNode: ProxyNodeID? = nil) throws -> HelperResponse {
+    guard requestedNode != .auto else {
+      throw CoreFailure.invalidProfile("Auto latency is owned by sing-box.")
+    }
     guard isCoreRunning else { throw CoreFailure.coreNotRunning }
-    let descriptors: [ProxyNodeDescriptor]
+    let delays: [NodeDelay]
     if let requestedNode {
-      guard let descriptor = state.nodes.first(where: { $0.id == requestedNode }) else {
+      guard state.nodes.contains(where: { $0.id == requestedNode }) else {
         throw CoreFailure.invalidProfile("The requested latency node is not active.")
       }
-      descriptors = [descriptor]
+      _ = try apiRequest(
+        method: "GET",
+        path: LatencyDelayRequest.path(for: requestedNode, target: state.latencyTestURL),
+        body: nil,
+        timeoutSeconds: 0.25,
+        totalPhaseTimeout: true,
+        waitForResponse: false
+      )
+      delays = []
     } else {
-      descriptors = state.nodes
-    }
-    let results = DelayResults()
-    let workerCount = min(8, descriptors.count)
-    DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
-      for index in stride(from: worker, to: descriptors.count, by: workerCount) {
-        let descriptor = descriptors[index]
-        let node = descriptor.id
-        let path = LatencyDelayRequest.path(for: node, target: state.latencyTestURL)
-        let data = try? apiRequest(method: "GET", path: path, body: nil)
-        let object = data.flatMap {
-          try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
-        }
-        results.set(object?["delay"] as? Int, for: node)
-      }
-    }
-    let delays = descriptors.map { descriptor in
-      NodeDelay(node: descriptor.id, milliseconds: results.value(for: descriptor.id))
+      let data = try apiRequest(
+        method: "GET",
+        path: "/proxies",
+        body: nil,
+        timeoutSeconds: 0.25,
+        totalPhaseTimeout: true
+      )
+      delays = try parseLatencyHistory(data, nodes: state.nodes)
     }
     return HelperResponse(
       success: true,
@@ -848,6 +1095,11 @@ final class CoreManager: @unchecked Sendable {
       activeIPv6Enabled: state.activeIPv6Policy,
       nodes: state.nodes,
       delays: delays,
+      runtimeOutcome: DeferredRuntimeMarkerPolicy.outcome(
+        coreRunning: true,
+        marker: state.deferredRuntimeApplyPending
+      ),
+      legacy1115Retired: state.legacy1115RetirementComplete,
       message: "Latency updated"
     )
   }
@@ -867,90 +1119,13 @@ final class CoreManager: @unchecked Sendable {
       activeProfileID: state.activeProfileID,
       activeIPv6Enabled: isCoreRunning ? state.activeIPv6Policy : nil,
       nodes: built.nodes,
+      legacy1115Retired: state.legacy1115RetirementComplete,
       message: "Profile validated"
     )
   }
 
-  func matchRuleSets(tags: [String], destination: String) throws -> HelperResponse {
-    guard isCoreRunning, state.profile != nil,
-      !tags.isEmpty, tags.count <= 8, Set(tags).count == tags.count,
-      !destination.isEmpty, destination.utf8.count <= 512,
-      !destination.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
-    else { throw CoreFailure.invalidRuleSetQuery }
-    try requireSecureManagedFileIfPresent(cacheURL)
-    try requireSecureManagedFileIfPresent(configURL)
-    let attributes = try fileManager.attributesOfItem(atPath: configURL.path)
-    guard let size = attributes[.size] as? NSNumber,
-      size.intValue > 0, size.intValue <= 2 * 1_048_576
-    else { throw CoreFailure.invalidRuleSetQuery }
-    let activeConfiguration = try Data(contentsOf: configURL)
-    guard activeConfiguration.count <= 2 * 1_048_576 else {
-      throw CoreFailure.invalidRuleSetQuery
-    }
-    guard
-      let root = try JSONSerialization.jsonObject(with: activeConfiguration) as? [String: Any],
-      let route = root["route"] as? [String: Any]
-    else { throw CoreFailure.invalidRuleSetQuery }
-    let definitions: [String: String] = Dictionary(
-      uniqueKeysWithValues: (route["rule_set"] as? [[String: Any]] ?? []).compactMap { item in
-        guard (item["type"] as? String) == "remote",
-          let tag = item["tag"] as? String,
-          let format = item["format"] as? String,
-          ["source", "binary"].contains(format)
-        else { return nil }
-        return (tag, format)
-      }
-    )
-    let temporaryDirectory = supportDirectory.appendingPathComponent(
-      "rule-set-match-\(UUID().uuidString)", isDirectory: true)
-    try fileManager.createDirectory(
-      at: temporaryDirectory,
-      withIntermediateDirectories: false,
-      attributes: [.posixPermissions: 0o700]
-    )
-    defer { try? fileManager.removeItem(at: temporaryDirectory) }
-    var matches: [RuleSetMatch] = []
-    for (index, tag) in tags.enumerated() {
-      guard let format = definitions[tag] else { throw CoreFailure.invalidRuleSetQuery }
-      let content: Data
-      do {
-        content = try RuleSetCacheReader.content(at: cacheURL, tag: tag)
-      } catch {
-        throw CoreFailure.ruleSetUnavailable(tag)
-      }
-      let ruleSetURL = temporaryDirectory.appendingPathComponent(
-        "rule-set-\(index).\(format == "binary" ? "srs" : "json")")
-      try content.write(to: ruleSetURL, options: .atomic)
-      try secureFile(ruleSetURL)
-      let matched = try runCore(
-        arguments: [
-          "rule-set", "match", "-f", format, ruleSetURL.path, destination,
-        ], timeoutSeconds: 5)
-      matches.append(RuleSetMatch(tag: tag, matches: matched))
-    }
-    return status(message: "Routing rule sets matched", ruleSetMatches: matches)
-  }
-
   private var isCoreRunning: Bool {
-    guard let pid = currentPID() else { return false }
-    return isProcessRunning(pid)
-  }
-
-  private func currentPID() -> pid_t? {
-    guard let value = try? String(contentsOf: pidURL, encoding: .utf8),
-      let pid = pid_t(value.trimmingCharacters(in: .whitespacesAndNewlines)),
-      pid > 1
-    else { return nil }
-    return pid
-  }
-
-  private func isProcessRunning(_ pid: pid_t) -> Bool {
-    guard kill(pid, 0) == 0 || errno == EPERM else { return false }
-    var buffer = [CChar](repeating: 0, count: 4096)
-    let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-    guard count > 0 else { return false }
-    let pathBytes = buffer.prefix(Int(count)).prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-    return String(decoding: pathBytes, as: UTF8.self) == coreURL.path
+    coreProcess?.isRunning == true
   }
 
   private func prepareFilesystem(installBundledCore: Bool = true) throws {
@@ -972,8 +1147,7 @@ final class CoreManager: @unchecked Sendable {
         "The root support directory has unsafe ownership, permissions, or file type.")
     }
     for url in [
-      configURL, configBackupURL, stateURL, pidURL, logURL, cacheURL, coreMetadataURL,
-      coreBackupURL,
+      configURL, configBackupURL, stateURL, cacheURL, coreMetadataURL, coreBackupURL,
     ] {
       try requireSecureManagedFileIfPresent(url)
     }
@@ -1009,18 +1183,20 @@ final class CoreManager: @unchecked Sendable {
       }
       return
     }
-    guard fileManager.isExecutableFile(atPath: bundledCoreURL.path) else {
-      throw CoreFailure.coreMissing
-    }
-    let bundledDigest = try sha256(of: bundledCoreURL)
-    guard bundledDigest == expectedCoreSHA256 else {
-      throw CoreFailure.coreIntegrity("The bundled sing-box checksum does not match this build.")
-    }
     let candidate = supportDirectory.appendingPathComponent(
       "sing-box.candidate-\(UUID().uuidString)")
-    try fileManager.copyItem(at: bundledCoreURL, to: candidate)
-    defer { try? fileManager.removeItem(at: candidate) }
-    try takeRootOwnershipOfCopiedRegularFile(candidate)
+    var candidateCaptured = false
+    defer {
+      if candidateCaptured {
+        try? fileManager.removeItem(at: candidate)
+      }
+    }
+    try Self.captureBundledCore(
+      from: bundledCoreURL,
+      to: candidate,
+      expectedSize: CoreBuildInfo.signedSize
+    )
+    candidateCaptured = true
     try secureExecutable(candidate)
     guard try sha256(of: candidate) == expectedCoreSHA256 else {
       throw CoreFailure.coreIntegrity("The root-owned sing-box copy failed verification.")
@@ -1068,6 +1244,106 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
+  static func captureBundledCore(
+    from source: URL,
+    to destination: URL,
+    expectedSize: Int64
+  ) throws {
+    guard expectedSize > 0 else {
+      throw CoreFailure.coreIntegrity("Invalid signed core size.")
+    }
+    let sourcePath = source.path
+    let destinationPath = destination.path
+    var sourceDescriptor: Int32 = -1
+    var destinationDescriptor: Int32 = -1
+    var removeCandidateOnFailure = false
+    defer {
+      if destinationDescriptor >= 0 { _ = Darwin.close(destinationDescriptor) }
+      if sourceDescriptor >= 0 { _ = Darwin.close(sourceDescriptor) }
+      if removeCandidateOnFailure { _ = Darwin.unlink(destinationPath) }
+    }
+    sourceDescriptor = sourcePath.withCString {
+      Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+    }
+    guard sourceDescriptor >= 0 else {
+      if errno == ENOENT { throw CoreFailure.coreMissing }
+      throw CoreFailure.coreIntegrity("Unable to open bundled sing-box core (errno \(errno)).")
+    }
+    var sourceInfo = stat()
+    var statResult = Darwin.fstat(sourceDescriptor, &sourceInfo)
+    while statResult != 0 && errno == EINTR {
+      statResult = Darwin.fstat(sourceDescriptor, &sourceInfo)
+    }
+    guard statResult == 0, sourceInfo.st_mode & S_IFMT == S_IFREG,
+      sourceInfo.st_size == expectedSize
+    else {
+      throw CoreFailure.coreIntegrity("Bundled sing-box is not a regular file of signed size.")
+    }
+    destinationDescriptor = destinationPath.withCString {
+      Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+    }
+    guard destinationDescriptor >= 0 else {
+      throw CoreFailure.coreIntegrity("Unable to create sing-box candidate (errno \(errno)).")
+    }
+    removeCandidateOnFailure = true
+    var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+    var copied: Int64 = 0
+    while copied < expectedSize {
+      let readLimit = min(buffer.count, Int(expectedSize - copied))
+      var readCount = buffer.withUnsafeMutableBytes {
+        Darwin.read(sourceDescriptor, $0.baseAddress, size_t(readLimit))
+      }
+      while readCount < 0 && errno == EINTR {
+        readCount = buffer.withUnsafeMutableBytes {
+          Darwin.read(sourceDescriptor, $0.baseAddress, size_t(readLimit))
+        }
+      }
+      guard readCount > 0 else {
+        throw CoreFailure.coreIntegrity("Bundled sing-box ended before its signed size.")
+      }
+      var written = 0
+      while written < readCount {
+        var writeCount = buffer.withUnsafeBytes {
+          Darwin.write(
+            destinationDescriptor,
+            $0.baseAddress?.advanced(by: written),
+            size_t(readCount - written)
+          )
+        }
+        while writeCount < 0 && errno == EINTR {
+          writeCount = buffer.withUnsafeBytes {
+            Darwin.write(
+              destinationDescriptor,
+              $0.baseAddress?.advanced(by: written),
+              size_t(readCount - written)
+            )
+          }
+        }
+        guard writeCount > 0 else {
+          throw CoreFailure.coreIntegrity("Unable to write sing-box candidate.")
+        }
+        written += writeCount
+      }
+      copied += Int64(readCount)
+    }
+    var extraByte: UInt8 = 0
+    var extraRead = withUnsafeMutableBytes(of: &extraByte) {
+      Darwin.read(sourceDescriptor, $0.baseAddress, 1)
+    }
+    while extraRead < 0 && errno == EINTR {
+      extraRead = withUnsafeMutableBytes(of: &extraByte) {
+        Darwin.read(sourceDescriptor, $0.baseAddress, 1)
+      }
+    }
+    guard extraRead == 0 else {
+      throw CoreFailure.coreIntegrity("Bundled sing-box did not end at its signed size.")
+    }
+    guard copied == expectedSize else {
+      throw CoreFailure.coreIntegrity("Sing-box candidate size differs from signed size.")
+    }
+    removeCandidateOnFailure = false
+  }
+
   private func restoreBackupCore(expectedMetadata: CoreMetadata) throws {
     try requireSecureManagedFileIfPresent(coreBackupURL)
     let candidate = supportDirectory.appendingPathComponent(
@@ -1112,27 +1388,50 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func cachedMetadataMatchesInstalledCore() -> Bool {
-    guard let metadata = cachedMetadataMatchingInstalledCoreIdentity() else { return false }
+    guard let metadata = coreMetadataMatchingInstalledIdentity() else { return false }
     return metadata.digest == expectedCoreSHA256
       && metadata.version == "sing-box version \(CoreBuildInfo.version)"
   }
 
   private func verifiedInstalledCoreMetadata() throws -> CoreMetadata? {
-    guard let metadata = cachedMetadataMatchingInstalledCoreIdentity() else { return nil }
-    guard try sha256(of: coreURL) == metadata.digest,
-      readCoreVersion(at: coreURL) == metadata.version
-    else { return nil }
-    return metadata
+    guard let metadata = coreMetadataMatchingInstalledIdentity() else { return nil }
+    do {
+      guard try sha256(of: coreURL) == metadata.digest,
+        readCoreVersion(at: coreURL) == metadata.version
+      else {
+        coreMetadata = nil
+        return nil
+      }
+      return metadata
+    } catch {
+      coreMetadata = nil
+      throw error
+    }
   }
 
-  private func cachedMetadataMatchingInstalledCoreIdentity() -> CoreMetadata? {
+  private func loadCachedMetadataMatchingInstalledCoreIdentity() -> CoreMetadata? {
     guard isSecureRootRegularFile(coreURL),
       isSecureRootRegularFile(coreMetadataURL),
       let data = try? Data(contentsOf: coreMetadataURL),
       let metadata = try? JSONDecoder().decode(CoreMetadata.self, from: data),
       let info = CoreFileIdentity.read(coreURL)
     else { return nil }
-    guard metadata.matches(info) else { return nil }
+    guard metadata.matches(info),
+      metadata.digest == expectedCoreSHA256,
+      metadata.version == "sing-box version \(CoreBuildInfo.version)"
+    else { return nil }
+    return metadata
+  }
+
+  private func coreMetadataMatchingInstalledIdentity() -> CoreMetadata? {
+    guard let metadata = coreMetadata,
+      isSecureRootRegularFile(coreURL),
+      let identity = CoreFileIdentity.read(coreURL),
+      metadata.matches(identity)
+    else {
+      coreMetadata = nil
+      return nil
+    }
     return metadata
   }
 
@@ -1154,6 +1453,7 @@ final class CoreManager: @unchecked Sendable {
     let metadata = CoreMetadata(digest: digest, identity: identity, version: version)
     try JSONEncoder().encode(metadata).write(to: coreMetadataURL, options: .atomic)
     try secureFile(coreMetadataURL)
+    coreMetadata = metadata
   }
 
   private func isSecureRootDirectory(_ url: URL) -> Bool {
@@ -1276,7 +1576,8 @@ final class CoreManager: @unchecked Sendable {
       selectedNode: effectiveState.selectedNode,
       localSOCKSPort: effectiveState.localSOCKSEnabled ? effectiveState.localSOCKSPort : nil,
       latencyTestURL: effectiveState.latencyTestURL,
-      ipv6Enabled: effectiveState.ipv6Enabled
+      ipv6Enabled: effectiveState.ipv6Enabled,
+      dnsSettings: effectiveState.dnsSettings
     )
   }
 
@@ -1285,8 +1586,8 @@ final class CoreManager: @unchecked Sendable {
       "validation-\(UUID().uuidString).json"
     )
     try built.data.write(to: candidate, options: .atomic)
-    try secureFile(candidate)
     defer { try? fileManager.removeItem(at: candidate) }
+    try secureFile(candidate)
     try runCore(arguments: ["check", "-c", candidate.path])
   }
 
@@ -1330,8 +1631,8 @@ final class CoreManager: @unchecked Sendable {
     let candidate = supportDirectory.appendingPathComponent(
       "config.json.candidate-\(UUID().uuidString)")
     try built.data.write(to: candidate, options: .atomic)
-    try secureFile(candidate)
     defer { try? fileManager.removeItem(at: candidate) }
+    try secureFile(candidate)
     try atomicReplace(candidate, at: configURL)
     try secureFile(configURL)
   }
@@ -1352,24 +1653,20 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func launchCore() throws {
-    try enforceLogLimit()
-    let logHandle = try writableLogHandle()
-    let process = Process()
-    process.executableURL = coreURL
-    process.arguments = ["run", "-c", configURL.path]
-    process.currentDirectoryURL = supportDirectory
-    process.standardOutput = logHandle
-    process.standardError = logHandle
-    try process.run()
+    if let existing = coreProcess {
+      guard !existing.isRunning else { throw CoreFailure.coreAlreadyRunning }
+      coreProcess = nil
+    }
+    let process = try ManagedCoreChild.launch(
+      executableURL: coreURL,
+      arguments: ["run", "-c", configURL.path],
+      currentDirectoryURL: supportDirectory
+    )
     coreProcess = process
-    try Data("\(process.processIdentifier)\n".utf8).write(to: pidURL, options: .atomic)
-    try secureFile(pidURL)
 
-    usleep(100_000)
-    guard process.isRunning else {
-      process.waitUntilExit()
-      try? fileManager.removeItem(at: pidURL)
-      throw CoreFailure.coreExited(process.terminationStatus)
+    if let status = process.waitUntilExit(timeout: 0.1) {
+      coreProcess = nil
+      throw CoreFailure.coreExited(status)
     }
   }
 
@@ -1397,38 +1694,20 @@ final class CoreManager: @unchecked Sendable {
 
   private func loadState() throws -> PersistentState {
     guard fileManager.fileExists(atPath: stateURL.path) else {
-      let initial = PersistentState()
-      state = initial
-      try saveState()
-      return initial
+      throw CoreFailure.coreIntegrity("The completed current helper state is missing.")
     }
-    do {
-      return try JSONDecoder().decode(
-        PersistentState.self,
-        from: Data(contentsOf: stateURL)
-      )
-    } catch {
-      let timestamp = Int(Date().timeIntervalSince1970)
-      let quarantined = supportDirectory.appendingPathComponent(
-        "state.corrupt-\(timestamp).json"
-      )
-      try? fileManager.moveItem(at: stateURL, to: quarantined)
-      if fileManager.fileExists(atPath: quarantined.path) {
-        try? secureFile(quarantined)
-      }
-      FileHandle.standardError.write(
-        Data(
-          "Preserved unreadable state as \(quarantined.lastPathComponent): "
-            .appending(error.localizedDescription)
-            .appending("\n")
-            .utf8
-        )
-      )
-      let initial = PersistentState()
-      state = initial
-      try saveState()
-      return initial
+    let data = try Data(contentsOf: stateURL)
+    try StrictJSONDuplicateValidator.validate(
+      data,
+      maximumBytes: 4 * 1_024 * 1_024,
+      maximumDepth: 32,
+      maximumStringBytes: 2 * 1_024 * 1_024
+    )
+    let decoded = try JSONDecoder().decode(PersistentState.self, from: data)
+    guard decoded.legacy1115RetirementComplete else {
+      throw CoreFailure.coreIntegrity("The current helper state has no valid retired-OFF receipt.")
     }
+    return decoded
   }
 
   private func persistDeferredRuntimeMarker(_ marker: Bool) throws {
@@ -1452,37 +1731,6 @@ final class CoreManager: @unchecked Sendable {
     try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     guard isSecureRootRegularFile(url) else {
       throw CoreFailure.coreIntegrity("Unable to secure a managed file.")
-    }
-  }
-
-  private func writableLogHandle() throws -> FileHandle {
-    if !fileManager.fileExists(atPath: logURL.path) {
-      fileManager.createFile(
-        atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
-    }
-    try secureFile(logURL)
-    let descriptor = open(logURL.path, O_WRONLY | O_APPEND | O_NOFOLLOW)
-    guard descriptor >= 0 else {
-      throw CocoaError(.fileWriteUnknown)
-    }
-    return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-  }
-
-  private func enforceLogLimit() throws {
-    let limit: off_t = 5 * 1_024 * 1_024
-    guard pathExistsWithoutFollowingSymlinks(logURL) else { return }
-    try requireSecureManagedFileIfPresent(logURL)
-    let descriptor = open(logURL.path, O_WRONLY | O_NOFOLLOW)
-    guard descriptor >= 0 else {
-      throw CocoaError(.fileWriteUnknown)
-    }
-    defer { close(descriptor) }
-    var metadata = stat()
-    guard fstat(descriptor, &metadata) == 0 else {
-      throw CocoaError(.fileReadUnknown)
-    }
-    if metadata.st_size > limit, ftruncate(descriptor, 0) != 0 {
-      throw CocoaError(.fileWriteUnknown)
     }
   }
 
@@ -1537,14 +1785,7 @@ final class CoreManager: @unchecked Sendable {
   }
 
   private func cachedCoreVersion() -> String? {
-    guard let data = try? Data(contentsOf: coreMetadataURL),
-      let metadata = try? JSONDecoder().decode(CoreMetadata.self, from: data)
-    else { return nil }
-    return metadata.version
-  }
-
-  private func readCoreVersionFromProcess() -> String? {
-    readCoreVersion(at: coreURL)
+    coreMetadata?.version
   }
 
   private func readCoreVersion(at executable: URL) -> String? {
@@ -1590,21 +1831,9 @@ final class CoreManager: @unchecked Sendable {
 
   @discardableResult
   private func terminateCore() -> Bool {
-    if let pid = currentPID(), isProcessRunning(pid) {
-      _ = kill(pid, SIGTERM)
-      for _ in 0..<30 where isProcessRunning(pid) {
-        usleep(100_000)
-      }
-      if isProcessRunning(pid) {
-        _ = kill(pid, SIGKILL)
-        for _ in 0..<10 where isProcessRunning(pid) {
-          usleep(100_000)
-        }
-      }
-      guard !isProcessRunning(pid) else { return false }
-    }
+    guard let process = coreProcess else { return true }
+    guard process.terminate(), !process.isRunning else { return false }
     coreProcess = nil
-    try? fileManager.removeItem(at: pidURL)
     return true
   }
 
@@ -1627,27 +1856,25 @@ final class CoreManager: @unchecked Sendable {
     method: String,
     path: String,
     body: Data?,
-    timeoutSeconds: Int = 2
+    timeoutSeconds: TimeInterval = 2,
+    totalPhaseTimeout: Bool = false,
+    waitForResponse: Bool = true
   ) throws -> Data {
     let descriptor = socket(AF_INET, SOCK_STREAM, 0)
     guard descriptor >= 0 else { throw CoreFailure.apiUnavailable }
     defer { close(descriptor) }
     try configureSocketTimeouts(descriptor, seconds: timeoutSeconds)
+    let deadline =
+      totalPhaseTimeout
+      ? ProcessInfo.processInfo.systemUptime + timeoutSeconds
+      : nil
 
     var address = sockaddr_in()
     address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     address.sin_family = sa_family_t(AF_INET)
     address.sin_port = in_port_t(19090).bigEndian
     address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-    var result: Int32
-    repeat {
-      result = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-          connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
-    } while result != 0 && errno == EINTR
-    guard result == 0 else { throw CoreFailure.apiUnavailable }
+    try connectAPISocket(descriptor, address: &address, deadline: deadline)
 
     let payload = body ?? Data()
     var request = "\(method) \(path) HTTP/1.1\r\n"
@@ -1658,30 +1885,243 @@ final class CoreManager: @unchecked Sendable {
     request += "Connection: close\r\n\r\n"
     var bytes = Data(request.utf8)
     bytes.append(payload)
-    try writeAll(bytes, to: descriptor)
+    try writeAll(bytes, to: descriptor, deadline: deadline)
+    guard waitForResponse else { return Data() }
 
     var response = Data()
     var buffer = [UInt8](repeating: 0, count: 4096)
-    while response.count < 1_048_576 {
-      let count = Darwin.read(descriptor, &buffer, buffer.count)
+    let maximumResponseBytes = 1_048_576
+    while true {
+      if let deadline {
+        try configureSocketTimeout(
+          descriptor,
+          option: SO_RCVTIMEO,
+          seconds: deadline - ProcessInfo.processInfo.systemUptime
+        )
+      }
+      if response.count == maximumResponseBytes {
+        var extraByte: UInt8 = 0
+        let count = Darwin.read(descriptor, &extraByte, 1)
+        if count < 0, errno == EINTR { continue }
+        guard count == 0 else { throw CoreFailure.apiUnavailable }
+        break
+      }
+      let requested = min(buffer.count, maximumResponseBytes - response.count)
+      let count = Darwin.read(descriptor, &buffer, requested)
       if count < 0, errno == EINTR { continue }
       if count < 0 { throw CoreFailure.apiUnavailable }
       if count == 0 { break }
       response.append(contentsOf: buffer.prefix(count))
     }
-    guard let separator = response.range(of: Data("\r\n\r\n".utf8)),
-      let head = String(data: response[..<separator.lowerBound], encoding: .utf8),
-      let statusLine = head.split(separator: "\r\n").first,
-      let status = Int(statusLine.split(separator: " ").dropFirst().first ?? "0"),
-      (200..<300).contains(status)
-    else { throw CoreFailure.apiUnavailable }
-    return Data(response[separator.upperBound...])
+    return try Self.parseAPIResponse(response)
   }
 
-  private func writeAll(_ data: Data, to descriptor: Int32) throws {
+  static func parseAPIResponse(_ response: Data) throws -> Data {
+    let maximumResponseBytes = 1_048_576
+    guard response.count <= maximumResponseBytes,
+      let separator = response.range(of: Data("\r\n\r\n".utf8)),
+      let head = String(data: response[..<separator.lowerBound], encoding: .ascii)
+    else { throw CoreFailure.apiUnavailable }
+
+    let lines = head.components(separatedBy: "\r\n")
+    guard let statusLine = lines.first else { throw CoreFailure.apiUnavailable }
+    let statusParts = statusLine.split(separator: " ", omittingEmptySubsequences: true)
+    guard statusParts.count >= 2,
+      statusParts[0] == "HTTP/1.1",
+      statusParts[1].count == 3,
+      statusParts[1].allSatisfy(\.isNumber),
+      let status = Int(statusParts[1]),
+      (200..<300).contains(status)
+    else { throw CoreFailure.apiUnavailable }
+
+    var contentLength: Int?
+    var transferEncoding: String?
+    for line in lines.dropFirst() {
+      let (name, value) = try parseHTTPHeader(line)
+      switch name {
+      case "content-length":
+        let trimmed = trimHTTPWhitespace(value)
+        guard !trimmed.isEmpty, trimmed.utf8.allSatisfy({ (48...57).contains($0) }),
+          let parsed = Int(trimmed)
+        else { throw CoreFailure.apiUnavailable }
+        if let contentLength, contentLength != parsed {
+          throw CoreFailure.apiUnavailable
+        }
+        contentLength = parsed
+      case "transfer-encoding":
+        guard transferEncoding == nil else { throw CoreFailure.apiUnavailable }
+        let parsed = trimHTTPWhitespace(value).lowercased()
+        guard parsed == "chunked" else { throw CoreFailure.apiUnavailable }
+        transferEncoding = parsed
+      default:
+        break
+      }
+    }
+    guard contentLength == nil || transferEncoding == nil else {
+      throw CoreFailure.apiUnavailable
+    }
+
+    let body = Data(response[separator.upperBound...])
+    if transferEncoding == "chunked" {
+      return try decodeChunkedAPIResponseBody(body)
+    }
+    if let contentLength {
+      guard body.count == contentLength else { throw CoreFailure.apiUnavailable }
+      return body
+    }
+    return body
+  }
+
+  private static func parseHTTPHeader(_ line: String) throws -> (String, String) {
+    guard let colon = line.firstIndex(of: ":") else { throw CoreFailure.apiUnavailable }
+    let name = String(line[..<colon])
+    let value = String(line[line.index(after: colon)...])
+    guard !name.isEmpty, name.utf8.allSatisfy(isHTTPTokenByte),
+      value.utf8.allSatisfy({ $0 == 0x09 || (0x20...0x7e).contains($0) })
+    else { throw CoreFailure.apiUnavailable }
+    return (name.lowercased(), value)
+  }
+
+  private static func isHTTPTokenByte(_ byte: UInt8) -> Bool {
+    (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+      || Array("!#$%&'*+-.^_`|~".utf8).contains(byte)
+  }
+
+  private static func trimHTTPWhitespace(_ value: String) -> String {
+    value.trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
+  }
+
+  private static func decodeChunkedAPIResponseBody(_ body: Data) throws -> Data {
+    let bytes = Array(body)
+    var cursor = 0
+    var decoded = Data()
+    while true {
+      guard let (sizeLine, nextCursor) = readHTTPLine(bytes, from: cursor),
+        !sizeLine.isEmpty,
+        sizeLine.utf8.allSatisfy(isHexByte),
+        let chunkSize = UInt64(sizeLine, radix: 16),
+        chunkSize <= UInt64(Int.max)
+      else { throw CoreFailure.apiUnavailable }
+      cursor = nextCursor
+      if chunkSize == 0 {
+        while true {
+          guard let (trailer, trailerEnd) = readHTTPLine(bytes, from: cursor) else {
+            throw CoreFailure.apiUnavailable
+          }
+          cursor = trailerEnd
+          if trailer.isEmpty {
+            guard cursor == bytes.count else { throw CoreFailure.apiUnavailable }
+            return decoded
+          }
+          _ = try parseHTTPHeader(trailer)
+        }
+      }
+
+      let count = Int(chunkSize)
+      guard count <= 1_048_576 - decoded.count,
+        cursor <= bytes.count,
+        count <= bytes.count - cursor,
+        bytes.count - cursor - count >= 2
+      else { throw CoreFailure.apiUnavailable }
+      let chunkEnd = cursor + count
+      guard bytes[chunkEnd] == 0x0d, bytes[chunkEnd + 1] == 0x0a else {
+        throw CoreFailure.apiUnavailable
+      }
+      decoded.append(contentsOf: bytes[cursor..<chunkEnd])
+      cursor = chunkEnd + 2
+    }
+  }
+
+  private static func readHTTPLine(_ bytes: [UInt8], from start: Int) -> (String, Int)? {
+    guard start >= 0, start <= bytes.count - 2 else { return nil }
+    var index = start
+    while index < bytes.count {
+      if bytes[index] == 0x0d {
+        guard index + 1 < bytes.count, bytes[index + 1] == 0x0a,
+          let line = String(bytes: bytes[start..<index], encoding: .ascii)
+        else { return nil }
+        return (line, index + 2)
+      }
+      guard bytes[index] != 0x0a else { return nil }
+      index += 1
+    }
+    return nil
+  }
+
+  private static func isHexByte(_ byte: UInt8) -> Bool {
+    (48...57).contains(byte) || (65...70).contains(byte) || (97...102).contains(byte)
+  }
+
+  private func connectAPISocket(
+    _ descriptor: Int32,
+    address: inout sockaddr_in,
+    deadline: TimeInterval?
+  ) throws {
+    guard let deadline else {
+      var result: Int32
+      repeat {
+        result = withUnsafePointer(to: &address) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+          }
+        }
+      } while result != 0 && errno == EINTR
+      guard result == 0 else { throw CoreFailure.apiUnavailable }
+      return
+    }
+
+    let originalFlags = fcntl(descriptor, F_GETFL)
+    guard originalFlags >= 0,
+      fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK) >= 0
+    else { throw CoreFailure.apiUnavailable }
+    defer { _ = fcntl(descriptor, F_SETFL, originalFlags) }
+
+    let result = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard result != 0 else { return }
+    guard errno == EINPROGRESS || errno == EINTR || errno == EALREADY else {
+      throw CoreFailure.apiUnavailable
+    }
+
+    var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+    while true {
+      let remaining = deadline - ProcessInfo.processInfo.systemUptime
+      guard remaining > 0 else { throw CoreFailure.apiUnavailable }
+      let timeoutMilliseconds = Int32((remaining * 1_000).rounded(.up))
+      let pollResult = poll(&pollDescriptor, 1, timeoutMilliseconds)
+      if pollResult < 0, errno == EINTR { continue }
+      guard pollResult > 0 else { throw CoreFailure.apiUnavailable }
+      var socketError: Int32 = 0
+      var socketErrorSize = socklen_t(MemoryLayout<Int32>.size)
+      guard
+        getsockopt(
+          descriptor,
+          SOL_SOCKET,
+          SO_ERROR,
+          &socketError,
+          &socketErrorSize
+        ) == 0, socketError == 0
+      else {
+        throw CoreFailure.apiUnavailable
+      }
+      return
+    }
+  }
+
+  private func writeAll(_ data: Data, to descriptor: Int32, deadline: TimeInterval?) throws {
     var offset = 0
     try data.withUnsafeBytes { bytes in
       while offset < bytes.count {
+        if let deadline {
+          try configureSocketTimeout(
+            descriptor,
+            option: SO_SNDTIMEO,
+            seconds: deadline - ProcessInfo.processInfo.systemUptime
+          )
+        }
         let count = Darwin.write(
           descriptor, bytes.baseAddress?.advanced(by: offset), bytes.count - offset)
         if count < 0, errno == EINTR { continue }
@@ -1691,7 +2131,7 @@ final class CoreManager: @unchecked Sendable {
     }
   }
 
-  private func configureSocketTimeouts(_ descriptor: Int32, seconds: Int) throws {
+  private func configureSocketTimeouts(_ descriptor: Int32, seconds: TimeInterval) throws {
     var noSigPipe: Int32 = 1
     guard
       setsockopt(
@@ -1704,31 +2144,31 @@ final class CoreManager: @unchecked Sendable {
     else {
       throw CoreFailure.apiUnavailable
     }
-    var timeout = timeval(tv_sec: seconds, tv_usec: 0)
-    let receiveResult = withUnsafePointer(to: &timeout) { pointer in
+    try configureSocketTimeout(descriptor, option: SO_RCVTIMEO, seconds: seconds)
+    try configureSocketTimeout(descriptor, option: SO_SNDTIMEO, seconds: seconds)
+  }
+
+  private func configureSocketTimeout(
+    _ descriptor: Int32,
+    option: Int32,
+    seconds: TimeInterval
+  ) throws {
+    guard seconds > 0, seconds.isFinite else { throw CoreFailure.apiUnavailable }
+    let microseconds = Int((seconds * 1_000_000).rounded(.up))
+    var timeout = timeval(
+      tv_sec: microseconds / 1_000_000,
+      tv_usec: Int32(microseconds % 1_000_000)
+    )
+    let result = withUnsafePointer(to: &timeout) { pointer in
       setsockopt(
         descriptor,
         SOL_SOCKET,
-        SO_RCVTIMEO,
+        option,
         pointer,
         socklen_t(MemoryLayout<timeval>.size)
       )
     }
-    guard receiveResult == 0 else {
-      throw CoreFailure.apiUnavailable
-    }
-    let sendResult = withUnsafePointer(to: &timeout) { pointer in
-      setsockopt(
-        descriptor,
-        SOL_SOCKET,
-        SO_SNDTIMEO,
-        pointer,
-        socklen_t(MemoryLayout<timeval>.size)
-      )
-    }
-    guard sendResult == 0 else {
-      throw CoreFailure.apiUnavailable
-    }
+    guard result == 0 else { throw CoreFailure.apiUnavailable }
   }
 
   private func ensureAPIPortAvailable() throws {
@@ -1751,12 +2191,12 @@ enum CoreFailure: LocalizedError {
   case invalidProfile(String)
   case configurationRejected(String)
   case coreExited(Int32)
+  case coreLaunchFailed(Int32)
+  case coreAlreadyRunning
   case coreNotRunning
   case coreStopFailed
   case apiUnavailable
   case apiPortUnavailable
-  case invalidRuleSetQuery
-  case ruleSetUnavailable(String)
   case configurationCheckTimedOut
 
   var errorDescription: String? {
@@ -1767,15 +2207,14 @@ enum CoreFailure: LocalizedError {
     case .invalidProfile(let message): message
     case .configurationRejected(let message): "sing-box rejected the configuration: \(message)"
     case .coreExited(let status): "sing-box exited with status \(status)."
+    case .coreLaunchFailed(let code):
+      "Unable to launch sing-box: \(String(cString: strerror(code)))."
+    case .coreAlreadyRunning: "The managed sing-box core is already running."
     case .coreNotRunning: "Connect the VPN before testing latency."
     case .coreStopFailed: "sing-box did not stop after SIGTERM and SIGKILL."
     case .apiUnavailable: "The local sing-box control API is unavailable."
     case .apiPortUnavailable:
       "Local control port 19090 is already in use. Stop the conflicting process and try again."
-    case .invalidRuleSetQuery:
-      "The routing rule-set query is unavailable for the active profile."
-    case .ruleSetUnavailable(let tag):
-      "The active rule-set cache does not contain a usable \(tag) entry."
     case .configurationCheckTimedOut: "sing-box configuration validation timed out."
     }
   }

@@ -44,7 +44,7 @@ private func websiteTestConnection() -> ManagedConnection {
   }
 }
 
-@Test func websiteRulesRoundTripAndOlderLibrariesDefaultToEmpty() throws {
+@Test func websiteRulesRoundTripInCurrentProfileLibrary() throws {
   let rule = WebsiteRoutingRule(domain: "stepik.org", target: .selectedProxy)
   let profile = ManagedProfile(
     name: "Websites",
@@ -57,23 +57,6 @@ private func websiteTestConnection() -> ManagedConnection {
   let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: data)
   #expect(decoded.profiles.first?.payload?.websiteRoutingRules == [rule])
 
-  var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
-  object["schemaVersion"] = 3
-  var profiles = try #require(object["profiles"] as? [[String: Any]])
-  var storedProfile = profiles[0]
-  var payload = try #require(storedProfile["payload"] as? [String: Any])
-  var compatibility = try #require(payload["compatibility"] as? [String: Any])
-  var associated = try #require(compatibility["_0"] as? [String: Any])
-  associated.removeValue(forKey: "websiteRoutingRules")
-  compatibility["_0"] = associated
-  payload["compatibility"] = compatibility
-  storedProfile["payload"] = payload
-  profiles[0] = storedProfile
-  object["profiles"] = profiles
-  let oldData = try JSONSerialization.data(withJSONObject: object)
-  let migrated = try JSONDecoder().decode(ProfileLibrary.self, from: oldData)
-  #expect(migrated.profiles.first?.payload?.websiteRoutingRules.isEmpty == true)
-  #expect(migrated.requiresMigration)
 }
 
 @Test func websiteRuleChangesRequireRuntimeConvergence() {
@@ -103,7 +86,7 @@ private func websiteTestConnection() -> ManagedConnection {
   #expect(reconciled.websiteRoutingRules == [rule])
 }
 
-@Test func compatibilityWebsiteRulesPrecedeApplicationAndImportedRouting() throws {
+@Test func compatibilityApplicationRulesPrecedeWebsiteAndImportedRouting() throws {
   let website = WebsiteRoutingRule(domain: "stepik.org", target: .selectedProxy)
   let application = ApplicationRoutingRule(
     displayName: "Browser",
@@ -134,13 +117,25 @@ private func websiteTestConnection() -> ManagedConnection {
   let applicationIndex = try #require(rules.firstIndex { $0["process_path"] != nil })
   let importedIndex = try #require(
     rules.firstIndex { ($0["domain_suffix"] as? [String]) == [".org"] })
+  #expect(applicationIndex < privateIndex)
   #expect(privateIndex < websiteIndex)
-  #expect(websiteIndex < applicationIndex)
   #expect(applicationIndex < importedIndex)
+  #expect(websiteIndex < importedIndex)
 
   let dns = try #require(root["dns"] as? [String: Any])
   let dnsRules = try #require(dns["rules"] as? [[String: Any]])
-  #expect(!dnsRules.contains { ($0["domain"] as? [String]) == ["stepik.org"] })
+  let appDNSIndex = try #require(
+    dnsRules.firstIndex {
+      $0["process_path"] as? [String] == [application.executablePath]
+    }
+  )
+  #expect(dnsRules[appDNSIndex]["action"] as? String == "route")
+  #expect(dnsRules[appDNSIndex]["server"] as? String == "dns-local")
+  #expect(
+    appDNSIndex
+      < (dnsRules.firstIndex { $0["domain_suffix"] as? [String] == [".org"] } ?? Int.max)
+  )
+  #expect(dnsRules.last?["server"] as? String == "dns-remote")
 
   let composed = try ComposedRoutingInspection.make(profile: .compatibility(profile))
   for domain in ["stepik.org", "welcome.stepik.org"] {
@@ -148,21 +143,29 @@ private func websiteTestConnection() -> ManagedConnection {
       route: composed.route,
       context: RoutingInspectionContext(
         domain: domain,
+        ipAddress: "93.184.216.34",
         applicationPath: application.executablePath
       ),
       outboundDecisions: composed.outboundDecisions,
-      selectorOutbound: composed.selectorOutbound
     )
-    #expect(result.decision == .indeterminate)
-    #expect(result.fallback == nil)
-    #expect(
-      Set(result.alternatives.map(\.decision))
-        == Set([RoutingInspectionResult.Decision.direct, .vpn, .reject])
+    #expect(result.decision == .direct)
+    #expect(result.ruleIndex == 3)
+
+    let defaultResult = RoutingInspector.inspect(
+      route: composed.route,
+      context: RoutingInspectionContext(
+        domain: domain,
+        ipAddress: "93.184.216.34",
+        defaultApplicationPaths: [application.executablePath]
+      ),
+      outboundDecisions: composed.outboundDecisions,
     )
+    #expect(defaultResult.decision == .vpn)
+    #expect(defaultResult.ruleIndex == 7)
   }
 }
 
-@Test func websiteDirectAndRejectRulesComposeForCompatibilityAndNative() throws {
+@Test func websiteDirectAndRejectRulesComposeForManagedProfile() throws {
   let direct = WebsiteRoutingRule(domain: "direct.example", target: .direct)
   let reject = WebsiteRoutingRule(domain: "reject.example", target: .reject)
   let compatibility = VPNProfile(
@@ -189,37 +192,4 @@ private func websiteTestConnection() -> ManagedConnection {
     }
   )
 
-  let nativeJSON = Data(
-    #"{"outbounds":[{"type":"socks","tag":"proxy-node","server":"127.0.0.1","server_port":1080},{"type":"selector","tag":"proxy","outbounds":["proxy-node"]}],"route":{"rules":[]}}"#
-      .utf8
-  )
-  let native = NativeProfile(
-    configuration: nativeJSON,
-    selectorTag: "proxy",
-    nodes: [
-      ProxyNodeDescriptor(id: ProxyNodeID(rawValue: "proxy-node"), name: "Proxy", kind: .native)
-    ],
-    websiteRoutingRules: [direct, reject]
-  )
-  let nativeBuilt = try ConfigBuilder(cachePath: "/tmp/cache.db", apiSecret: "test-secret")
-    .makeConfiguration(
-      profile: .native(native), mode: .rule, selectedNode: ProxyNodeID(rawValue: "proxy-node"))
-  let nativeRoot = try #require(
-    JSONSerialization.jsonObject(with: nativeBuilt.data) as? [String: Any])
-  let nativeRoute = try #require(nativeRoot["route"] as? [String: Any])
-  let nativeRules = try #require(nativeRoute["rules"] as? [[String: Any]])
-  #expect(
-    nativeRules.contains {
-      ($0["domain"] as? [String]) == ["reject.example"]
-        && ($0["action"] as? String) == "reject"
-    }
-  )
-  let nativeDNS = try #require(nativeRoot["dns"] as? [String: Any])
-  let nativeDNSRules = try #require(nativeDNS["rules"] as? [[String: Any]])
-  #expect(
-    nativeDNSRules.contains {
-      ($0["domain"] as? [String]) == ["direct.example"]
-        && ($0["server"] as? String) == "sbm-dns-local"
-    }
-  )
 }

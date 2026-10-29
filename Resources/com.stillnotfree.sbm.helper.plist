@@ -6,26 +6,11 @@
 	<string>com.stillnotfree.sbm.helper</string>
     <key>BundleProgram</key>
     <string>Contents/Resources/SBMHelper</string>
-    <key>AssociatedBundleIdentifiers</key>
-    <array>
-        <string>com.stillnotfree.sbm</string>
-    </array>
-    <key>Sockets</key>
+    <key>EnvironmentVariables</key>
     <dict>
-        <key>Listener</key>
-        <dict>
-            <key>SockPathName</key>
-            <string>/var/run/com.stillnotfree.sbm.helper.sock</string>
-            <key>SockPathOwner</key>
-            <integer>0</integer>
-            <key>SockPathGroup</key>
-            <integer>80</integer>
-            <key>SockPathMode</key>
-            <integer>432</integer>
-        </dict>
+        <key>SBM_HELPER_SERVICE_LABEL</key>
+        <string>com.stillnotfree.sbm.helper</string>
     </dict>
-    <key>AbandonProcessGroup</key>
-    <true/>
     <key>ThrottleInterval</key>
     <integer>1</integer>
     <key>ProcessType</key>

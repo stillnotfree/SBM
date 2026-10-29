@@ -4,11 +4,40 @@ import Testing
 
 @testable import SBM
 
+private func supportSnapshot(
+  coreState: ObservedCoreState,
+  localSOCKSEnabled: Bool,
+  localSOCKSPort: UInt16
+) -> SupportSnapshot {
+  SupportSnapshot(
+    capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+    appVersion: "1.2.3",
+    appBuild: "123",
+    macOSVersion: "macOS test",
+    helperReachable: false,
+    helperVersion: nil,
+    helperRevision: nil,
+    helperState: .unreachable,
+    coreState: coreState,
+    coreVersion: nil,
+    routingMode: .rule,
+    profileKind: .compatibilitySubscription,
+    profileUpdatedAt: nil,
+    profileLibraryAvailable: true,
+    sourceCount: 0,
+    localSOCKSEnabled: localSOCKSEnabled,
+    localSOCKSPort: localSOCKSPort,
+    selectedProtocolKind: nil,
+    nodes: [],
+    lastError: nil,
+    redactionSecrets: []
+  )
+}
+
 @Test func supportSnapshotIsRedactedBoundedAndDecodable() throws {
   let urlCanary = "https://subscription-canary.example/secret-path"
   let passwordCanary = "password-canary"
   let hardwareIDCanary = "9d2c43a3-5f5d-4f31-924f-2e5b0a8d7c11"
-  let nativeJSONCanary = #"{"outbounds":[{"password":"native-json-canary"}]}"#
   let snapshot = SupportSnapshot(
     capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
     appVersion: "1.2.3",
@@ -21,7 +50,7 @@ import Testing
     coreState: .running,
     coreVersion: "1.13.16",
     routingMode: .rule,
-    profileKind: .nativeJSON,
+    profileKind: .compatibilitySubscription,
     profileUpdatedAt: Date(timeIntervalSince1970: 1_700_000_001),
     profileLibraryAvailable: true,
     sourceCount: 999,
@@ -31,14 +60,13 @@ import Testing
     nodes: (0..<130).map { _ in
       SupportSnapshot.NodeObservation(kind: .vless, delayMilliseconds: 42)
     },
-    lastError:
-      "Failed for \(urlCanary), password=\(passwordCanary), hwid=\(hardwareIDCanary), \(nativeJSONCanary)",
+    lastError: "Failed for \(urlCanary), password=\(passwordCanary), hwid=\(hardwareIDCanary)",
     redactionSecrets: [urlCanary, passwordCanary, hardwareIDCanary]
   )
 
   let text = snapshot.text
   let json = snapshot.jsonText()
-  for canary in [urlCanary, passwordCanary, hardwareIDCanary, nativeJSONCanary] {
+  for canary in [urlCanary, passwordCanary, hardwareIDCanary] {
     #expect(!text.contains(canary))
     #expect(!json.contains(canary))
   }
@@ -95,7 +123,11 @@ import Testing
     redactionSecrets: []
   )
 
-  #expect(snapshot.text.contains("observations only"))
+  #expect(snapshot.text.contains("SBM support snapshot"))
+  #expect(!snapshot.text.contains("observations only"))
+  #expect(snapshot.text.contains("Local SOCKS5 saved configuration: disabled"))
+  #expect(
+    snapshot.text.contains("Local SOCKS5 listener presence: not observed by this snapshot"))
   #expect(snapshot.text.contains("Active DNS/network probes run: no"))
   #expect(snapshot.text.contains("hysteria2: 2 nodes, 1 measured, 1 unmeasured, 30 ms"))
   #expect(snapshot.text.contains("shadowsocks: 1 nodes, 1 measured, 0 unmeasured, 70 ms"))
@@ -104,6 +136,39 @@ import Testing
   #expect(json.contains(#""routing_mode":"Direct""#))
   #expect(json.contains(#""selected_protocol_kind":"hysteria2""#))
   #expect(json.contains(#""state":"not_enabled""#))
+  #expect(json.contains(#""local_socks":{"enabled":false}"#))
+}
+
+@Test func localSOCKSTextDescribesSavedConfigurationWithoutInferringListener() throws {
+  let stopped = supportSnapshot(
+    coreState: .stopped, localSOCKSEnabled: true, localSOCKSPort: 2080)
+  let unknown = supportSnapshot(
+    coreState: .unknown, localSOCKSEnabled: true, localSOCKSPort: 2080)
+  let running = supportSnapshot(
+    coreState: .running, localSOCKSEnabled: true, localSOCKSPort: 2080)
+  let disabled = supportSnapshot(
+    coreState: .running, localSOCKSEnabled: false, localSOCKSPort: 2080)
+
+  for snapshot in [stopped, unknown, running] {
+    #expect(
+      snapshot.statusText.contains(
+        "Local SOCKS5 saved configuration: enabled on 127.0.0.1:2080"))
+    #expect(
+      snapshot.statusText.contains(
+        "Local SOCKS5 listener presence: not observed by this snapshot"))
+    #expect(!snapshot.statusText.localizedCaseInsensitiveContains("listener is active"))
+    #expect(!snapshot.statusText.contains("Local SOCKS5: enabled"))
+    #expect(
+      snapshot.jsonText().contains(#""local_socks":{"enabled":true,"port":2080}"#))
+  }
+  #expect(stopped.core.state == .stopped)
+  #expect(unknown.core.state == .unknown)
+  #expect(running.core.state == .running)
+  #expect(disabled.statusText.contains("Local SOCKS5 saved configuration: disabled"))
+  #expect(
+    disabled.statusText.contains(
+      "Local SOCKS5 listener presence: not observed by this snapshot"))
+  #expect(disabled.jsonText().contains(#""local_socks":{"enabled":false}"#))
 }
 
 @Test func diagnosticsRefreshDoesNotDirectlyStartLatencyTesting() throws {

@@ -56,8 +56,7 @@ private struct ReleasedV9VLESS: Decodable {
 }
 
 @Test func currentIPCShapeRequiresTheNewProtocolBoundary() throws {
-  #expect(HelperConstants.protocolVersion == 11)
-  #expect(HelperConstants.helperRevision == 54)
+  #expect(HelperConstants.protocolVersion == 14)
 
   let profile = CoreProfile.compatibility(
     VPNProfile(
@@ -84,9 +83,26 @@ private struct ReleasedV9VLESS: Decodable {
   let object = try #require(
     JSONSerialization.jsonObject(with: encoded) as? [String: Any]
   )
+  #expect(object["ruleSetTags"] == nil)
+  #expect(object["routingDestination"] == nil)
+  #expect(throws: DecodingError.self) {
+    _ = try JSONDecoder().decode(
+      HelperRequest.self,
+      from: Data(#"{"protocolVersion":14,"action":"matchRuleSets"}"#.utf8)
+    )
+  }
   let profileObject = try #require(object["profile"] as? [String: Any])
+  #expect(Set(profileObject.keys) == ["compatibility"])
   let compatibility = try #require(profileObject["compatibility"] as? [String: Any])
+  #expect(Set(compatibility.keys) == ["_0"])
   let profilePayload = try #require(compatibility["_0"] as? [String: Any])
+  #expect(
+    Set(profilePayload.keys)
+      == Set([
+        "connections", "nodeGroups", "applicationRoutingRules", "websiteRoutingRules",
+        "autoExcludedNodeIDs",
+      ])
+  )
   let connections = try #require(profilePayload["connections"] as? [[String: Any]])
   let connection = try #require(connections.first)
   let outbound = try #require(connection["outbound"] as? [String: Any])
@@ -98,20 +114,288 @@ private struct ReleasedV9VLESS: Decodable {
   }
 }
 
-@Test func profileLibraryDefaultsLatencyIntervalForOlderStores() throws {
-  let data = Data(
-    """
-    {
-      "profiles": [],
-      "selectedProfileID": null,
-      "localSOCKSEnabled": false,
-      "localSOCKSPort": 1082
-    }
-    """.utf8
+@Test func autoObservationWireFieldsAreOptionalAndRoundTrip() throws {
+  #expect(HelperConstants.protocolVersion == 14)
+
+  let missingRequest = try JSONDecoder().decode(
+    HelperRequest.self,
+    from: Data(#"{"protocolVersion":14,"action":"status"}"#.utf8)
   )
-  let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: data)
-  #expect(decoded.latencyIntervalMinutes == 10)
-  #expect(!decoded.ipv6Enabled)
+  #expect(missingRequest.observeAutoNode == nil)
+  #expect(missingRequest.recoverDesiredRuntime == nil)
+  #expect(missingRequest.dnsSettings == nil)
+  #expect((missingRequest.dnsSettings ?? .defaults) == .defaults)
+  #expect((missingRequest.observeAutoNode ?? false) == false)
+  #expect((missingRequest.recoverDesiredRuntime ?? false) == false)
+
+  let deniedRequest = HelperRequest(action: .status, recoverDesiredRuntime: false)
+  let deniedData = try JSONEncoder().encode(deniedRequest)
+  let deniedObject = try #require(
+    JSONSerialization.jsonObject(with: deniedData) as? [String: Any]
+  )
+  #expect(deniedObject["recoverDesiredRuntime"] as? Bool == false)
+  #expect(
+    try JSONDecoder().decode(HelperRequest.self, from: deniedData).recoverDesiredRuntime == false
+  )
+
+  let dnsSettings = ManagedDNSSettings(
+    direct: .google,
+    proxy: .customDoH("https://dns.example.test/query")
+  )
+  let requested = HelperRequest(
+    action: .status,
+    observeAutoNode: true,
+    recoverDesiredRuntime: true,
+    dnsSettings: dnsSettings
+  )
+  let decodedRequest = try JSONDecoder().decode(
+    HelperRequest.self,
+    from: JSONEncoder().encode(requested)
+  )
+  #expect(decodedRequest.observeAutoNode == true)
+  #expect(decodedRequest.recoverDesiredRuntime == true)
+  #expect(decodedRequest.dnsSettings == dnsSettings)
+
+  let node = ProxyNodeID(rawValue: "active-child")
+  let response = HelperResponse(
+    success: true,
+    coreRunning: true,
+    effectiveAutoNode: node,
+    message: "status"
+  )
+  let encodedResponse = try JSONEncoder().encode(response)
+  var responseObject = try #require(
+    JSONSerialization.jsonObject(with: encodedResponse) as? [String: Any]
+  )
+  #expect(responseObject["ruleSetMatches"] == nil)
+  let decodedResponse = try JSONDecoder().decode(HelperResponse.self, from: encodedResponse)
+  #expect(decodedResponse.effectiveAutoNode == node)
+
+  responseObject.removeValue(forKey: "effectiveAutoNode")
+  let missingResponse = try JSONDecoder().decode(
+    HelperResponse.self,
+    from: JSONSerialization.data(withJSONObject: responseObject)
+  )
+  #expect(missingResponse.effectiveAutoNode == nil)
+}
+
+@Test func helperAutoObservationUsesOnlyTheExistingBoundedActiveProfilePath() throws {
+  let testDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+  let repositoryRoot = testDirectory.deletingLastPathComponent().deletingLastPathComponent()
+  let managerURL = repositoryRoot.appendingPathComponent("Sources/SBMHelper/CoreManager.swift")
+  let serverURL = repositoryRoot.appendingPathComponent("Sources/SBMHelper/main.swift")
+  let managerSource = try String(contentsOf: managerURL, encoding: .utf8)
+  let serverSource = try String(contentsOf: serverURL, encoding: .utf8)
+  let statusStart = try #require(managerSource.range(of: "  func status("))
+  let statusEnd = try #require(
+    managerSource.range(
+      of: "  func reconcileDesiredRuntime(recoveryAuthorized: Bool)",
+      range: statusStart.upperBound..<managerSource.endIndex
+    )
+  )
+  let statusSource = String(managerSource[statusStart.lowerBound..<statusEnd.lowerBound])
+
+  #expect(statusSource.contains("if observeAutoNode, coreRunning, state.selectedNode == .auto"))
+  #expect(statusSource.contains("case .compatibility(let activeProfile)? = state.profile"))
+  #expect(statusSource.components(separatedBy: "path: \"/proxies/auto\"").count - 1 == 1)
+  #expect(statusSource.contains("timeoutSeconds: 0.25"))
+  #expect(statusSource.contains("totalPhaseTimeout: true"))
+  #expect(statusSource.contains("object[\"now\"] as? String"))
+  #expect(statusSource.contains("activeProfile.connections.contains"))
+  #expect(statusSource.contains("activeProfile.autoExcludedNodeIDs.contains"))
+  #expect(managerSource.contains("timeoutSeconds: TimeInterval = 2"))
+  #expect(managerSource.contains("totalPhaseTimeout: Bool = false"))
+  #expect(
+    managerSource.contains("? ProcessInfo.processInfo.systemUptime + timeoutSeconds"))
+  #expect(!managerSource.contains("sendDeadline"))
+  #expect(!managerSource.contains("receiveDeadline"))
+  #expect(managerSource.contains("seconds: deadline - ProcessInfo.processInfo.systemUptime"))
+  #expect(serverSource.contains("observeAutoNode: request.observeAutoNode ?? false"))
+}
+
+@Test func helperRecoveryAuthorizationIsCheckedBeforeReconciliationEffects() throws {
+  let appModel = try projectSource("Sources/SBM/AppModel.swift")
+  let refresh = try sourceSection(
+    appModel,
+    from: "  func refresh(observeAutoNode: Bool = false)",
+    to: "  func refreshExternalState()"
+  )
+  let statusTask = try #require(refresh.range(of: "statusRefreshTask = Task {"))
+  let appAuthorization = try #require(
+    refresh.range(of: "let authorizeDesiredRuntimeRecovery =")
+  )
+  let sender = try #require(refresh.range(of: "try await helperLifecycleSender("))
+  #expect(statusTask.lowerBound < appAuthorization.lowerBound)
+  #expect(appAuthorization.lowerBound < sender.lowerBound)
+
+  let helper = try projectSource("Sources/SBMHelper/main.swift")
+  let handle = try sourceSection(
+    helper,
+    from: "private func handle(",
+    to: "private func authenticatePeer("
+  )
+  let protocolCheck = try #require(handle.range(of: "guard request.protocolVersion =="))
+  let actionDispatch = try #require(handle.range(of: "switch request.action"))
+  #expect(protocolCheck.lowerBound < actionDispatch.lowerBound)
+  let statusCase = try sourceSection(handle, from: "case .status:", to: "case .start:")
+  #expect(
+    statusCase.contains(
+      "recoveryAuthorized: request.recoverDesiredRuntime ?? false"
+    )
+  )
+
+  let manager = try projectSource("Sources/SBMHelper/CoreManager.swift")
+  let reconciliation = try sourceSection(
+    manager,
+    from: "  func reconcileDesiredRuntime(recoveryAuthorized: Bool)",
+    to: "  func start("
+  )
+  let authorization = try #require(
+    reconciliation.range(of: "guard recoveryAuthorized else { return nil }")
+  )
+  let prepare = try #require(reconciliation.range(of: "try prepareFilesystem()"))
+  let configurationProbe = try #require(
+    reconciliation.range(of: "pathExistsWithoutFollowingSymlinks(configURL)")
+  )
+  let policy = try #require(reconciliation.range(of: "DesiredRuntimeRecoveryPolicy.decision("))
+  #expect(authorization.lowerBound < prepare.lowerBound)
+  #expect(authorization.lowerBound < configurationProbe.lowerBound)
+  #expect(authorization.lowerBound < policy.lowerBound)
+
+  let recoveryPolicy = try sourceSection(
+    manager,
+    from: "enum DesiredRuntimeRecoveryPolicy {",
+    to: "enum CoreActivationDisposition"
+  )
+  let noPermission = try #require(
+    recoveryPolicy.range(of: "guard recoveryAuthorized else { return .noAction }")
+  )
+  let desiredState = try #require(recoveryPolicy.range(of: "guard desiredRunning else"))
+  #expect(noPermission.lowerBound < desiredState.lowerBound)
+}
+
+@Test func coldOffReplacementBindsManifestToCurrentSignedCandidateAndRechecksAfterUnregister()
+  throws
+{
+  let helperClient = try projectSource("Sources/SBM/HelperClient.swift")
+  let candidate = try sourceSection(
+    helperClient,
+    from: "  static func currentCandidateSnapshot(",
+    to: "private static func candidateFileIdentities("
+  )
+  #expect(candidate.contains("CurrentReleaseManifest.verify("))
+  #expect(candidate.contains("payload.appCDHash"))
+  #expect(candidate.contains("payload.helperCDHash"))
+  #expect(candidate.contains("staticCodeIdentity(at: paths[0], isBundle: true)"))
+  #expect(candidate.contains("staticCodeIdentity(at: paths[3])"))
+  #expect(candidate.contains("runningCodeIdentity()"))
+  #expect(candidate.contains("payload.appVersion"))
+  #expect(candidate.contains("payload.appBuild"))
+  #expect(candidate.contains("payload.helperRevision == HelperConstants.helperRevision"))
+  #expect(candidate.contains("payload.ipcProtocolVersion == HelperConstants.protocolVersion"))
+  #expect(candidate.contains("payload.coreSHA256 == CoreBuildInfo.signedSHA256"))
+
+  let lifecycle = try projectSource("Sources/SBM/HelperLifecycle.swift")
+  let replace = try sourceSection(
+    lifecycle,
+    from: "  static func replace(",
+    to: "  static func upgradeLegacy1115("
+  )
+  let candidateCheckBeforeUnregister = try #require(
+    replace.range(of: "try HelperClient.validateHeldColdOffClaim(")
+  )
+  let unregister = try #require(replace.range(of: "try await service.unregister()"))
+  let candidateRecheck = try #require(
+    replace.range(
+      of: "try HelperClient.validateHeldColdOffClaim(",
+      range: candidateCheckBeforeUnregister.upperBound..<replace.endIndex
+    )
+  )
+  let release = try #require(replace.range(of: "coldOffClaim.release()"))
+  let register = try #require(replace.range(of: "try service.register()"))
+  let attemptSnapshot = try #require(
+    replace.range(of: "_ = try HelperClient.currentCandidateSnapshot(")
+  )
+  #expect(candidateCheckBeforeUnregister.lowerBound < unregister.lowerBound)
+  #expect(unregister.lowerBound < candidateRecheck.lowerBound)
+  #expect(candidateRecheck.lowerBound < release.lowerBound)
+  #expect(attemptSnapshot.lowerBound < register.lowerBound)
+  #expect(release.lowerBound < register.lowerBound)
+
+  let appModel = try projectSource("Sources/SBM/AppModel.swift")
+  let repair = try sourceSection(
+    appModel,
+    from: "  func repairHelper()",
+    to: "  private func retainCurrentColdOffClaim("
+  )
+  #expect(repair.contains("candidateBundleURL: applicationBundleURL"))
+  let retainClaim = try sourceSection(
+    appModel,
+    from: "  private func retainCurrentColdOffClaim(",
+    to: "  func setLaunchAtLoginEnabled("
+  )
+  #expect(retainClaim.contains("claim.requireOFFMarker()"))
+  #expect(retainClaim.contains("ColdOffProof.acquireClaim()"))
+  #expect(!retainClaim.contains("HelperClient.validateHeldColdOffClaim"))
+  #expect(!retainClaim.contains("HelperClient.acquireColdOffClaim"))
+}
+
+@Test func helperLatencyHistoryUsesSingBoxValuesInStateOrder() throws {
+  let nodes = [
+    ProxyNodeDescriptor(id: .auto, name: "Auto", kind: .automatic),
+    ProxyNodeDescriptor(id: ProxyNodeID(rawValue: "second"), name: "Second"),
+    ProxyNodeDescriptor(id: ProxyNodeID(rawValue: "empty"), name: "Empty"),
+    ProxyNodeDescriptor(id: ProxyNodeID(rawValue: "missing"), name: "Missing"),
+  ]
+  let json =
+    #"{"proxies":{"second":{"history":[{"delay":82}]},"auto":{"history":[{"delay":37}]},"empty":{"history":[]},"missing":{"history":[{"delay":"bad"}]},"ignored":{"history":[{"delay":999}]}}}"#
+
+  let delays = try parseLatencyHistory(Data(json.utf8), nodes: nodes)
+
+  #expect(delays.map(\.node) == nodes.map(\.id))
+  #expect(delays.map(\.milliseconds) == [37, 82, nil, nil])
+}
+
+@Test func helperLatencyRejectsAutoAndMalformedProxyResponses() {
+  #expect(throws: CoreFailure.self) {
+    try CoreManager().testLatency(node: .auto)
+  }
+  #expect(throws: CoreFailure.self) {
+    try parseLatencyHistory(Data(#"{"unexpected":{}}"#.utf8), nodes: [])
+  }
+}
+
+@Test func latencyCleanupRemovesBlockingBulkAndUsesBoundedSingleSender() throws {
+  let testDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+  let repositoryRoot = testDirectory.deletingLastPathComponent().deletingLastPathComponent()
+  let helperSource = try String(
+    contentsOf: repositoryRoot.appendingPathComponent("Sources/SBMHelper/CoreManager.swift"),
+    encoding: .utf8
+  )
+  let appSource = try String(
+    contentsOf: repositoryRoot.appendingPathComponent("Sources/SBM/AppEnvironment.swift"),
+    encoding: .utf8
+  )
+
+  #expect(!helperSource.contains("DelayResults"))
+  #expect(!helperSource.contains("concurrentPerform"))
+  #expect(helperSource.contains("waitForResponse: false"))
+  #expect(helperSource.contains("path: \"/proxies\""))
+  #expect(helperSource.contains(#"inet_addr("127.0.0.1")"#))
+  #expect(helperSource.contains(#"Authorization: Bearer \(state.apiSecret)"#))
+  let latencyStart = try #require(helperSource.range(of: "func testLatency(node"))
+  let validationStart = try #require(
+    helperSource.range(
+      of: "func validate(profile:", range: latencyStart.upperBound..<helperSource.endIndex)
+  )
+  let latencySource = helperSource[latencyStart.lowerBound..<validationStart.lowerBound]
+  #expect(latencySource.contains("target: state.latencyTestURL"))
+  #expect(latencySource.contains("path: \"/proxies\""))
+  #expect(latencySource.contains("runtimeOutcome: DeferredRuntimeMarkerPolicy.outcome("))
+  #expect(latencySource.contains("marker: state.deferredRuntimeApplyPending"))
+  #expect(!appSource.contains("latencyCycleSender"))
+  #expect(!appSource.contains("LatencyRequestPolicy"))
+  #expect(appSource.contains("receiveTimeoutSeconds: 2"))
 }
 
 @Test func profileLibraryPersistsDisabledIPv6Preference() throws {
@@ -126,54 +410,6 @@ private struct ReleasedV9VLESS: Decodable {
   )
   #expect(decoded == library)
   #expect(!decoded.ipv6Enabled)
-}
-
-@Test func immediatelyPreviousLibrarySchemaMigratesCurrentConnectionModel() throws {
-  let library = ProfileLibrary(
-    profiles: [
-      ManagedProfile(
-        name: "Schema Four",
-        payload: .compatibility(
-          VPNProfile(
-            connections: [
-              ManagedConnection(
-                id: ProxyNodeID(rawValue: "node-schema-four"),
-                displayName: "Schema Four Node",
-                outbound: .shadowsocks(
-                  ShadowsocksProfile(
-                    server: "203.0.113.44",
-                    port: 443,
-                    method: "aes-256-gcm",
-                    password: "schema-four-password"
-                  ))
-              )
-            ]
-          )
-        )
-      )
-    ],
-    selectedProfileID: nil
-  )
-  var root = try #require(
-    JSONSerialization.jsonObject(with: JSONEncoder().encode(library)) as? [String: Any])
-  root["schemaVersion"] = 4
-  let decoded = try JSONDecoder().decode(
-    ProfileLibrary.self,
-    from: JSONSerialization.data(withJSONObject: root)
-  )
-  #expect(decoded.requiresMigration)
-
-  let rewritten = try #require(
-    JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
-  #expect(rewritten["schemaVersion"] as? Int == ProfileLibrary.currentSchemaVersion)
-  let profiles = try #require(rewritten["profiles"] as? [[String: Any]])
-  let payload = try #require(profiles[0]["payload"] as? [String: Any])
-  let compatibility = try #require(payload["compatibility"] as? [String: Any])
-  let current = try #require(compatibility["_0"] as? [String: Any])
-  #expect(current["connections"] != nil)
-  #expect(current["vless"] == nil)
-  #expect(current["hysteria2"] == nil)
-  #expect(current["shadowsocks"] == nil)
 }
 
 @Test func persistentHelperStateDefaultsRecoveryAndDeferredMarkersForOlderStores() throws {
@@ -230,9 +466,11 @@ private struct ReleasedV9VLESS: Decodable {
   #expect(!state.activeIPv6PolicyKnown)
   #expect(state.activeIPv6Enabled == nil)
   #expect(state.activeIPv6Policy == nil)
+  #expect(state.dnsSettings == .defaults)
 
   var unrelated = state
   unrelated.mode = .direct
+  unrelated.dnsSettings = ManagedDNSSettings(direct: .yandex, proxy: .adguard)
   let roundTripped = try JSONDecoder().decode(
     PersistentState.self,
     from: JSONEncoder().encode(unrelated)
@@ -241,6 +479,7 @@ private struct ReleasedV9VLESS: Decodable {
   #expect(!roundTripped.ipv6Enabled)
   #expect(!roundTripped.activeIPv6PolicyKnown)
   #expect(roundTripped.activeIPv6Enabled == nil)
+  #expect(roundTripped.dnsSettings == unrelated.dnsSettings)
 
   let knownCurrentState = try JSONDecoder().decode(
     PersistentState.self,
@@ -258,159 +497,34 @@ private struct ReleasedV9VLESS: Decodable {
   #expect(knownCurrentState.activeIPv6Policy == nil)
 }
 
-@Test func legacyManagedLibraryMigratesExactAggregateIDsAndAtomicallyRewrites() throws {
-  let profileID = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
-  let sourceAID = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
-  let sourceBID = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
-  let realityA = VLESSProfile(
-    server: "203.0.113.1", port: 443,
-    uuid: "5efab93b-90d0-4904-93d6-44b4f0b00001", serverName: "a.example.com",
-    fingerprint: "chrome", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-    shortID: "", displayName: "Reality A"
-  )
-  let realityB = VLESSProfile(
-    server: "203.0.113.2", port: 443,
-    uuid: "5efab93b-90d0-4904-93d6-44b4f0b00002", serverName: "b.example.com",
-    fingerprint: "firefox", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-    shortID: "", displayName: "Reality B"
-  )
-  let hysteria = Hysteria2Profile(
-    server: "hy.example.com", port: 443, password: "hy-password",
-    serverName: "hy.example.com", displayName: "Hysteria A"
-  )
-  let sourceAConnections = [
-    ManagedConnection(
-      id: ProxyNodeID(rawValue: "vless-1"), displayName: "Reality A", outbound: .vless(realityA)
-    ),
-    ManagedConnection(
-      id: ProxyNodeID(rawValue: "hysteria2-1"),
-      displayName: "Hysteria A",
-      outbound: .hysteria2(hysteria)
-    ),
-  ]
-  let sourceA = CoreProfile.compatibility(
-    VPNProfile(connections: sourceAConnections)
-  )
-  let sourceB = CoreProfile.compatibility(
-    VPNProfile(connections: [
-      ManagedConnection(
-        id: ProxyNodeID(rawValue: "vless-1"), displayName: "Reality A", outbound: .vless(realityA)
-      ),
-      ManagedConnection(
-        id: ProxyNodeID(rawValue: "vless-2"), displayName: "Reality B", outbound: .vless(realityB)
-      ),
-    ])
-  )
-  let aggregate = CoreProfile.compatibility(
-    VPNProfile(
-      connections: sourceAConnections,
-      nodeGroups: [
-        ProxyNodeGroup(
-          id: sourceAID.uuidString, name: "First",
-          nodes: [ProxyNodeID(rawValue: "vless-1"), ProxyNodeID(rawValue: "hysteria2-1")]
-        )
-      ]
-    ))
-  let modern = ProfileLibrary(
-    profiles: [
-      ManagedProfile(
-        id: profileID, name: "Legacy",
-        sources: [
-          ManagedSource(id: sourceAID, name: "First", value: "vless://first", payload: sourceA),
-          ManagedSource(
-            id: sourceBID, name: "Second", value: "vless://second", excludeRegex: "Reality B",
-            payload: sourceB
-          ),
-        ], payload: aggregate
-      )
-    ],
-    selectedProfileID: profileID
-  )
-  var root = try #require(
-    JSONSerialization.jsonObject(with: JSONEncoder().encode(modern)) as? [String: Any])
-  var profiles = try #require(root["profiles"] as? [[String: Any]])
-  var entry = profiles[0]
-  entry["payload"] = try legacyCompatibilityPayload(aggregate)
-  var sources = try #require(entry["sources"] as? [[String: Any]])
-  sources[0]["payload"] = try legacyCompatibilityPayload(sourceA)
-  sources[1]["payload"] = try legacyCompatibilityPayload(sourceB)
-  entry["sources"] = sources
-  profiles[0] = entry
-  root["profiles"] = profiles
-  root.removeValue(forKey: "schemaVersion")
-  let legacyData = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
-
-  let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: legacyData)
-  #expect(decoded.requiresMigration)
-  let migrated = try #require(decoded.profiles.first)
-  let aggregateProfile: VPNProfile
-  if case .compatibility(let value) = try #require(migrated.payload) {
-    aggregateProfile = value
-  } else {
-    fatalError()
-  }
-  #expect(aggregateProfile.connections.map(\.id.rawValue) == ["vless-1", "hysteria2-1"])
-  #expect(
-    aggregateProfile.nodeGroups?.map(\.nodes) == [
-      [ProxyNodeID(rawValue: "vless-1"), ProxyNodeID(rawValue: "hysteria2-1")]
-    ])
-  guard case .compatibility(let migratedSourceB) = try #require(migrated.sources.last?.payload)
-  else {
-    Issue.record("Expected a compatibility source")
-    return
-  }
-  #expect(migratedSourceB.connections.map(\.id.rawValue).first == "vless-1")
-  #expect(migratedSourceB.connections.map(\.id.rawValue).last?.hasPrefix("node-") == true)
-
-  let directory = FileManager.default.temporaryDirectory
-    .appendingPathComponent("SBMLegacyMigration-\(UUID().uuidString)", isDirectory: true)
-  try FileManager.default.createDirectory(
-    at: directory, withIntermediateDirectories: true,
-    attributes: [.posixPermissions: 0o700])
-  defer { try? FileManager.default.removeItem(at: directory) }
-  let url = directory.appendingPathComponent("profiles.json")
-  FileManager.default.createFile(
-    atPath: url.path, contents: legacyData,
-    attributes: [.posixPermissions: 0o600])
-  let loaded = try ProfileStore.loadProfileLibrary(from: url)
-  let persisted = try #require(loaded)
-  #expect(!persisted.requiresMigration)
-  let rewritten = try #require(
-    JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-  #expect(rewritten["schemaVersion"] as? Int == ProfileLibrary.currentSchemaVersion)
-  let rewrittenProfiles = try #require(rewritten["profiles"] as? [[String: Any]])
-  let rewrittenPayload = try #require(rewrittenProfiles[0]["payload"] as? [String: Any])
-  let compatibility = try #require(rewrittenPayload["compatibility"] as? [String: Any])
-  let value = try #require(compatibility["_0"] as? [String: Any])
-  #expect(value["connections"] != nil)
-  #expect(value["vless"] == nil)
-}
-
-@Test func persistentStateMigratesLegacySelectionAndFallsBackForCorruptMapping() throws {
-  let profile = CoreProfile.compatibility(
-    VPNProfile(vless: [
+@Test func persistentStatePreservesCurrentSelectionAndFallsBackForCorruptMapping() throws {
+  let node = ProxyNodeID(rawValue: "node-vless")
+  let connection = ManagedConnection(
+    id: node,
+    displayName: "Reality",
+    outbound: .vless(
       VLESSProfile(
         server: "203.0.113.1", port: 443,
         uuid: "5efab93b-90d0-4904-93d6-44b4f0b00001", serverName: "a.example.com",
         fingerprint: "chrome", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-        shortID: "", displayName: "Reality"
+        shortID: ""
       )
-    ]))
-  var root = try #require(
-    JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)) as? [String: Any])
-  root = try legacyCompatibilityPayload(profile)
+    )
+  )
+  let profile = CoreProfile.compatibility(VPNProfile(connections: [connection]))
   let state: [String: Any] = [
-    "profile": root,
-    "selectedNode": "vless-1",
-    "nodes": [["id": "vless-1", "name": "Reality"]],
+    "profile": try JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)),
+    "selectedNode": node.rawValue,
+    "nodes": [["id": node.rawValue, "name": "Reality"]],
     "apiSecret": "test-secret",
   ]
   let preserved = try JSONDecoder().decode(
     PersistentState.self, from: JSONSerialization.data(withJSONObject: state))
-  #expect(preserved.selectedNode == ProxyNodeID(rawValue: "vless-1"))
+  #expect(preserved.selectedNode == node)
   #expect(preserved.nodes.first?.kind == .vless)
+
   var corrupt = state
-  corrupt["selectedNode"] = "vless-99"
+  corrupt["selectedNode"] = "node-missing"
   let recovered = try JSONDecoder().decode(
     PersistentState.self, from: JSONSerialization.data(withJSONObject: corrupt))
   #expect(recovered.selectedNode == .auto)
@@ -445,112 +559,10 @@ private struct ReleasedV9VLESS: Decodable {
   #expect(decoded.selectedNode == .auto)
 }
 
-@Test func failedLegacyMigrationWriteDoesNotQuarantineValidJSONAsCorrupt() throws {
-  let directory = FileManager.default.temporaryDirectory
-    .appendingPathComponent("SBMMigrationWriteFailure-\(UUID().uuidString)", isDirectory: true)
-  try FileManager.default.createDirectory(
-    at: directory, withIntermediateDirectories: true,
-    attributes: [.posixPermissions: 0o700])
-  defer {
-    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-    try? FileManager.default.removeItem(at: directory)
-  }
-  let url = directory.appendingPathComponent("profiles.json")
-  let validLegacy = Data(
-    """
-    {"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
-    """.utf8)
-  FileManager.default.createFile(
-    atPath: url.path, contents: validLegacy,
-    attributes: [.posixPermissions: 0o600])
-  try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
-  do {
-    _ = try ProfileStore.loadProfileLibrary(from: url, preserveInvalidCopy: true)
-    Issue.record("Expected the atomic migration write to fail")
-  } catch let failure as ProfileStoreFailure {
-    if case .invalidJSON = failure {
-      Issue.record("Valid legacy JSON was misclassified as invalid")
-    }
-  } catch {
-    // The underlying write failure is the expected fail-closed outcome.
-  }
-  let preserved = try FileManager.default.contentsOfDirectory(
-    at: directory, includingPropertiesForKeys: nil
-  )
-  .filter { $0.lastPathComponent.hasPrefix("profiles.invalid-") }
-  #expect(preserved.isEmpty)
-  #expect(try Data(contentsOf: url) == validLegacy)
-}
-
-@Test func profileLibraryRejectsUnknownOrSchemaMismatchedManagedConnectionEncoding() throws {
-  let future = Data(
-    """
-    {"schemaVersion":7,"profiles":[],"selectedProfileID":null,"localSOCKSEnabled":false,"localSOCKSPort":1082}
-    """.utf8)
-  #expect(throws: DecodingError.self) {
-    try JSONDecoder().decode(ProfileLibrary.self, from: future)
-  }
-  let vless = VLESSProfile(
-    server: "203.0.113.1", port: 443,
-    uuid: "5efab93b-90d0-4904-93d6-44b4f0b00001", serverName: "a.example.com",
-    fingerprint: "chrome", publicKey: "Z9rM8XAd3bkfAcRjXymiE_nAe-E6okm35RfIq_iMBBU",
-    shortID: "", displayName: "Reality"
-  )
-  let payload = CoreProfile.compatibility(VPNProfile(vless: [vless]))
-  let current = ProfileLibrary(
-    profiles: [ManagedProfile(name: "Current", payload: payload)], selectedProfileID: nil)
-  var root = try #require(
-    JSONSerialization.jsonObject(with: JSONEncoder().encode(current)) as? [String: Any])
-  var profiles = try #require(root["profiles"] as? [[String: Any]])
-  profiles[0]["payload"] = try legacyCompatibilityPayload(payload)
-  root["profiles"] = profiles
-  #expect(throws: DecodingError.self) {
-    try JSONDecoder().decode(
-      ProfileLibrary.self, from: JSONSerialization.data(withJSONObject: root))
-  }
-}
-
-private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [String: Any] {
-  guard case .compatibility = profile else { fatalError() }
-  var root = try #require(
-    JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)) as? [String: Any])
-  var wrapper = try #require(root["compatibility"] as? [String: Any])
-  var value = try #require(wrapper["_0"] as? [String: Any])
-  let connections = try #require(value["connections"] as? [[String: Any]])
-  var vless: [[String: Any]] = []
-  var hysteria2: [[String: Any]] = []
-  var shadowsocks: [[String: Any]] = []
-  for connection in connections {
-    let displayName = try #require(connection["displayName"] as? String)
-    let outbound = try #require(connection["outbound"] as? [String: Any])
-    let kind = try #require(outbound["kind"] as? String)
-    var payload: [String: Any]
-    switch kind {
-    case "vless": payload = try #require(outbound["vless"] as? [String: Any])
-    case "hysteria2": payload = try #require(outbound["hysteria2"] as? [String: Any])
-    case "shadowsocks": payload = try #require(outbound["shadowsocks"] as? [String: Any])
-    default: continue
-    }
-    payload["displayName"] = displayName
-    switch kind {
-    case "vless": vless.append(payload)
-    case "hysteria2": hysteria2.append(payload)
-    case "shadowsocks": shadowsocks.append(payload)
-    default: break
-    }
-  }
-  value.removeValue(forKey: "connections")
-  value["vless"] = vless
-  value["hysteria2"] = hysteria2
-  value["shadowsocks"] = shadowsocks
-  wrapper["_0"] = value
-  root["compatibility"] = wrapper
-  return root
-}
-
 @Test func desiredRuntimeRecoveryAllowsOnlyOneAutomaticAttempt() {
   #expect(
     DesiredRuntimeRecoveryPolicy.decision(
+      recoveryAuthorized: true,
       desiredRunning: false,
       coreRunning: true,
       profileAvailable: true,
@@ -560,6 +572,7 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   )
   #expect(
     DesiredRuntimeRecoveryPolicy.decision(
+      recoveryAuthorized: true,
       desiredRunning: true,
       coreRunning: true,
       profileAvailable: true,
@@ -569,6 +582,7 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   )
   #expect(
     DesiredRuntimeRecoveryPolicy.decision(
+      recoveryAuthorized: true,
       desiredRunning: true,
       coreRunning: false,
       profileAvailable: true,
@@ -578,6 +592,7 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   )
   #expect(
     DesiredRuntimeRecoveryPolicy.decision(
+      recoveryAuthorized: true,
       desiredRunning: true,
       coreRunning: false,
       profileAvailable: true,
@@ -587,42 +602,13 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   )
   #expect(
     DesiredRuntimeRecoveryPolicy.decision(
+      recoveryAuthorized: true,
       desiredRunning: true,
       coreRunning: false,
       profileAvailable: false,
       configurationAvailable: true,
       recoveryAlreadyAttempted: false
     ) == .disableDesiredState
-  )
-}
-
-@Test func exhaustedHelperRecoveryDoesNotTriggerAutomaticConnection() {
-  #expect(
-    !AutomaticConnectionPolicy.shouldConnect(
-      didAttemptAutomaticConnection: false,
-      automaticRecoveryExhausted: true,
-      helperReady: true,
-      profileAvailable: true,
-      coreRunningForSelectedProfile: false
-    )
-  )
-  #expect(
-    !AutomaticConnectionPolicy.shouldConnect(
-      didAttemptAutomaticConnection: true,
-      automaticRecoveryExhausted: false,
-      helperReady: true,
-      profileAvailable: true,
-      coreRunningForSelectedProfile: false
-    )
-  )
-  #expect(
-    AutomaticConnectionPolicy.shouldConnect(
-      didAttemptAutomaticConnection: false,
-      automaticRecoveryExhausted: false,
-      helperReady: true,
-      profileAvailable: true,
-      coreRunningForSelectedProfile: false
-    )
   )
 }
 
@@ -707,22 +693,31 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
     userAgent: "Custom/1.0",
     appVersion: nil,
     deviceOS: "CustomOS",
+    deviceOSVersion: "CustomVersion",
+    deviceModel: "CustomModel",
     hardwareID: "stable-device-id"
   )
 
   let reset = original.resettingRequestPreset()
 
   #expect(reset.userAgent == SubscriptionHeaders.defaultUserAgent)
-  #expect(reset.appVersion == SubscriptionHeaders.defaultAppVersion)
+  #expect(reset.appVersion == nil)
   #expect(reset.deviceOS == SubscriptionHeaders.defaultDeviceOS)
+  #expect(reset.deviceOSVersion == SubscriptionHeaders.defaultDeviceOSVersion)
+  #expect(reset.deviceModel == SubscriptionHeaders.defaultDeviceModel)
   #expect(reset.hardwareID == "stable-device-id")
 }
 
-@Test func newSourcesUseCapturedHappPresetWithoutMigratingStoredHeaders() throws {
+@Test func newSourcesUseShadowrocketPresetWithoutMigratingStoredHeaders() throws {
   let fresh = ManagedSource()
-  #expect(fresh.headers.userAgent == "Happ/5.4.0/ios/2607311456556")
-  #expect(fresh.headers.appVersion == "5.4.0")
+  #expect(
+    fresh.headers.userAgent
+      == "Shadowrocket/3445 CFNetwork/3860.700.2 Darwin/25.6.0 iPhone17,1"
+  )
+  #expect(fresh.headers.appVersion == nil)
   #expect(fresh.headers.deviceOS == "iOS")
+  #expect(fresh.headers.deviceOSVersion == "26.7")
+  #expect(fresh.headers.deviceModel == "iPhone")
   #expect(UUID(uuidString: fresh.headers.hardwareID) != nil)
   #expect(fresh.headers.hardwareID.count == 36)
   #expect(fresh.headers.hardwareID == fresh.headers.hardwareID.uppercased())
@@ -733,6 +728,8 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
       userAgent: "Custom Existing Client/7.0",
       appVersion: nil,
       deviceOS: "CustomOS",
+      deviceOSVersion: nil,
+      deviceModel: nil,
       hardwareID: "existing-hwid"
     )
   )
@@ -743,6 +740,8 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   #expect(restored.headers.userAgent == "Custom Existing Client/7.0")
   #expect(restored.headers.appVersion == nil)
   #expect(restored.headers.deviceOS == "CustomOS")
+  #expect(restored.headers.deviceOSVersion == nil)
+  #expect(restored.headers.deviceModel == nil)
   #expect(restored.headers.hardwareID == "existing-hwid")
 }
 
@@ -760,7 +759,7 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   )
   defer { try? FileManager.default.removeItem(at: directory) }
   let url = directory.appendingPathComponent("profiles.json")
-  let malformed = Data("{not-json".utf8)
+  let malformed = Data(#"{"schemaVersion":11,"profiles":null}"#.utf8)
   FileManager.default.createFile(
     atPath: url.path,
     contents: malformed,
@@ -902,7 +901,7 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   defer { try? FileManager.default.removeItem(at: directory) }
 
   let destination = directory.appendingPathComponent("profiles.json")
-  let original = Data("{broken".utf8)
+  let original = Data(#"{"schemaVersion":11,"profiles":null}"#.utf8)
   FileManager.default.createFile(
     atPath: destination.path,
     contents: original,
@@ -954,8 +953,33 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
 }
 
 @Test func pinnedCoreMatchesGeneratedBuildInformation() throws {
-  let core = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    .appendingPathComponent(".vendor/sing-box")
+  let project = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+  let core = project.appendingPathComponent(".vendor/sing-box")
+  let lock = try String(contentsOf: project.appendingPathComponent("Core.lock"), encoding: .utf8)
+  func recipeValue(_ name: String) throws -> String {
+    let lines = lock.split(whereSeparator: \.isNewline).filter { $0.hasPrefix("\(name) :=") }
+    let line = try #require(lines.count == 1 ? lines.first : nil)
+    return try #require(line.split(separator: ":=", maxSplits: 1).last)
+      .trimmingCharacters(in: .whitespaces)
+  }
+  #expect(try recipeValue("CORE_VERSION") == CoreBuildInfo.version)
+  #expect(try recipeValue("CORE_REVISION") == CoreBuildInfo.revision)
+  #expect(try recipeValue("CORE_GO_DIRECTIVE") == "1.25.5")
+  #expect(try recipeValue("CORE_GO_DIRECTIVE") != recipeValue("CORE_GO_VERSION"))
+  #expect(try recipeValue("CORE_GO_VERSION") == String(CoreBuildInfo.goVersion.dropFirst(2)))
+  #expect(try recipeValue("CORE_BUILD_TAGS") == CoreBuildInfo.buildTags)
+  #expect(try recipeValue("CORE_CGO_ENABLED") == (CoreBuildInfo.cgo == "enabled" ? "1" : "0"))
+  #expect(try recipeValue("CORE_LDFLAGS") == CoreBuildInfo.linkerFlags)
+  let coreAttributes = try FileManager.default.attributesOfItem(atPath: core.path)
+  let coreSize = try #require((coreAttributes[.size] as? NSNumber)?.int64Value)
+  #expect(coreSize == CoreBuildInfo.signedSize)
+  let packagedCore = project.appending(path: "dist/SBM.app/Contents/Resources/sing-box")
+  if FileManager.default.fileExists(atPath: packagedCore.path) {
+    let packagedAttributes = try FileManager.default.attributesOfItem(atPath: packagedCore.path)
+    let packagedSize = try #require((packagedAttributes[.size] as? NSNumber)?.int64Value)
+    #expect(packagedSize == CoreBuildInfo.signedSize)
+  }
+
   let digest = SHA256.hash(data: try Data(contentsOf: core))
     .map { String(format: "%02x", $0) }.joined()
   #expect(digest == CoreBuildInfo.signedSHA256)
@@ -966,6 +990,123 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   )
   #expect(result.status == 0)
   #expect(result.output.hasPrefix("sing-box version \(CoreBuildInfo.version)\n"))
+  #expect(result.output.contains("Revision: \(CoreBuildInfo.revision)\n"))
+  #expect(result.output.contains("Environment: \(CoreBuildInfo.goVersion) darwin/arm64\n"))
+  #expect(result.output.contains("Tags: \(CoreBuildInfo.buildTags)\n"))
+  #expect(result.output.contains("CGO: \(CoreBuildInfo.cgo)\n"))
+}
+
+@Test func bundledCoreCaptureCopiesAnExactSizeRegularFile() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMCoreCaptureTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let source = directory.appendingPathComponent("source")
+  let destination = directory.appendingPathComponent("candidate")
+  let contents = Data("signed-core-fixture".utf8)
+  try contents.write(to: source)
+
+  try CoreManager.captureBundledCore(
+    from: source,
+    to: destination,
+    expectedSize: Int64(contents.count)
+  )
+
+  #expect(try Data(contentsOf: destination) == contents)
+}
+
+@Test(arguments: [Int64(3), Int64(5)])
+func bundledCoreCaptureRejectsDeclaredSizeMismatch(expectedSize: Int64) throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMCoreCaptureTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let source = directory.appendingPathComponent("source")
+  let destination = directory.appendingPathComponent("candidate")
+  try Data("1234".utf8).write(to: source)
+
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.captureBundledCore(from: source, to: destination, expectedSize: expectedSize)
+  }
+  #expect(!FileManager.default.fileExists(atPath: destination.path))
+}
+
+@Test func bundledCoreCaptureRejectsSymlinkSource() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMCoreCaptureTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let target = directory.appendingPathComponent("target")
+  let source = directory.appendingPathComponent("source")
+  let destination = directory.appendingPathComponent("candidate")
+  try Data("signed-core-fixture".utf8).write(to: target)
+  try FileManager.default.createSymbolicLink(at: source, withDestinationURL: target)
+
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.captureBundledCore(
+      from: source,
+      to: destination,
+      expectedSize: Int64("signed-core-fixture".utf8.count)
+    )
+  }
+  #expect(!FileManager.default.fileExists(atPath: destination.path))
+}
+
+@Test func bundledCoreCaptureDoesNotReplaceAnExistingDestination() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SBMCoreCaptureTests-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let source = directory.appendingPathComponent("source")
+  let destination = directory.appendingPathComponent("candidate")
+  let existing = Data("existing".utf8)
+  try Data("signed-core-fixture".utf8).write(to: source)
+  try existing.write(to: destination)
+
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.captureBundledCore(
+      from: source,
+      to: destination,
+      expectedSize: Int64("signed-core-fixture".utf8.count)
+    )
+  }
+  #expect(try Data(contentsOf: destination) == existing)
+}
+
+@Test func bundledCoreInstallationUsesBoundedDescriptorCaptureBeforeTrustChecks() throws {
+  let core = try projectSource("Sources/SBMHelper/CoreManager.swift")
+  let installation = try sourceSection(
+    core,
+    from: "private func installBundledCoreIfNeeded()",
+    to: "private func restoreBackupCore("
+  )
+  #expect(!installation.contains("sha256(of: bundledCoreURL)"))
+  #expect(!installation.contains("copyItem(at: bundledCoreURL"))
+  #expect(!installation.contains("isExecutableFile(atPath: bundledCoreURL.path)"))
+  let capture = try #require(installation.range(of: "try Self.captureBundledCore("))
+  let secure = try #require(installation.range(of: "try secureExecutable(candidate)"))
+  let digest = try #require(installation.range(of: "sha256(of: candidate)"))
+  let version = try #require(installation.range(of: "readCoreVersion(at: candidate)"))
+  #expect(capture.lowerBound < secure.lowerBound)
+  #expect(secure.lowerBound < digest.lowerBound)
+  #expect(digest.lowerBound < version.lowerBound)
+
+  let captureImplementation = try sourceSection(
+    core,
+    from: "static func captureBundledCore(",
+    to: "private func restoreBackupCore("
+  )
+  for required in [
+    "O_RDONLY | O_NOFOLLOW | O_NONBLOCK", "Darwin.fstat(sourceDescriptor, &sourceInfo)",
+    "sourceInfo.st_mode & S_IFMT == S_IFREG", "sourceInfo.st_size == expectedSize",
+    "O_CREAT | O_EXCL | O_NOFOLLOW", "mode_t(0o600)", "copied < expectedSize",
+    "size_t(readLimit)", "Darwin.write", "guard readCount > 0", "extraByte",
+  ] {
+    #expect(captureImplementation.contains(required))
+  }
+  let makefile = try projectSource("Makefile")
+  #expect(makefile.contains("signed_size=\"$$(stat -f %z"))
+  #expect(makefile.contains("public static let signedSize: Int64"))
 }
 
 @Test func profileStoreWritesCredentialsWithUserOnlyPermissions() throws {
@@ -1009,211 +1150,193 @@ private func legacyCompatibilityPayload(_ profile: CoreProfile) throws -> [Strin
   #expect(decoded == library)
 }
 
-@Test func importedRootOwnedSectionsAreReplaced() throws {
-  let source = Data(
-    """
-    {
-      "log": { "output": "/tmp/untrusted.log", "level": "trace" },
-      "inbounds": [
-        { "type": "mixed", "tag": "untrusted-listener", "listen": "0.0.0.0", "listen_port": 8080 }
-      ],
-      "outbounds": [
-        { "type": "socks", "tag": "proxy", "server": "203.0.113.10", "server_port": 1080 }
-      ],
-      "experimental": {
-        "clash_api": { "external_controller": "0.0.0.0:9090", "secret": "untrusted" }
-      }
+@Test func strictJSONDuplicateValidatorRejectsNestedAndEscapedDuplicateKeys() {
+  for text in [
+    #"{"outer":{"key":1,"key":2}}"#,
+    #"{"a":1,"\u0061":2}"#,
+  ] {
+    #expect(throws: StrictJSONValidationError.self) {
+      try StrictJSONDuplicateValidator.validate(
+        Data(text.utf8),
+        maximumBytes: 128,
+        maximumDepth: 8,
+        maximumStringBytes: 64
+      )
     }
-    """.utf8)
-  let profile = try NativeProfileParser.parse(source)
-  let built = try ConfigBuilder(
-    cachePath: "/safe/cache.db",
-    apiSecret: "safe-secret"
-  ).makeConfiguration(profile: .native(profile), mode: .rule, selectedNode: .auto)
-  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
-  let log = try #require(root["log"] as? [String: Any])
-  #expect(log["output"] as? String == "/dev/null")
-  let inbounds = try #require(root["inbounds"] as? [[String: Any]])
-  #expect(inbounds.count == 1)
-  #expect(inbounds[0]["tag"] as? String == "sbm-tun-in")
-  #expect(inbounds[0]["mtu"] as? Int == 1400)
-  let route = try #require(root["route"] as? [String: Any])
-  let rules = try #require(route["rules"] as? [[String: Any]])
-  #expect(
-    !rules.contains {
-      ($0["protocol"] as? String) == "quic"
-        && ($0["action"] as? String) == "reject"
-    })
-  let experimental = try #require(root["experimental"] as? [String: Any])
-  let api = try #require(experimental["clash_api"] as? [String: Any])
-  #expect(api["external_controller"] as? String == "127.0.0.1:19090")
-  #expect(api["secret"] as? String == "safe-secret")
+  }
+  #expect(throws: StrictJSONValidationError.self) {
+    try StrictJSONDuplicateValidator.validate(
+      Data(#"{"outer":[1,]}"#.utf8),
+      maximumBytes: 128,
+      maximumDepth: 8,
+      maximumStringBytes: 64
+    )
+  }
 }
 
-@Test func nativeProfileRoutesUnmatchedTrafficThroughManagedSelector() throws {
-  let source = Data(
-    """
-    {
-      "outbounds": [
-        { "type": "socks", "tag": "proxy", "server": "203.0.113.10", "server_port": 1080 },
-        { "type": "direct", "tag": "bypass" }
-      ],
-      "route": {
-        "rules": [
-          { "domain_suffix": ["example.org"], "action": "route", "outbound": "bypass" }
-        ],
-        "final": "bypass"
-      }
-    }
-    """.utf8)
-  let profile = try NativeProfileParser.parse(source)
-  let built = try ConfigBuilder(
-    cachePath: "/safe/cache.db",
-    apiSecret: "safe-secret"
-  ).makeConfiguration(
-    profile: .native(profile),
-    mode: .rule,
-    selectedNode: ProxyNodeID(rawValue: "proxy")
+@Test func strictJSONDuplicateValidatorEnforcesRawDepthAndDecodedStringBounds() throws {
+  try StrictJSONDuplicateValidator.validate(
+    Data("null".utf8), maximumBytes: 4, maximumDepth: 0, maximumStringBytes: 0)
+  #expect(throws: StrictJSONValidationError.oversized) {
+    try StrictJSONDuplicateValidator.validate(
+      Data("null".utf8), maximumBytes: 3, maximumDepth: 0, maximumStringBytes: 0)
+  }
+
+  try StrictJSONDuplicateValidator.validate(
+    Data("[[0]]".utf8), maximumBytes: 5, maximumDepth: 2, maximumStringBytes: 0)
+  #expect(throws: StrictJSONValidationError.invalidJSON) {
+    try StrictJSONDuplicateValidator.validate(
+      Data("[[0]]".utf8), maximumBytes: 5, maximumDepth: 1, maximumStringBytes: 0)
+  }
+
+  try StrictJSONDuplicateValidator.validate(
+    Data(#""abc""#.utf8), maximumBytes: 5, maximumDepth: 0, maximumStringBytes: 3)
+  #expect(throws: StrictJSONValidationError.oversized) {
+    try StrictJSONDuplicateValidator.validate(
+      Data(#""abc""#.utf8), maximumBytes: 5, maximumDepth: 0, maximumStringBytes: 2)
+  }
+}
+
+@Test func strictJSONDuplicateValidatorAcceptsCurrentHelperAndRoutingShapes() throws {
+  let request = try JSONEncoder().encode(HelperRequest(action: .status))
+  try StrictJSONDuplicateValidator.validate(
+    request,
+    maximumBytes: 2 * 1_048_576,
+    maximumDepth: 32,
+    maximumStringBytes: 2 * 1_048_576
   )
-  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
-  let route = try #require(root["route"] as? [String: Any])
-  #expect(route["final"] as? String == "sbm-selector")
-  let rules = try #require(route["rules"] as? [[String: Any]])
-  #expect(rules.contains { ($0["outbound"] as? String) == "bypass" })
+  let policy = Data(
+    #"{"route":{"rules":[{"domain_suffix":["example.test"],"action":"route","outbound":"direct"}]}}"#
+      .utf8
+  )
+  try StrictJSONDuplicateValidator.validate(
+    policy,
+    maximumBytes: RoutingPolicyParser.maximumPolicySize,
+    maximumDepth: 64,
+    maximumStringBytes: RoutingPolicyParser.maximumPolicySize
+  )
 }
 
-@Test func nativeProfileKeepsRuleDNSAndOverridesOnlyDirectGlobalModes() throws {
-  let source = Data(
-    """
-    {
-      "dns": {
-        "servers": [
-          { "type": "tls", "tag": "user-dns", "server": "1.1.1.1" }
-        ],
-        "rules": [
-          { "domain_suffix": ["example.org"], "action": "route", "server": "user-dns" }
-        ],
-        "final": "user-dns"
-      },
-      "outbounds": [
-        { "type": "socks", "tag": "proxy", "server": "203.0.113.10", "server_port": 1080 }
-      ]
-    }
-    """.utf8)
-  let profile = try NativeProfileParser.parse(source)
-  let built = try ConfigBuilder(
-    cachePath: "/safe/cache.db",
-    apiSecret: "safe-secret"
-  ).makeConfiguration(profile: .native(profile), mode: .rule, selectedNode: .auto)
-  let root = try #require(JSONSerialization.jsonObject(with: built.data) as? [String: Any])
-  let dns = try #require(root["dns"] as? [String: Any])
-  let servers = try #require(dns["servers"] as? [[String: Any]])
+private func projectSource(_ path: String) throws -> String {
+  try String(
+    contentsOf: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+      .appending(path: path),
+    encoding: .utf8
+  )
+}
+
+private func sourceSection(
+  _ source: String,
+  from startMarker: String,
+  to endMarker: String
+) throws -> String {
+  let start = try #require(source.range(of: startMarker))
+  let end = try #require(source.range(of: endMarker, range: start.upperBound..<source.endIndex))
+  return String(source[start.lowerBound..<end.lowerBound])
+}
+
+@Test func preRCJSONBoundariesRejectDuplicatesBeforeDecoding() throws {
+  let helper = try projectSource("Sources/SBMHelper/main.swift")
+  let request = try sourceSection(
+    helper,
+    from: "private func decodeRequest(_ frame: Data)",
+    to: "private func prepareColdOffLifetime()"
+  )
+  #expect(request.range(of: "StrictJSONDuplicateValidator.validate") != nil)
+  let requestValidation = try #require(request.range(of: "StrictJSONDuplicateValidator.validate"))
+  let requestDecode = try #require(request.range(of: "JSONDecoder().decode(HelperRequest.self"))
+  #expect(requestValidation.lowerBound < requestDecode.lowerBound)
+
+  let client = try projectSource("Sources/SBM/HelperClient.swift")
+  #expect(client.range(of: "StrictJSONDuplicateValidator.validate") != nil)
+  let responseValidation = try #require(client.range(of: "StrictJSONDuplicateValidator.validate"))
+  let responseDecode = try #require(client.range(of: "JSONDecoder().decode(HelperResponse.self"))
+  #expect(responseValidation.lowerBound < responseDecode.lowerBound)
+  let routing = try projectSource("Sources/SBM/SubscriptionClient.swift")
+  let parser = try sourceSection(
+    routing,
+    from: "static func parse(_ data: Data) throws -> RoutingPolicy",
+    to: "\n  }\n}"
+  )
+  let policyValidation = try #require(parser.range(of: "StrictJSONDuplicateValidator.validate"))
+  let policyParse = try #require(parser.range(of: "JSONSerialization.jsonObject"))
+  #expect(policyValidation.lowerBound < policyParse.lowerBound)
   #expect(
-    servers.compactMap { $0["tag"] as? String } == [
-      "user-dns", "sbm-dns-local", "sbm-dns-remote",
-    ])
-  let rules = try #require(dns["rules"] as? [[String: Any]])
-  #expect(rules[0]["clash_mode"] as? String == "Direct")
-  #expect(rules[1]["clash_mode"] as? String == "Global")
-  #expect((rules[2]["domain_suffix"] as? [String]) == ["example.org"])
-  #expect(dns["final"] as? String == "user-dns")
+    try projectSource("Sources/SBMHelper/ConfigBuilder.swift")
+      .contains("StrictJSONDuplicateValidator.validate"))
 }
 
-@Test func nativeProfileRejectsSystemManagedEndpoint() throws {
-  let source = Data(
-    """
-    {
-      "outbounds": [
-        { "type": "socks", "tag": "proxy", "server": "203.0.113.10", "server_port": 1080 }
-      ],
-      "endpoints": [
-        { "type": "wireguard", "tag": "wg", "system": true }
-      ]
-    }
-    """.utf8)
-  let profile = try NativeProfileParser.parse(source)
-  #expect(throws: (any Error).self) {
-    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
-      .makeConfiguration(profile: .native(profile), mode: .rule, selectedNode: .auto)
+@Test func preRCHelperShutdownAndInfoPlistAdmissionStayBounded() throws {
+  let helper = try projectSource("Sources/SBMHelper/main.swift")
+  let shutdown = try sourceSection(
+    helper,
+    from: "case .shutdown:",
+    to: "\n      }\n    } catch HelperFailure.unauthorizedPeer"
+  )
+  let normalizedShutdown =
+    shutdown
+    .split(whereSeparator: \.isWhitespace)
+    .joined(separator: " ")
+  let shutdownStopArm = try #require(
+    normalizedShutdown.range(of: "response = manager.legacy1115Retired ? try manager.stop()")
+  )
+  let unresolvedShutdownResponse = try #require(
+    normalizedShutdown.range(
+      of:
+        ": manager.inertLegacyUpgradeResponse( success: false, message: \"Legacy helper retirement is unresolved; shutdown cannot report OFF.\""
+    )
+  )
+  let terminalMark = try #require(normalizedShutdown.range(of: "terminalDisposition = .exiting"))
+  #expect(terminalMark.lowerBound < shutdownStopArm.lowerBound)
+  #expect(shutdownStopArm.upperBound < unresolvedShutdownResponse.lowerBound)
+  #expect(!shutdown.contains("if !response.coreRunning"))
+
+  let handle = try sourceSection(
+    helper,
+    from: "private func handle(",
+    to: "private func authenticatePeer("
+  )
+  let catchPath = try #require(handle.range(of: "} catch HelperFailure.unauthorizedPeer"))
+  let truthfulError = try #require(handle.range(of: "let current = manager.status()"))
+  let terminalReturn = try #require(
+    handle.range(of: "\n    return terminalDisposition == .exiting\n  }")
+  )
+  #expect(catchPath.lowerBound < truthfulError.lowerBound)
+  #expect(truthfulError.lowerBound < terminalReturn.lowerBound)
+  #expect(handle.contains("message: error.localizedDescription"))
+
+  let trust = try projectSource("Sources/SBMHelper/HelperTrust.swift")
+  let reader = try sourceSection(
+    trust,
+    from: "private static func boundedInfoPlistData(at path: String)",
+    to: "static func currentReleaseFieldsMatch("
+  )
+  for required in [
+    "open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)",
+    "fstat(descriptor, &info)",
+    "S_IFREG",
+    "maximumBytes = 256 * 1_024",
+    "maximumBytes + 1 - data.count",
+    "Darwin.read",
+    "close(descriptor)",
+  ] {
+    #expect(reader.contains(required))
   }
+  #expect(!reader.contains("Data(contentsOf:"))
+  #expect(trust.contains("boundedInfoPlistData(at: appInfoURL.path)"))
 }
 
-@Test func nativeProfileRejectsUnsupportedPrivilegedServices() throws {
-  let source = Data(
-    """
-    {
-      "outbounds": [
-        { "type": "socks", "tag": "proxy", "server": "203.0.113.10", "server_port": 1080 }
-      ],
-      "services": [
-        { "type": "resolved", "listen": "0.0.0.0" }
-      ]
-    }
-    """.utf8)
-  let profile = try NativeProfileParser.parse(source)
-  #expect(throws: (any Error).self) {
-    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
-      .makeConfiguration(profile: .native(profile), mode: .rule, selectedNode: .auto)
-  }
-}
-
-@Test func nativeProfileRejectsMalformedRoutingInsteadOfDiscardingIt() throws {
-  let source = Data(
-    """
-    {
-      "outbounds": [
-        { "type": "socks", "tag": "proxy", "server": "203.0.113.10", "server_port": 1080 }
-      ],
-      "route": { "rules": "not-an-array" }
-    }
-    """.utf8)
-  let profile = try NativeProfileParser.parse(source)
-  #expect(throws: (any Error).self) {
-    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
-      .makeConfiguration(profile: .native(profile), mode: .rule, selectedNode: .auto)
-  }
-}
-
-@Test func nativeProfileRejectsExcessiveNesting() throws {
-  var nested: Any = "leaf"
-  for index in 0..<40 {
-    nested = ["layer\(index)": nested]
-  }
-  let source = try JSONSerialization.data(withJSONObject: [
-    "outbounds": [
-      [
-        "type": "socks",
-        "tag": "proxy",
-        "server": "203.0.113.10",
-        "server_port": 1080,
-        "headers": ["X-Test": nested],
-      ]
-    ]
-  ])
-  let profile = try NativeProfileParser.parse(source)
-
-  #expect(throws: (any Error).self) {
-    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
-      .makeConfiguration(profile: .native(profile), mode: .rule, selectedNode: .auto)
-  }
-}
-
-@Test func nativeProfileRejectsOversizedCollections() throws {
-  let source = try JSONSerialization.data(withJSONObject: [
-    "outbounds": [
-      [
-        "type": "socks",
-        "tag": "proxy",
-        "server": "203.0.113.10",
-        "server_port": 1080,
-        "headers": ["X-Test": Array(repeating: "value", count: 5_000)],
-      ]
-    ]
-  ])
-  let profile = try NativeProfileParser.parse(source)
-
-  #expect(throws: (any Error).self) {
-    try ConfigBuilder(cachePath: "/tmp/cache", apiSecret: "secret")
-      .makeConfiguration(profile: .native(profile), mode: .rule, selectedNode: .auto)
+@Test func coreConfigurationCandidatesHaveCleanupBeforeSecureFileAdmission() throws {
+  let core = try projectSource("Sources/SBMHelper/CoreManager.swift")
+  for (start, end) in [
+    ("private func validateConfiguration(", "private func backupActiveConfiguration("),
+    ("private func writeValidatedConfiguration(", "private func restoreBackupConfiguration("),
+  ] {
+    let section = try sourceSection(core, from: start, to: end)
+    let cleanup = try #require(
+      section.range(of: "defer { try? fileManager.removeItem(at: candidate) }")
+    )
+    let secure = try #require(section.range(of: "try secureFile(candidate)"))
+    #expect(cleanup.lowerBound < secure.lowerBound)
   }
 }

@@ -1,17 +1,6 @@
 import Foundation
 import SBMShared
 
-enum LatencyTargetSettings {
-  static func apply(
-    draft: String,
-    persist: (String) throws -> Void
-  ) throws -> String {
-    let target = try LatencyTargetPolicy.normalized(draft)
-    try persist(target)
-    return target
-  }
-}
-
 enum LatencyRefreshSchedule {
   static func isDue(lastTestAt: Date?, now: Date, intervalMinutes: Int) -> Bool {
     guard let lastTestAt else { return true }

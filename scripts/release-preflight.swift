@@ -1,4 +1,6 @@
 #!/usr/bin/env swift
+import CryptoKit
+import Darwin
 import Foundation
 
 private enum PreflightFailure: LocalizedError {
@@ -66,24 +68,28 @@ private enum ReleasePreflight {
     try verifyMetadata(tag: options.tag, root: options.root)
     guard !options.metadataOnly else { return }
 
-    try run("swift test", in: options.root)
-    try run("xcrun swift-format lint --recursive Sources Tests Package.swift", in: options.root)
+    try run("swift test --disable-sandbox --no-parallel", in: options.root)
+    try run(
+      "xcrun swift-format lint --recursive Sources Tests Package.swift scripts/release-manifest.swift scripts/release-preflight.swift scripts/update-core.swift",
+      in: options.root
+    )
     try run(
       "plutil -lint Resources/Info.plist Resources/com.stillnotfree.sbm.helper.plist",
       in: options.root
     )
     try run("git diff --check", in: options.root)
-    try run("make app", in: options.root)
+    let coreBuildInfoURL = options.root.appendingPathComponent(
+      "Sources/SBMShared/CoreBuildInfo.swift")
+    let checkpointedCoreBuildInfo = try Data(contentsOf: coreBuildInfoURL)
+    var buildFailure: Error?
+    do {
+      try run("make dmg", in: options.root)
+    } catch {
+      buildFailure = error
+    }
+    try verifyCoreBuildInfoUnchanged(checkpointedCoreBuildInfo, at: coreBuildInfoURL)
+    if let buildFailure { throw buildFailure }
     try verifyBuiltArtifacts(tag: options.tag, root: options.root)
-    try run("codesign --verify --strict --verbose=2 dist/SBM.app", in: options.root)
-    try run(
-      "codesign --verify --strict --verbose=2 dist/SBM.app/Contents/Resources/SBMHelper",
-      in: options.root
-    )
-    try run(
-      "codesign --verify --strict --verbose=2 dist/SBM.app/Contents/Resources/sing-box",
-      in: options.root
-    )
   }
 
   private static func verifyMetadata(tag: String, root: URL) throws {
@@ -125,13 +131,53 @@ private enum ReleasePreflight {
     else {
       throw PreflightFailure.check("Core.lock CORE_VERSION must be a stable semantic version.")
     }
-    let digests = try digestAssignments(in: lock)
-    guard digests.count == 2 else {
-      throw PreflightFailure.check(
-        "Core.lock must contain exactly two lowercase 64-character SHA-256 digests; found \(digests.count)."
-      )
+    let coreFields = [
+      "CORE_VERSION", "CORE_REVISION", "CORE_GO_DIRECTIVE", "CORE_GO_VERSION",
+      "CORE_BUILD_TAGS", "CORE_CGO_ENABLED", "CORE_LDFLAGS",
+    ]
+    let coreAssignments = captures(#"^[ \t]*(CORE_[A-Z0-9_]+)[ \t]*:="#, in: lock)
+      .compactMap(\.first)
+    guard Set(coreAssignments) == Set(coreFields), coreAssignments.count == coreFields.count else {
+      throw PreflightFailure.check("Core.lock must contain exactly the seven source recipe fields.")
     }
-    print("Metadata OK: Core.lock has a stable version and two SHA-256 digests.")
+    var recipe: [String: String] = [:]
+    for name in coreFields {
+      recipe[name] = try oneAssignment(named: name, in: lock, file: "Core.lock")
+    }
+    let revision = try required(recipe, "CORE_REVISION")
+    guard matches(revision, pattern: #"^[a-f0-9]{40}$"#) else {
+      throw PreflightFailure.check(
+        "Core.lock CORE_REVISION must be 40 lowercase hexadecimal characters.")
+    }
+    let goDirective = try required(recipe, "CORE_GO_DIRECTIVE")
+    guard matches(goDirective, pattern: #"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"#)
+    else {
+      throw PreflightFailure.check("Core.lock CORE_GO_DIRECTIVE must use major.minor.patch format.")
+    }
+    let goVersion = try required(recipe, "CORE_GO_VERSION")
+    guard matches(goVersion, pattern: #"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"#)
+    else {
+      throw PreflightFailure.check("Core.lock CORE_GO_VERSION must use major.minor.patch format.")
+    }
+    let buildTags = try required(recipe, "CORE_BUILD_TAGS")
+    let tags = buildTags.split(separator: ",", omittingEmptySubsequences: false)
+    guard !tags.isEmpty,
+      tags.allSatisfy({
+        !$0.isEmpty && $0.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }
+      }), Set(tags).count == tags.count
+    else {
+      throw PreflightFailure.check(
+        "Core.lock CORE_BUILD_TAGS must be non-empty and contain unique tags.")
+    }
+    let cgoEnabled = try required(recipe, "CORE_CGO_ENABLED")
+    guard cgoEnabled == "0" || cgoEnabled == "1" else {
+      throw PreflightFailure.check("Core.lock CORE_CGO_ENABLED must be 0 or 1.")
+    }
+    let linkerFlags = try required(recipe, "CORE_LDFLAGS")
+    guard !linkerFlags.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw PreflightFailure.check("Core.lock CORE_LDFLAGS must not be empty.")
+    }
+    print("Metadata OK: Core.lock has one valid seven-field source build recipe.")
 
     let buildInfo = try read("Sources/SBMShared/CoreBuildInfo.swift", from: root)
     let buildInfoVersion = try oneSwiftString(
@@ -141,30 +187,37 @@ private enum ReleasePreflight {
         "CoreBuildInfo version \(buildInfoVersion) does not match Core.lock CORE_VERSION \(coreVersion)."
       )
     }
+    let buildInfoFields = [
+      ("revision", revision), ("goVersion", "go\(goVersion)"),
+      ("buildTags", buildTags), ("cgo", cgoEnabled == "1" ? "enabled" : "disabled"),
+      ("linkerFlags", linkerFlags),
+    ]
+    for (name, expected) in buildInfoFields {
+      let value = try oneSwiftString(
+        named: name, in: buildInfo, file: "Sources/SBMShared/CoreBuildInfo.swift")
+      guard value == expected else {
+        throw PreflightFailure.check("CoreBuildInfo \(name) does not match Core.lock.")
+      }
+    }
+    let unsignedDigest = try oneSwiftString(
+      named: "unsignedSHA256", in: buildInfo, file: "Sources/SBMShared/CoreBuildInfo.swift")
+    guard matches(unsignedDigest, pattern: #"^[a-f0-9]{64}$"#) else {
+      throw PreflightFailure.check(
+        "CoreBuildInfo unsignedSHA256 must be a lowercase 64-character SHA-256 digest.")
+    }
     let signedDigest = try oneSwiftString(
       named: "signedSHA256", in: buildInfo, file: "Sources/SBMShared/CoreBuildInfo.swift")
     guard matches(signedDigest, pattern: #"^[a-f0-9]{64}$"#) else {
       throw PreflightFailure.check(
         "CoreBuildInfo signedSHA256 must be a lowercase 64-character SHA-256 digest.")
     }
-    print("Metadata OK: CoreBuildInfo matches the pinned core version and signed digest format.")
-
-    let policy = try read("Sources/SBMHelper/NativeCapabilityPolicy.swift", from: root)
-    let reviewedVersion = try oneSwiftString(
-      named: "reviewedCoreVersion", in: policy,
-      file: "Sources/SBMHelper/NativeCapabilityPolicy.swift")
-    guard reviewedVersion == coreVersion else {
-      throw PreflightFailure.check(
-        "NativeCapabilityPolicy reviewedCoreVersion \(reviewedVersion) does not match Core.lock CORE_VERSION \(coreVersion)."
-      )
-    }
-    print("Metadata OK: NativeCapabilityPolicy is reviewed for the pinned core.")
+    print("Metadata OK: CoreBuildInfo matches the recipe and both SHA-256 formats.")
 
     try verifyRepositoryScope(root: root)
     print("Metadata OK: .codex contains no tracked files.")
 
-    try verifyArm64Packaging(makefile: makefile, root: root)
-    print("Metadata OK: Package and Make packaging inputs are arm64-only.")
+    try verifyBuildAndReleaseTrustInputs(makefile: makefile, root: root)
+    print("Metadata OK: pinned core build and release trust inputs are valid.")
   }
 
   private static func read(_ path: String, from root: URL) throws -> String {
@@ -199,28 +252,13 @@ private enum ReleasePreflight {
     -> String
   {
     let values = captures(
-      #"^\s*"# + NSRegularExpression.escapedPattern(for: name) + #"\s*:=\s*([^\s#]+)\s*(?:#.*)?$"#,
+      #"^[ \t]*"# + NSRegularExpression.escapedPattern(for: name) + #"[ \t]*:=[ \t]*(.*?)[ \t]*$"#,
       in: text
     )
     guard values.count == 1, let value = values.first?.first else {
       throw PreflightFailure.check("\(file) must define \(name) exactly once.")
     }
     return value
-  }
-
-  private static func digestAssignments(in text: String) throws -> [(String, String)] {
-    let assignments = captures(#"^\s*([A-Z0-9_]*SHA256)\s*:=\s*([^\s#]+)\s*(?:#.*)?$"#, in: text)
-    for match in assignments {
-      guard match.count == 2, matches(match[1], pattern: #"^[a-f0-9]{64}$"#) else {
-        let name = match.first ?? "SHA256 value"
-        throw PreflightFailure.check(
-          "Core.lock \(name) must be a lowercase 64-character SHA-256 digest.")
-      }
-    }
-    return assignments.compactMap { values in
-      guard values.count == 2 else { return nil }
-      return (values[0], values[1])
-    }
   }
 
   private static func oneSwiftString(named name: String, in text: String, file: String) throws
@@ -246,27 +284,65 @@ private enum ReleasePreflight {
     }
   }
 
-  private static func verifyArm64Packaging(makefile: String, root: URL) throws {
+  private static func verifyBuildAndReleaseTrustInputs(makefile: String, root: URL) throws {
     let package = try read("Package.swift", from: root)
-    let requiredMakeInputs = [
-      "darwin-arm64.tar.gz",
-      "--arch arm64",
-      "arm64-apple-macosx",
-      "-arm64.dmg",
+    let requiredBuildInputs = [
+      "test \"$$source_go\" = \"$(CORE_GO_DIRECTIVE)\"",
+      "GOTOOLCHAIN=go$(CORE_GO_VERSION)",
+      "-mod=readonly",
+      "-trimpath",
+      "-tags \"$(CORE_BUILD_TAGS)\"",
     ]
+    let releaseTool = try read("scripts/release-manifest.swift", from: root)
+    let signingStart = "    case \"sign-update-artifact\":"
+    let verificationStart = "    case \"verify-update-artifact\":"
+    let signingCase: String
+    if let start = releaseTool.range(of: signingStart),
+      let end = releaseTool.range(
+        of: verificationStart, range: start.upperBound..<releaseTool.endIndex)
+    {
+      signingCase = String(releaseTool[start.upperBound..<end.lowerBound])
+    } else {
+      throw PreflightFailure.check("release trust tool is missing its update-proof commands.")
+    }
+    let requiredTrustSequence = [
+      "let manifest = try verifyDMG(dmg: dmg, coreDigestFile: coreDigestFile)",
+      "updateArtifactFacts(for: dmg, appVersion: manifest.appVersion)",
+      "privateKey.publicKey.rawRepresentation == CurrentReleaseManifest.projectPublicKey",
+      "UpdateArtifactProof.sign(payload, with: privateKey)",
+      "try proof.write(",
+      "try verifyUpdateArtifact(dmg: dmg, coreDigestFile: coreDigestFile)",
+    ]
+    let trustPositions = requiredTrustSequence.compactMap {
+      signingCase.range(of: $0)?.lowerBound
+    }
     guard package.contains("platforms: [.macOS"),
-      requiredMakeInputs.allSatisfy(makefile.contains),
-      !makefile.localizedCaseInsensitiveContains("x86_64"),
-      !makefile.localizedCaseInsensitiveContains("universal"),
-      !package.localizedCaseInsensitiveContains("x86_64"),
-      !package.localizedCaseInsensitiveContains("universal")
+      requiredBuildInputs.allSatisfy(makefile.contains),
+      trustPositions.count == requiredTrustSequence.count,
+      trustPositions == trustPositions.sorted()
     else {
-      throw PreflightFailure.check("Package and Make packaging inputs must be arm64-only.")
+      throw PreflightFailure.check(
+        "pinned core build and release proof inputs must match the current trust contract.")
     }
   }
 
+  private static func required(_ values: [String: String], _ name: String) throws -> String {
+    guard let value = values[name] else {
+      throw PreflightFailure.check("Core.lock is missing \(name).")
+    }
+    return value
+  }
+
+  private static func verifyCoreBuildInfoUnchanged(_ expected: Data, at url: URL) throws {
+    guard let current = try? Data(contentsOf: url), current == expected else {
+      throw PreflightFailure.check(
+        "full release build changed checkpointed CoreBuildInfo; review the rebuilt core before release."
+      )
+    }
+    print("Build OK: full release build preserved checkpointed CoreBuildInfo.")
+  }
+
   private static func verifyBuiltArtifacts(tag: String, root: URL) throws {
-    let app = root.appendingPathComponent("dist/SBM.app", isDirectory: true)
     let info = try propertyList("dist/SBM.app/Contents/Info.plist", root: root)
     let sourceInfo = try propertyList("Resources/Info.plist", root: root)
     let expectedVersion = String(tag.dropFirst())
@@ -288,31 +364,78 @@ private enum ReleasePreflight {
     }
     print("Built artifact OK: Info.plist marketing and build versions match the release.")
 
-    try verifyArm64Artifact(
-      app.appendingPathComponent("Contents/MacOS/SBM"), name: "app executable")
-    try verifyArm64Artifact(
-      app.appendingPathComponent("Contents/Resources/SBMHelper"), name: "helper executable")
-    try verifyArm64Artifact(
-      app.appendingPathComponent("Contents/Resources/sing-box"), name: "bundled sing-box")
+    let helperPlist = try propertyList(
+      "dist/SBM.app/Contents/Library/LaunchDaemons/com.stillnotfree.sbm.helper.plist",
+      root: root
+    )
+    if let abandonProcessGroup = helperPlist["AbandonProcessGroup"] {
+      guard let value = abandonProcessGroup as? Bool, !value else {
+        throw PreflightFailure.check(
+          "built helper plist must omit AbandonProcessGroup or set it false.")
+      }
+    }
+    print("Built artifact OK: helper plist does not abandon its process group.")
+    try verifyFinalDMGPresentation(tag: tag, root: root)
   }
 
-  private static func verifyArm64Artifact(_ url: URL, name: String) throws {
-    guard FileManager.default.fileExists(atPath: url.path) else {
-      throw PreflightFailure.check("built \(name) is missing from dist/SBM.app.")
+  private static func verifyFinalDMGPresentation(tag: String, root: URL) throws {
+    let files = FileManager.default
+    let mountpoint = files.temporaryDirectory.appendingPathComponent(
+      "SBMReleaseDMG-\(UUID().uuidString)", isDirectory: true)
+    try files.createDirectory(at: mountpoint, withIntermediateDirectories: false)
+    var needsDetach = true
+    defer {
+      if needsDetach {
+        _ = try? process(["hdiutil", "detach", mountpoint.path], in: root, captureOutput: true)
+      }
+      try? files.removeItem(at: mountpoint)
     }
-    print("Running: xcrun lipo -archs \(url.path)")
-    let result = try process(
-      ["xcrun", "lipo", "-archs", url.path],
-      in: url.deletingLastPathComponent(),
-      captureOutput: true
+    let dmg = root.appendingPathComponent("dist/SBM-\(String(tag.dropFirst()))-arm64.dmg")
+    let attach = try process(
+      ["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mountpoint.path, dmg.path],
+      in: root, captureOutput: true)
+    guard attach.status == 0 else {
+      throw PreflightFailure.command("hdiutil attach final DMG", attach.status)
+    }
+    guard files.fileExists(atPath: mountpoint.appendingPathComponent("SBM.app").path) else {
+      throw PreflightFailure.check("final DMG is missing root SBM.app.")
+    }
+    let applications = mountpoint.appendingPathComponent("Applications")
+    var linkStat = stat()
+    guard lstat(applications.path, &linkStat) == 0, (linkStat.st_mode & S_IFMT) == S_IFLNK,
+      (try? files.destinationOfSymbolicLink(atPath: applications.path)) == "/Applications"
+    else {
+      throw PreflightFailure.check("final DMG Applications must be a symlink to /Applications.")
+    }
+    let background = mountpoint.appendingPathComponent(".background/background.png")
+    guard
+      let tracked = try? Data(
+        contentsOf: root.appendingPathComponent("Resources/DMG/background.png")),
+      regularFileSize(background.path) == off_t(tracked.count),
+      let mounted = try? Data(contentsOf: background),
+      Data(SHA256.hash(data: tracked)) == Data(SHA256.hash(data: mounted))
+    else {
+      throw PreflightFailure.check("final DMG background digest does not match the tracked asset.")
+    }
+    guard let storeSize = regularFileSize(mountpoint.appendingPathComponent(".DS_Store").path),
+      storeSize > 0
+    else {
+      throw PreflightFailure.check("final DMG root .DS_Store must be a non-empty regular file.")
+    }
+    let detach = try process(["hdiutil", "detach", mountpoint.path], in: root, captureOutput: true)
+    guard detach.status == 0 else {
+      throw PreflightFailure.command("hdiutil detach final DMG", detach.status)
+    }
+    needsDetach = false
+    print(
+      "Final DMG presentation OK: SBM.app, Applications link, tracked background, and non-empty .DS_Store."
     )
-    guard result.status == 0 else {
-      throw PreflightFailure.check("could not inspect the architecture of built \(name).")
-    }
-    guard result.output.trimmingCharacters(in: .whitespacesAndNewlines) == "arm64" else {
-      throw PreflightFailure.check("built \(name) must be arm64-only.")
-    }
-    print("Built artifact OK: \(name) is arm64-only.")
+  }
+
+  private static func regularFileSize(_ path: String) -> off_t? {
+    var fileStat = stat()
+    guard lstat(path, &fileStat) == 0, (fileStat.st_mode & S_IFMT) == S_IFREG else { return nil }
+    return fileStat.st_size
   }
 
   private static func run(_ command: String, in root: URL) throws {
@@ -346,8 +469,8 @@ private enum ReleasePreflight {
     } catch {
       throw PreflightFailure.check("could not start command: \(arguments.joined(separator: " "))")
     }
-    process.waitUntilExit()
     let data = captureOutput ? output.fileHandleForReading.readDataToEndOfFile() : Data()
+    process.waitUntilExit()
     return (process.terminationStatus, String(decoding: data, as: UTF8.self))
   }
 

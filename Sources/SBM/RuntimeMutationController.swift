@@ -1,14 +1,7 @@
 import Foundation
+import SBMShared
 
-enum RuntimeApplyStatus: Equatable, Sendable {
-  case saved
-  case applying
-  case active
-  case reconnectRequired
-  case failed
-}
-
-enum RuntimeApplyCoordinatorFailure: LocalizedError, Sendable {
+enum RuntimeMutationControllerFailure: LocalizedError, Sendable {
   case superseded
 
   var errorDescription: String? {
@@ -17,19 +10,19 @@ enum RuntimeApplyCoordinatorFailure: LocalizedError, Sendable {
 }
 
 @MainActor
-final class RuntimeApplyCoordinator<Request: Sendable, Response: Sendable> {
+final class RuntimeMutationController {
   struct Outcome: Sendable {
     let generation: UInt64
     let isCurrent: Bool
-    let result: Result<Response, any Error>
+    let result: Result<HelperResponse, any Error>
   }
 
-  typealias Sender = @Sendable (Request) async throws -> Response
+  typealias Sender = @Sendable (HelperRequest) async throws -> HelperResponse
   typealias Completion = @MainActor (Outcome) -> Void
 
   private struct Pending {
     let generation: UInt64
-    let request: Request
+    let request: HelperRequest
     let completion: Completion
   }
 
@@ -38,35 +31,36 @@ final class RuntimeApplyCoordinator<Request: Sendable, Response: Sendable> {
   private var pending: Pending?
   private var worker: Task<Void, Never>?
 
-  private(set) var status: RuntimeApplyStatus = .saved
+  /// `nil` means startup has not adopted helper state or received explicit intent.
+  /// Explicit Disconnect is stored as `false`.
+  var desiredRunning: Bool?
 
   var isApplying: Bool { worker != nil }
   var currentGeneration: UInt64 { desiredGeneration }
+
+  func drainAcceptedWork() async {
+    if let worker { await worker.value }
+  }
 
   init(sender: @escaping Sender) {
     self.sender = sender
   }
 
-  func markSaved() {
-    guard worker == nil else { return }
-    status = .saved
-  }
-
   @discardableResult
-  func submit(_ request: Request, completion: @escaping Completion) -> UInt64 {
+  func submit(_ request: HelperRequest, completion: @escaping Completion) -> UInt64 {
     desiredGeneration &+= 1
     let generation = desiredGeneration
-    if let superseded = pending {
+    let superseded = pending
+    pending = Pending(generation: generation, request: request, completion: completion)
+    if let superseded {
       superseded.completion(
         Outcome(
           generation: superseded.generation,
           isCurrent: false,
-          result: .failure(RuntimeApplyCoordinatorFailure.superseded)
+          result: .failure(RuntimeMutationControllerFailure.superseded)
         )
       )
     }
-    pending = Pending(generation: generation, request: request, completion: completion)
-    status = .applying
     startWorkerIfNeeded()
     return generation
   }
@@ -81,7 +75,7 @@ final class RuntimeApplyCoordinator<Request: Sendable, Response: Sendable> {
   private func drain() async {
     while let current = pending {
       pending = nil
-      let result: Result<Response, any Error>
+      let result: Result<HelperResponse, any Error>
       do {
         result = .success(try await sender(current.request))
       } catch {
@@ -89,14 +83,6 @@ final class RuntimeApplyCoordinator<Request: Sendable, Response: Sendable> {
       }
 
       let isCurrent = current.generation == desiredGeneration
-      if isCurrent {
-        switch result {
-        case .success:
-          status = .active
-        case .failure:
-          status = .failed
-        }
-      }
       current.completion(
         Outcome(generation: current.generation, isCurrent: isCurrent, result: result)
       )

@@ -71,11 +71,11 @@ For every scenario:
 Use these three conditions. They are intentionally application-level scenarios;
 the harness does not operate SBM for you.
 
-| Scenario | Manual condition during the five-minute run |
+| Scenario | Condition during the five-minute run |
 | --- | --- |
-| Idle | SBM open and disconnected; no profile refresh, update check, or manual latency action. |
+| Idle | SBM open and disconnected; no profile refresh or update check. |
 | Connected | SBM connected to the same selected profile and route mode; leave user traffic quiet except for ordinary background macOS noise. |
-| Latency test | The same connected state; invoke SBM's manual latency test at a pre-recorded cadence (for example, once at 60, 120, 180, and 240 seconds). Record the cadence and target URL next to the run. |
+| Connected latency | The same connected state; use SBM's automatic latency checks at the configured interval. For a bounded measurement, set the existing supported interval short enough before the run, then record the applied interval and target URL next to the run. |
 
 For A/B work, change exactly one named variable, repeat the same sequence, and
 use the same explicit labels on both sides. For example, after independently

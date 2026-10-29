@@ -19,11 +19,16 @@ let package = Package(
     ),
     .executableTarget(
       name: "SBMHelper",
-      dependencies: ["SBMShared"]
+      dependencies: ["SBMShared"],
+      linkerSettings: [
+        .linkedFramework("Security"),
+        .linkedLibrary("bsm"),
+      ]
     ),
     .testTarget(
       name: "SBMTests",
-      dependencies: ["SBM", "SBMHelper", "SBMShared"]
+      dependencies: ["SBM", "SBMHelper", "SBMShared"],
+      exclude: ["Fixtures"]
     ),
   ]
 )

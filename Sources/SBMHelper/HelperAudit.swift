@@ -11,28 +11,28 @@ struct HelperPeerIdentity: Equatable, Sendable {
   let pid: pid_t?
   let uid: uid_t
   let executablePath: String?
-}
+  let processVersion: Int32?
+  let signingIdentifier: String?
+  let cdHash: String?
 
-enum HelperPeerIdentityResolver {
-  static func processID(for descriptor: Int32) -> pid_t? {
-    var pid: pid_t = 0
-    var length = socklen_t(MemoryLayout<pid_t>.size)
-    guard getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0,
-      pid > 0
-    else { return nil }
-    return pid
-  }
-
-  static func executablePath(for pid: pid_t?) -> String? {
-    guard let pid, pid > 0 else { return nil }
-    var buffer = [CChar](repeating: 0, count: 4096)
-    let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-    guard count > 0 else { return nil }
-    let bytes = buffer.prefix(Int(count)).prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-    let path = String(decoding: bytes, as: UTF8.self)
-    return path.isEmpty ? nil : path
+  init(
+    pid: pid_t?,
+    uid: uid_t,
+    executablePath: String?,
+    processVersion: Int32? = nil,
+    signingIdentifier: String? = nil,
+    cdHash: String? = nil
+  ) {
+    self.pid = pid
+    self.uid = uid
+    self.executablePath = executablePath
+    self.processVersion = processVersion
+    self.signingIdentifier = signingIdentifier
+    self.cdHash = cdHash
   }
 }
+
+enum HelperPeerIdentityResolver {}
 
 struct HelperAuditRecord: Equatable, Sendable {
   let action: HelperAction

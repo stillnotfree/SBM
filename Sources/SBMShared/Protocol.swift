@@ -2,11 +2,15 @@ import CryptoKit
 import Foundation
 
 public enum HelperConstants {
-  public static let protocolVersion = 11
-  public static let helperVersion = "1.1.3"
-  public static let helperRevision = 54
-  public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.sock"
-  public static let daemonPlistName = "com.stillnotfree.sbm.helper.plist"
+  public static let protocolVersion = 14
+  public static let helperVersion = "1.2.0"
+  public static let helperRevision = 76
+  public static let socketPath = "/var/run/com.stillnotfree.sbm.helper.v12.sock"
+  public static let daemonPlistName = "com.stillnotfree.sbm.helper.v12.plist"
+  public static let legacyDaemonPlistName = "com.stillnotfree.sbm.helper.plist"
+  public static let serviceLabelEnvironmentKey = "SBM_HELPER_SERVICE_LABEL"
+  public static let currentServiceLabel = "com.stillnotfree.sbm.helper.v12"
+  public static let legacyServiceLabel = "com.stillnotfree.sbm.helper"
 }
 
 public enum HelperAction: String, Codable, Sendable {
@@ -18,14 +22,13 @@ public enum HelperAction: String, Codable, Sendable {
   case setLatencyTarget
   case testLatency
   case validateProfile
-  case matchRuleSets
   case shutdown
+  case finishLegacy1115Upgrade
 }
 
 public enum HelperStopReason: String, Codable, Sendable {
   case userDisconnect
   case reconnectToApply
-  case helperReplacement
   case appTermination
   case automaticRecovery
   case other
@@ -49,6 +52,68 @@ public enum RoutingMode: String, Codable, CaseIterable, Hashable, Sendable {
   case rule = "Rule"
   case global = "Global"
   case direct = "Direct"
+}
+
+public enum ManagedDNSChoice: Codable, Hashable, Sendable {
+  case system
+  case cloudflare
+  case google
+  case yandex
+  case quad9
+  case adguard
+  case customDoH(String)
+}
+
+public struct ManagedDNSSettings: Codable, Equatable, Sendable {
+  public var direct: ManagedDNSChoice
+  public var proxy: ManagedDNSChoice
+
+  public static let defaults = ManagedDNSSettings(direct: .system, proxy: .cloudflare)
+  private static let maximumCustomDoHURLBytes = 4096
+
+  public init(direct: ManagedDNSChoice = .system, proxy: ManagedDNSChoice = .cloudflare) {
+    self.direct = direct
+    self.proxy = proxy
+  }
+
+  public func validated() throws -> Self {
+    guard proxy != .system else { throw Self.invalid }
+    return Self(direct: try Self.validated(direct), proxy: try Self.validated(proxy))
+  }
+
+  private static func validated(_ choice: ManagedDNSChoice) throws -> ManagedDNSChoice {
+    guard case .customDoH(let rawURL) = choice else { return choice }
+    let value = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard value.utf8.count <= maximumCustomDoHURLBytes,
+      let components = URLComponents(string: value),
+      let source = components.string
+    else {
+      throw invalid
+    }
+    guard source.utf8.count <= maximumCustomDoHURLBytes else { throw invalid }
+    if components.rangeOfPort == nil, let hostEnd = components.rangeOfHost?.upperBound,
+      hostEnd < source.endIndex, source[hostEnd] == ":"
+    {
+      throw invalid
+    }
+    if components.rangeOfPort != nil {
+      guard let port = components.port, (1...65535).contains(port) else { throw invalid }
+    }
+    guard components.scheme?.lowercased() == "https",
+      components.host?.isEmpty == false,
+      components.percentEncodedUser == nil, components.percentEncodedPassword == nil,
+      components.percentEncodedQuery == nil, components.percentEncodedFragment == nil,
+      components.percentEncodedPath.isEmpty || components.percentEncodedPath.hasPrefix("/"),
+      components.url?.host != nil
+    else {
+      throw invalid
+    }
+    return .customDoH(value)
+  }
+
+  private static let invalid = DecodingError.dataCorrupted(
+    .init(codingPath: [], debugDescription: "Invalid DNS.")
+  )
 }
 
 public struct ProxyNodeID: RawRepresentable, Codable, Hashable, Sendable {
@@ -76,7 +141,6 @@ public enum ProxyNodeKind: String, Codable, Equatable, Hashable, Sendable {
   case vless
   case hysteria2
   case shadowsocks
-  case native
   case unknown
 }
 
@@ -85,7 +149,7 @@ public struct ProxyNodeDescriptor: Codable, Equatable, Hashable, Sendable {
   public let name: String
   public let kind: ProxyNodeKind
 
-  public init(id: ProxyNodeID, name: String, kind: ProxyNodeKind = .native) {
+  public init(id: ProxyNodeID, name: String, kind: ProxyNodeKind = .unknown) {
     self.id = id
     self.name = name
     self.kind = kind
@@ -103,11 +167,19 @@ public struct ProxyNodeDescriptor: Codable, Equatable, Hashable, Sendable {
 
 public enum VLESSProfileVariant: Equatable, Sendable {
   case reality(publicKey: String, shortID: String)
+  case realityGRPC(publicKey: String, shortID: String, serviceName: String)
+  case tlsTCP
+  case tlsHTTP(host: String?, path: String?)
   case tlsGRPC(serviceName: String)
+  case tlsWebSocket(host: String?, path: String?)
+  case tlsQUIC
+  case tlsHTTPUpgrade(host: String?, path: String?)
 
   public var isReality: Bool {
-    if case .reality = self { return true }
-    return false
+    switch self {
+    case .reality, .realityGRPC: true
+    default: false
+    }
   }
 }
 
@@ -125,20 +197,26 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
   public let variant: VLESSProfileVariant
 
   /// Compatibility views for the released REALITY-shaped model. They are
-  /// empty for TLS + gRPC and must not be used to build that variant.
+  /// empty for TLS profiles and must not be used to build those variants.
   public var publicKey: String {
-    guard case .reality(let publicKey, _) = variant else { return "" }
-    return publicKey
+    switch variant {
+    case .reality(let publicKey, _), .realityGRPC(let publicKey, _, _): publicKey
+    default: ""
+    }
   }
 
   public var shortID: String {
-    guard case .reality(_, let shortID) = variant else { return "" }
-    return shortID
+    switch variant {
+    case .reality(_, let shortID), .realityGRPC(_, let shortID, _): shortID
+    default: ""
+    }
   }
 
   public var grpcServiceName: String? {
-    guard case .tlsGRPC(let serviceName) = variant else { return nil }
-    return serviceName
+    switch variant {
+    case .tlsGRPC(let serviceName), .realityGRPC(_, _, let serviceName): serviceName
+    default: nil
+    }
   }
 
   public init(
@@ -178,7 +256,7 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case server, port, uuid, serverName, fingerprint, publicKey, shortID
-    case security, type, serviceName
+    case security, type, serviceName, host, path
   }
 
   public init(from decoder: Decoder) throws {
@@ -190,16 +268,43 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
     fingerprint = try container.decode(String.self, forKey: .fingerprint)
 
     if let security = try container.decodeIfPresent(String.self, forKey: .security) {
-      guard security == "tls",
-        try container.decode(String.self, forKey: .type) == "grpc"
-      else {
-        throw DecodingError.dataCorruptedError(
-          forKey: .security,
-          in: container,
-          debugDescription: "Unsupported VLESS managed security or transport."
+      let type = try container.decode(String.self, forKey: .type)
+      let hasRealityFields = container.contains(.publicKey) || container.contains(.shortID)
+      let hasTransportFields = container.contains(.host) || container.contains(.path)
+      let hasServiceName = container.contains(.serviceName)
+      let invalid = DecodingError.dataCorruptedError(
+        forKey: .security,
+        in: container,
+        debugDescription: "Unsupported VLESS managed security or transport."
+      )
+      switch (security, type) {
+      case ("tls", "grpc"):
+        guard !hasRealityFields, !hasTransportFields else { throw invalid }
+        variant = .tlsGRPC(serviceName: try container.decode(String.self, forKey: .serviceName))
+      case ("reality", "grpc"):
+        guard !hasTransportFields else { throw invalid }
+        variant = .realityGRPC(
+          publicKey: try container.decode(String.self, forKey: .publicKey),
+          shortID: try container.decode(String.self, forKey: .shortID),
+          serviceName: try container.decode(String.self, forKey: .serviceName)
         )
+      case ("tls", "tcp"):
+        guard !hasRealityFields, !hasTransportFields, !hasServiceName else { throw invalid }
+        variant = .tlsTCP
+      case ("tls", "http"), ("tls", "ws"), ("tls", "httpupgrade"):
+        guard !hasRealityFields, !hasServiceName else { throw invalid }
+        let host = try container.decodeIfPresent(String.self, forKey: .host)
+        let path = try container.decodeIfPresent(String.self, forKey: .path)
+        switch type {
+        case "http": variant = .tlsHTTP(host: host, path: path)
+        case "ws": variant = .tlsWebSocket(host: host, path: path)
+        default: variant = .tlsHTTPUpgrade(host: host, path: path)
+        }
+      case ("tls", "quic"):
+        guard !hasRealityFields, !hasTransportFields, !hasServiceName else { throw invalid }
+        variant = .tlsQUIC
+      default: throw invalid
       }
-      variant = .tlsGRPC(serviceName: try container.decode(String.self, forKey: .serviceName))
     } else {
       if let type = try container.decodeIfPresent(String.self, forKey: .type), type != "tcp" {
         throw DecodingError.dataCorruptedError(
@@ -228,11 +333,50 @@ public struct VLESSProfile: Codable, Equatable, Sendable {
       // equivalent in meaning and readable by older migration DTOs.
       try container.encode(publicKey, forKey: .publicKey)
       try container.encode(shortID, forKey: .shortID)
-    case .tlsGRPC(let serviceName):
-      try container.encode("tls", forKey: .security)
-      try container.encode("grpc", forKey: .type)
+    case .realityGRPC(let publicKey, let shortID, let serviceName):
+      try encodeTransport("reality", type: "grpc", into: &container)
+      try container.encode(publicKey, forKey: .publicKey)
+      try container.encode(shortID, forKey: .shortID)
       try container.encode(serviceName, forKey: .serviceName)
+    case .tlsTCP:
+      try encodeTransport("tls", type: "tcp", into: &container)
+    case .tlsHTTP(let host, let path):
+      try encodeTransport("tls", type: "http", into: &container)
+      try container.encodeIfPresent(host, forKey: .host)
+      try container.encodeIfPresent(path, forKey: .path)
+    case .tlsGRPC(let serviceName):
+      try encodeTransport("tls", type: "grpc", into: &container)
+      try container.encode(serviceName, forKey: .serviceName)
+    case .tlsWebSocket(let host, let path):
+      try encodeTransport("tls", type: "ws", into: &container)
+      try container.encodeIfPresent(host, forKey: .host)
+      try container.encodeIfPresent(path, forKey: .path)
+    case .tlsQUIC:
+      try encodeTransport("tls", type: "quic", into: &container)
+    case .tlsHTTPUpgrade(let host, let path):
+      try encodeTransport("tls", type: "httpupgrade", into: &container)
+      try container.encodeIfPresent(host, forKey: .host)
+      try container.encodeIfPresent(path, forKey: .path)
     }
+  }
+
+  private func encodeTransport(
+    _ security: String,
+    type: String,
+    into container: inout KeyedEncodingContainer<CodingKeys>
+  ) throws {
+    try container.encode(security, forKey: .security)
+    try container.encode(type, forKey: .type)
+  }
+}
+
+public struct Hysteria2PortRange: Codable, Equatable, Sendable {
+  public let start: UInt16
+  public let end: UInt16
+
+  public init(start: UInt16, end: UInt16) {
+    self.start = start
+    self.end = end
   }
 }
 
@@ -242,19 +386,22 @@ public struct Hysteria2Profile: Codable, Equatable, Sendable {
   public let password: String
   public let serverName: String
   public let obfsPassword: String?
+  public let portHoppingRanges: [Hysteria2PortRange]?
 
   public init(
     server: String,
     port: UInt16,
     password: String,
     serverName: String,
-    obfsPassword: String? = nil
+    obfsPassword: String? = nil,
+    portHoppingRanges: [Hysteria2PortRange]? = nil
   ) {
     self.server = server
     self.port = port
     self.password = password
     self.serverName = serverName
     self.obfsPassword = obfsPassword
+    self.portHoppingRanges = portHoppingRanges
   }
 }
 
@@ -269,174 +416,6 @@ public struct ShadowsocksProfile: Codable, Equatable, Sendable {
     self.port = port
     self.method = method
     self.password = password
-  }
-}
-
-/// Decoder-only representation used at the boundary for profile libraries
-/// written before managed connections became the sole current representation.
-/// It is intentionally not used by the runtime model or current encoder.
-public enum LegacyCoreProfileDTO: Decodable, Sendable {
-  case compatibility(LegacyVPNProfileDTO)
-  case native(NativeProfile)
-
-  private struct Wrapper<Value: Decodable>: Decodable {
-    let value: Value
-
-    private enum CodingKeys: String, CodingKey { case value = "_0" }
-  }
-
-  private enum CodingKeys: String, CodingKey { case compatibility, native }
-
-  public init(from decoder: Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    if let wrapped = try container.decodeIfPresent(
-      Wrapper<LegacyVPNProfileDTO>.self,
-      forKey: .compatibility
-    ) {
-      self = .compatibility(wrapped.value)
-    } else if let native = try container.decodeIfPresent(NativeProfile.self, forKey: .native) {
-      self = .native(native)
-    } else {
-      throw DecodingError.dataCorruptedError(
-        forKey: .compatibility,
-        in: container,
-        debugDescription: "Legacy profile payload has no supported kind."
-      )
-    }
-  }
-
-  public func currentProfile() -> CoreProfile {
-    switch self {
-    case .compatibility(let value): .compatibility(value.currentProfile())
-    case .native(let value): .native(value)
-    }
-  }
-}
-
-public struct LegacyVPNProfileDTO: Decodable, Sendable {
-  public let vless: [LegacyVLESSProfileDTO]
-  public let hysteria2: [LegacyHysteria2ProfileDTO]
-  public let shadowsocks: [LegacyShadowsocksProfileDTO]
-  public let routingPolicy: RoutingPolicy?
-  public let nodeGroups: [ProxyNodeGroup]?
-  public let applicationRoutingRules: [ApplicationRoutingRule]
-  public let websiteRoutingRules: [WebsiteRoutingRule]
-
-  private enum CodingKeys: String, CodingKey {
-    case vless, hysteria2, shadowsocks, routingPolicy, nodeGroups, applicationRoutingRules,
-      websiteRoutingRules
-  }
-
-  public init(from decoder: Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    vless = try container.decodeIfPresent([LegacyVLESSProfileDTO].self, forKey: .vless) ?? []
-    hysteria2 =
-      try container.decodeIfPresent([LegacyHysteria2ProfileDTO].self, forKey: .hysteria2) ?? []
-    shadowsocks =
-      try container.decodeIfPresent([LegacyShadowsocksProfileDTO].self, forKey: .shadowsocks)
-      ?? []
-    routingPolicy = try container.decodeIfPresent(RoutingPolicy.self, forKey: .routingPolicy)
-    nodeGroups = try container.decodeIfPresent([ProxyNodeGroup].self, forKey: .nodeGroups)
-    applicationRoutingRules =
-      try container.decodeIfPresent(
-        [ApplicationRoutingRule].self,
-        forKey: .applicationRoutingRules
-      ) ?? []
-    websiteRoutingRules =
-      try container.decodeIfPresent(
-        [WebsiteRoutingRule].self,
-        forKey: .websiteRoutingRules
-      ) ?? []
-  }
-
-  public func currentProfile() -> VPNProfile {
-    let vless = vless.enumerated().map { entry in
-      ManagedConnection(
-        id: ProxyNodeID(rawValue: "vless-\(entry.offset + 1)"),
-        displayName: entry.element.displayName,
-        outbound: .vless(entry.element.currentProfile())
-      )
-    }
-    let hysteria2 = hysteria2.enumerated().map { entry in
-      ManagedConnection(
-        id: ProxyNodeID(rawValue: "hysteria2-\(entry.offset + 1)"),
-        displayName: entry.element.displayName,
-        outbound: .hysteria2(entry.element.currentProfile())
-      )
-    }
-    let shadowsocks = shadowsocks.enumerated().map { entry in
-      ManagedConnection(
-        id: ProxyNodeID(rawValue: "shadowsocks-\(entry.offset + 1)"),
-        displayName: entry.element.displayName,
-        outbound: .shadowsocks(entry.element.currentProfile())
-      )
-    }
-    return VPNProfile(
-      connections: vless + hysteria2 + shadowsocks,
-      routingPolicy: routingPolicy,
-      nodeGroups: nodeGroups ?? [],
-      applicationRoutingRules: applicationRoutingRules,
-      websiteRoutingRules: websiteRoutingRules
-    )
-  }
-}
-
-public struct LegacyVLESSProfileDTO: Decodable, Sendable {
-  public let server: String
-  public let port: UInt16
-  public let uuid: String
-  public let serverName: String
-  public let fingerprint: String
-  public let publicKey: String
-  public let shortID: String
-  public let displayName: String
-
-  public func currentProfile() -> VLESSProfile {
-    VLESSProfile(
-      server: server,
-      port: port,
-      uuid: uuid,
-      serverName: serverName,
-      fingerprint: fingerprint,
-      publicKey: publicKey,
-      shortID: shortID
-    )
-  }
-}
-
-public struct LegacyHysteria2ProfileDTO: Decodable, Sendable {
-  public let server: String
-  public let port: UInt16
-  public let password: String
-  public let serverName: String
-  public let obfsPassword: String?
-  public let displayName: String
-
-  public func currentProfile() -> Hysteria2Profile {
-    Hysteria2Profile(
-      server: server,
-      port: port,
-      password: password,
-      serverName: serverName,
-      obfsPassword: obfsPassword
-    )
-  }
-}
-
-public struct LegacyShadowsocksProfileDTO: Decodable, Sendable {
-  public let server: String
-  public let port: UInt16
-  public let method: String
-  public let password: String
-  public let displayName: String
-
-  public func currentProfile() -> ShadowsocksProfile {
-    ShadowsocksProfile(
-      server: server,
-      port: port,
-      method: method,
-      password: password
-    )
   }
 }
 
@@ -470,12 +449,34 @@ public enum ManagedOutbound: Codable, Equatable, Sendable {
           "vless", "tls-grpc", canonicalHost(value.server), String(value.port),
           value.uuid.lowercased(), canonicalHost(value.serverName), value.fingerprint, serviceName,
         ])
+      case .realityGRPC(let publicKey, let shortID, let serviceName):
+        return vlessIdentity(
+          value, variant: "reality-grpc",
+          values: [publicKey, shortID.lowercased(), serviceName]
+        )
+      case .tlsTCP:
+        return vlessIdentity(value, variant: "tls-tcp", values: [])
+      case .tlsHTTP(let host, let path):
+        return vlessIdentity(value, variant: "tls-http", values: [host ?? "", path ?? ""])
+      case .tlsWebSocket(let host, let path):
+        return vlessIdentity(value, variant: "tls-ws", values: [host ?? "", path ?? ""])
+      case .tlsQUIC:
+        return vlessIdentity(value, variant: "tls-quic", values: [])
+      case .tlsHTTPUpgrade(let host, let path):
+        return vlessIdentity(
+          value, variant: "tls-httpupgrade", values: [host ?? "", path ?? ""]
+        )
       }
     case .hysteria2(let value):
-      return canonicalIdentity([
+      let parts = [
         "hysteria2", canonicalHost(value.server), String(value.port), value.password,
         canonicalHost(value.serverName), value.obfsPassword ?? "",
-      ])
+      ]
+      guard let ranges = value.portHoppingRanges else {
+        return canonicalIdentity(parts)
+      }
+      let canonicalRanges = ranges.map { "\($0.start):\($0.end)" }.joined(separator: ",")
+      return canonicalIdentity(parts + [canonicalRanges])
     case .shadowsocks(let value):
       return canonicalIdentity([
         "shadowsocks", canonicalHost(value.server), String(value.port), value.method.lowercased(),
@@ -496,6 +497,14 @@ public enum ManagedOutbound: Codable, Equatable, Sendable {
 
   private func canonicalHost(_ value: String) -> String {
     value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+  }
+
+  private func vlessIdentity(_ value: VLESSProfile, variant: String, values: [String]) -> String {
+    canonicalIdentity(
+      [
+        "vless", variant, canonicalHost(value.server), String(value.port), value.uuid.lowercased(),
+        canonicalHost(value.serverName), value.fingerprint,
+      ] + values)
   }
 
   private enum CodingKeys: String, CodingKey { case kind, vless, hysteria2, shadowsocks }
@@ -627,23 +636,27 @@ public struct VPNProfile: Codable, Equatable, Sendable {
   public let nodeGroups: [ProxyNodeGroup]?
   public let applicationRoutingRules: [ApplicationRoutingRule]
   public let websiteRoutingRules: [WebsiteRoutingRule]
+  public let autoExcludedNodeIDs: [ProxyNodeID]
 
   public init(
     connections: [ManagedConnection],
     routingPolicy: RoutingPolicy? = nil,
     nodeGroups: [ProxyNodeGroup] = [],
     applicationRoutingRules: [ApplicationRoutingRule] = [],
-    websiteRoutingRules: [WebsiteRoutingRule] = []
+    websiteRoutingRules: [WebsiteRoutingRule] = [],
+    autoExcludedNodeIDs: [ProxyNodeID] = []
   ) {
     self.connections = connections
     self.routingPolicy = routingPolicy
     self.nodeGroups = nodeGroups
     self.applicationRoutingRules = applicationRoutingRules
     self.websiteRoutingRules = websiteRoutingRules
+    self.autoExcludedNodeIDs = autoExcludedNodeIDs
   }
 
   private enum CodingKeys: String, CodingKey {
     case connections, routingPolicy, nodeGroups, applicationRoutingRules, websiteRoutingRules
+    case autoExcludedNodeIDs
   }
 
   public init(from decoder: Decoder) throws {
@@ -660,6 +673,8 @@ public struct VPNProfile: Codable, Equatable, Sendable {
         [WebsiteRoutingRule].self,
         forKey: .websiteRoutingRules
       ) ?? []
+    autoExcludedNodeIDs =
+      try container.decodeIfPresent([ProxyNodeID].self, forKey: .autoExcludedNodeIDs) ?? []
     if let connections = try container.decodeIfPresent(
       [ManagedConnection].self, forKey: .connections)
     {
@@ -682,64 +697,16 @@ public struct VPNProfile: Codable, Equatable, Sendable {
     try container.encodeIfPresent(nodeGroups, forKey: .nodeGroups)
     try container.encode(applicationRoutingRules, forKey: .applicationRoutingRules)
     try container.encode(websiteRoutingRules, forKey: .websiteRoutingRules)
-  }
-}
-
-public struct NativeProfile: Codable, Equatable, Sendable {
-  public let configuration: Data
-  public let selectorTag: String
-  public let nodes: [ProxyNodeDescriptor]
-  public let applicationRoutingRules: [ApplicationRoutingRule]
-  public let websiteRoutingRules: [WebsiteRoutingRule]
-
-  public init(
-    configuration: Data,
-    selectorTag: String,
-    nodes: [ProxyNodeDescriptor],
-    applicationRoutingRules: [ApplicationRoutingRule] = [],
-    websiteRoutingRules: [WebsiteRoutingRule] = []
-  ) {
-    self.configuration = configuration
-    self.selectorTag = selectorTag
-    self.nodes = nodes
-    self.applicationRoutingRules = applicationRoutingRules
-    self.websiteRoutingRules = websiteRoutingRules
-  }
-
-  private enum CodingKeys: String, CodingKey {
-    case configuration, selectorTag, nodes, applicationRoutingRules, websiteRoutingRules
-  }
-
-  public init(from decoder: Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    configuration = try container.decode(Data.self, forKey: .configuration)
-    selectorTag = try container.decode(String.self, forKey: .selectorTag)
-    nodes = try container.decode([ProxyNodeDescriptor].self, forKey: .nodes)
-    applicationRoutingRules =
-      try container.decodeIfPresent(
-        [ApplicationRoutingRule].self,
-        forKey: .applicationRoutingRules
-      ) ?? []
-    websiteRoutingRules =
-      try container.decodeIfPresent(
-        [WebsiteRoutingRule].self,
-        forKey: .websiteRoutingRules
-      ) ?? []
-  }
-
-  public func encode(to encoder: Encoder) throws {
-    var container = encoder.container(keyedBy: CodingKeys.self)
-    try container.encode(configuration, forKey: .configuration)
-    try container.encode(selectorTag, forKey: .selectorTag)
-    try container.encode(nodes, forKey: .nodes)
-    try container.encode(applicationRoutingRules, forKey: .applicationRoutingRules)
-    try container.encode(websiteRoutingRules, forKey: .websiteRoutingRules)
+    let orderedExclusions =
+      connections.flatMap { connection in
+        autoExcludedNodeIDs.filter { $0 == connection.id }
+      } + autoExcludedNodeIDs.filter { id in !connections.contains { $0.id == id } }
+    try container.encode(orderedExclusions, forKey: .autoExcludedNodeIDs)
   }
 }
 
 public enum CoreProfile: Codable, Equatable, Sendable {
   case compatibility(VPNProfile)
-  case native(NativeProfile)
 
   public var nodes: [ProxyNodeDescriptor] {
     switch self {
@@ -755,22 +722,18 @@ public enum CoreProfile: Codable, Equatable, Sendable {
         )
       }
       return nodes
-    case .native(let profile):
-      return profile.nodes
     }
   }
 
   public var applicationRoutingRules: [ApplicationRoutingRule] {
     switch self {
     case .compatibility(let profile): profile.applicationRoutingRules
-    case .native(let profile): profile.applicationRoutingRules
     }
   }
 
   public var websiteRoutingRules: [WebsiteRoutingRule] {
     switch self {
     case .compatibility(let profile): profile.websiteRoutingRules
-    case .native(let profile): profile.websiteRoutingRules
     }
   }
 }
@@ -785,16 +748,6 @@ public struct NodeDelay: Codable, Sendable {
   }
 }
 
-public struct RuleSetMatch: Codable, Equatable, Sendable {
-  public let tag: String
-  public let matches: Bool
-
-  public init(tag: String, matches: Bool) {
-    self.tag = tag
-    self.matches = matches
-  }
-}
-
 public struct HelperRequest: Codable, Sendable {
   public let protocolVersion: Int
   public let action: HelperAction
@@ -806,9 +759,10 @@ public struct HelperRequest: Codable, Sendable {
   public let localSOCKSPort: UInt16?
   public let latencyTestURL: String?
   public let ipv6Enabled: Bool?
-  public let ruleSetTags: [String]?
-  public let routingDestination: String?
   public let stopReason: HelperStopReason?
+  public let observeAutoNode: Bool?
+  public let recoverDesiredRuntime: Bool?
+  public let dnsSettings: ManagedDNSSettings?
 
   public init(
     action: HelperAction,
@@ -820,9 +774,10 @@ public struct HelperRequest: Codable, Sendable {
     localSOCKSPort: UInt16? = nil,
     latencyTestURL: String? = nil,
     ipv6Enabled: Bool? = nil,
-    ruleSetTags: [String]? = nil,
-    routingDestination: String? = nil,
-    stopReason: HelperStopReason? = nil
+    stopReason: HelperStopReason? = nil,
+    observeAutoNode: Bool? = nil,
+    recoverDesiredRuntime: Bool? = nil,
+    dnsSettings: ManagedDNSSettings? = nil
   ) {
     self.protocolVersion = HelperConstants.protocolVersion
     self.action = action
@@ -834,9 +789,10 @@ public struct HelperRequest: Codable, Sendable {
     self.localSOCKSPort = localSOCKSPort
     self.latencyTestURL = latencyTestURL
     self.ipv6Enabled = ipv6Enabled
-    self.ruleSetTags = ruleSetTags
-    self.routingDestination = routingDestination
     self.stopReason = stopReason
+    self.observeAutoNode = observeAutoNode
+    self.recoverDesiredRuntime = recoverDesiredRuntime
+    self.dnsSettings = dnsSettings
   }
 }
 
@@ -849,6 +805,7 @@ public struct HelperResponse: Codable, Sendable {
   public let coreVersion: String?
   public let mode: RoutingMode
   public let selectedNode: ProxyNodeID
+  public let effectiveAutoNode: ProxyNodeID?
   public let activeProfileID: UUID?
   /// The IPv6 policy in the configuration currently used by a running core.
   /// `nil` means the core is stopped or the authoritative policy is unknown.
@@ -857,8 +814,8 @@ public struct HelperResponse: Codable, Sendable {
   public let delays: [NodeDelay]
   /// `true` requires an explicit user connection before recovery can retry.
   public let automaticRecoveryExhausted: Bool
-  public let ruleSetMatches: [RuleSetMatch]
   public let runtimeOutcome: HelperRuntimeOutcome
+  public let legacy1115Retired: Bool?
   public let message: String
 
   public init(
@@ -867,13 +824,14 @@ public struct HelperResponse: Codable, Sendable {
     coreVersion: String? = nil,
     mode: RoutingMode = .rule,
     selectedNode: ProxyNodeID = .auto,
+    effectiveAutoNode: ProxyNodeID? = nil,
     activeProfileID: UUID? = nil,
     activeIPv6Enabled: Bool? = nil,
     nodes: [ProxyNodeDescriptor] = [],
     delays: [NodeDelay] = [],
     automaticRecoveryExhausted: Bool = false,
-    ruleSetMatches: [RuleSetMatch] = [],
     runtimeOutcome: HelperRuntimeOutcome = .applied,
+    legacy1115Retired: Bool?,
     message: String
   ) {
     self.protocolVersion = HelperConstants.protocolVersion
@@ -884,13 +842,14 @@ public struct HelperResponse: Codable, Sendable {
     self.coreVersion = coreVersion
     self.mode = mode
     self.selectedNode = selectedNode
+    self.effectiveAutoNode = effectiveAutoNode
     self.activeProfileID = activeProfileID
     self.activeIPv6Enabled = activeIPv6Enabled
     self.nodes = nodes
     self.delays = delays
     self.automaticRecoveryExhausted = automaticRecoveryExhausted
-    self.ruleSetMatches = ruleSetMatches
     self.runtimeOutcome = runtimeOutcome
+    self.legacy1115Retired = legacy1115Retired
     self.message = message
   }
 
@@ -903,13 +862,14 @@ public struct HelperResponse: Codable, Sendable {
     case coreVersion
     case mode
     case selectedNode
+    case effectiveAutoNode
     case activeProfileID
     case activeIPv6Enabled
     case nodes
     case delays
     case automaticRecoveryExhausted
-    case ruleSetMatches
     case runtimeOutcome
+    case legacy1115Retired
     case message
   }
 
@@ -923,16 +883,16 @@ public struct HelperResponse: Codable, Sendable {
     coreVersion = try container.decodeIfPresent(String.self, forKey: .coreVersion)
     mode = try container.decode(RoutingMode.self, forKey: .mode)
     selectedNode = try container.decode(ProxyNodeID.self, forKey: .selectedNode)
+    effectiveAutoNode = try container.decodeIfPresent(ProxyNodeID.self, forKey: .effectiveAutoNode)
     activeProfileID = try container.decodeIfPresent(UUID.self, forKey: .activeProfileID)
     activeIPv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .activeIPv6Enabled)
     nodes = try container.decode([ProxyNodeDescriptor].self, forKey: .nodes)
     delays = try container.decode([NodeDelay].self, forKey: .delays)
     automaticRecoveryExhausted =
       try container.decodeIfPresent(Bool.self, forKey: .automaticRecoveryExhausted) ?? false
-    ruleSetMatches =
-      try container.decodeIfPresent([RuleSetMatch].self, forKey: .ruleSetMatches) ?? []
     runtimeOutcome =
       try container.decodeIfPresent(HelperRuntimeOutcome.self, forKey: .runtimeOutcome) ?? .applied
+    legacy1115Retired = try container.decodeIfPresent(Bool.self, forKey: .legacy1115Retired)
     message = try container.decode(String.self, forKey: .message)
   }
 }

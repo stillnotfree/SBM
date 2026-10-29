@@ -2,38 +2,48 @@ import Foundation
 import SBMShared
 
 struct SubscriptionHeaders: Codable, Equatable, Sendable {
-  /// Exact stable client-identification fields observed in a Happ 5.4.0 iOS request capture.
-  static let defaultUserAgent = "Happ/5.4.0/ios/2607311456556"
-  static let defaultAppVersion = "5.4.0"
+  static let defaultUserAgent =
+    "Shadowrocket/3445 CFNetwork/3860.700.2 Darwin/25.6.0 iPhone17,1"
+  static let defaultAppVersion: String? = nil
   static let defaultDeviceOS = "iOS"
+  static let defaultDeviceOSVersion: String? = "26.7"
+  static let defaultDeviceModel: String? = "iPhone"
 
   var userAgent: String
   var appVersion: String?
   var deviceOS: String
+  var deviceOSVersion: String?
+  var deviceModel: String?
   var hardwareID: String
 
   init(
     userAgent: String = Self.defaultUserAgent,
     appVersion: String? = Self.defaultAppVersion,
     deviceOS: String = Self.defaultDeviceOS,
+    deviceOSVersion: String? = Self.defaultDeviceOSVersion,
+    deviceModel: String? = Self.defaultDeviceModel,
     hardwareID: String = Self.makeHardwareID()
   ) {
     self.userAgent = userAgent
     self.appVersion = appVersion
     self.deviceOS = deviceOS
+    self.deviceOSVersion = deviceOSVersion
+    self.deviceModel = deviceModel
     self.hardwareID = hardwareID
   }
 
   private enum CodingKeys: String, CodingKey {
-    case userAgent, appVersion, deviceOS, hardwareID
+    case userAgent, appVersion, deviceOS, deviceOSVersion, deviceModel, hardwareID
   }
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     userAgent = try container.decode(String.self, forKey: .userAgent)
-    // Missing means a pre-preset source. Do not silently add a new request header.
     appVersion = try container.decodeIfPresent(String.self, forKey: .appVersion)
     deviceOS = try container.decode(String.self, forKey: .deviceOS)
+    // Old schema-11 sources stay without newly introduced request identity values.
+    deviceOSVersion = try container.decodeIfPresent(String.self, forKey: .deviceOSVersion)
+    deviceModel = try container.decodeIfPresent(String.self, forKey: .deviceModel)
     hardwareID = try container.decode(String.self, forKey: .hardwareID)
   }
 
@@ -46,6 +56,8 @@ struct SubscriptionHeaders: Codable, Equatable, Sendable {
       userAgent: Self.defaultUserAgent,
       appVersion: Self.defaultAppVersion,
       deviceOS: Self.defaultDeviceOS,
+      deviceOSVersion: Self.defaultDeviceOSVersion,
+      deviceModel: Self.defaultDeviceModel,
       hardwareID: hardwareID
     )
   }
@@ -83,8 +95,19 @@ enum SourceNameFilter {
   static let maximumPatternLength = 512
 
   static func normalized(_ value: String) throws -> String? {
+    try normalizedAndCompiled(value).pattern
+  }
+
+  static func matcher(for value: String?) throws -> NSRegularExpression? {
+    try normalizedAndCompiled(value).expression
+  }
+
+  private static func normalizedAndCompiled(
+    _ value: String?
+  ) throws -> (pattern: String?, expression: NSRegularExpression?) {
+    guard let value else { return (nil, nil) }
     let pattern = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !pattern.isEmpty else { return nil }
+    guard !pattern.isEmpty else { return (nil, nil) }
     guard pattern.utf8.count <= maximumPatternLength,
       !pattern.unicodeScalars.contains(where: {
         CharacterSet.controlCharacters.contains($0)
@@ -93,16 +116,11 @@ enum SourceNameFilter {
       throw SubscriptionFailure.invalidExcludeRegex
     }
     do {
-      _ = try NSRegularExpression(pattern: pattern)
-      return pattern
+      let expression = try NSRegularExpression(pattern: pattern)
+      return (pattern, expression)
     } catch {
       throw SubscriptionFailure.invalidExcludeRegex
     }
-  }
-
-  static func matcher(for value: String?) throws -> NSRegularExpression? {
-    guard let value, let pattern = try normalized(value) else { return nil }
-    return try NSRegularExpression(pattern: pattern)
   }
 
   static func excludes(_ name: String, using expression: NSRegularExpression?) -> Bool {
@@ -134,89 +152,6 @@ struct ManagedProfile: Codable, Equatable, Identifiable, Sendable {
   }
 }
 
-private struct LegacyManagedSourceDTO: Decodable {
-  let id: UUID
-  let name: String
-  let value: String
-  let headers: SubscriptionHeaders
-  let excludeRegex: String?
-  let payload: LegacyCoreProfileDTO?
-  let updatedAt: Date?
-
-  func currentSource() -> ManagedSource {
-    ManagedSource(
-      id: id,
-      name: name,
-      value: value,
-      headers: headers,
-      excludeRegex: excludeRegex,
-      payload: payload?.currentProfile(),
-      updatedAt: updatedAt
-    )
-  }
-}
-
-private struct LegacyManagedProfileDTO: Decodable {
-  let id: UUID
-  let name: String
-  let sources: [LegacyManagedSourceDTO]
-  let payload: LegacyCoreProfileDTO?
-  let updatedAt: Date?
-
-  func currentProfile() -> ManagedProfile {
-    ManagedProfile(
-      id: id,
-      name: name,
-      sources: sources.map { $0.currentSource() },
-      payload: payload?.currentProfile(),
-      updatedAt: updatedAt
-    )
-  }
-}
-
-private struct LegacyProfileLibraryDTO: Decodable {
-  let profiles: [LegacyManagedProfileDTO]
-  let selectedProfileID: UUID?
-  let localSOCKSEnabled: Bool
-  let localSOCKSPort: UInt16
-  let latencyIntervalMinutes: Int
-  let latencyTestURL: String
-  let ipv6Enabled: Bool
-
-  private enum CodingKeys: String, CodingKey {
-    case profiles, selectedProfileID, localSOCKSEnabled, localSOCKSPort, latencyIntervalMinutes,
-      latencyTestURL, ipv6Enabled
-  }
-
-  init(from decoder: Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    profiles = try container.decode([LegacyManagedProfileDTO].self, forKey: .profiles)
-    selectedProfileID = try container.decodeIfPresent(UUID.self, forKey: .selectedProfileID)
-    localSOCKSEnabled =
-      try container.decodeIfPresent(Bool.self, forKey: .localSOCKSEnabled) ?? false
-    localSOCKSPort = try container.decodeIfPresent(UInt16.self, forKey: .localSOCKSPort) ?? 1082
-    latencyIntervalMinutes =
-      max(try container.decodeIfPresent(Int.self, forKey: .latencyIntervalMinutes) ?? 10, 1)
-    latencyTestURL = try LatencyTargetPolicy.normalized(
-      try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
-        ?? LatencyTargetPolicy.defaultURL
-    )
-    ipv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .ipv6Enabled) ?? false
-  }
-
-  func currentLibrary() -> ProfileLibrary {
-    ProfileLibrary(
-      profiles: profiles.map { $0.currentProfile() },
-      selectedProfileID: selectedProfileID,
-      localSOCKSEnabled: localSOCKSEnabled,
-      localSOCKSPort: localSOCKSPort,
-      latencyIntervalMinutes: latencyIntervalMinutes,
-      latencyTestURL: latencyTestURL,
-      ipv6Enabled: ipv6Enabled
-    )
-  }
-}
-
 enum ProfileAggregator {
   static func merge(
     sources: [ManagedSource],
@@ -229,8 +164,9 @@ enum ProfileAggregator {
 
     for source in sources {
       guard let payload = source.payload else { continue }
-      guard case .compatibility(let profile) = payload else {
-        throw SubscriptionFailure.nativeProfileCannotBeMerged
+      let profile: VPNProfile
+      switch payload {
+      case .compatibility(let managedProfile): profile = managedProfile
       }
       let sourceName = try SubscriptionClient.validateDisplayName(source.name)
       let filter = try SourceNameFilter.matcher(for: source.excludeRegex)
@@ -271,99 +207,113 @@ enum ProfileAggregator {
   }
 }
 
+enum ProfileLibrarySchemaMismatch: Error {
+  case legacy(version: Int?)
+  case unsupportedFuture(version: Int)
+}
+
 struct ProfileLibrary: Codable, Equatable, Sendable {
   var profiles: [ManagedProfile]
   var selectedProfileID: UUID?
+  var routingMode: RoutingMode
+  var selectedNodeID: ProxyNodeID
   var localSOCKSEnabled: Bool
   var localSOCKSPort: UInt16
   var latencyIntervalMinutes: Int
   var latencyTestURL: String
   var ipv6Enabled: Bool
-  /// Not encoded. ProfileStore writes the upgraded schema before it is used.
-  var requiresMigration = false
+  var dnsSettings: ManagedDNSSettings
 
-  static let currentSchemaVersion = 6
+  static let currentSchemaVersion = 11
 
   private enum CodingKeys: String, CodingKey {
     case profiles
     case selectedProfileID
+    case routingMode
+    case selectedNodeID
     case localSOCKSEnabled
     case localSOCKSPort
     case latencyIntervalMinutes
     case latencyTestURL
     case ipv6Enabled
+    case dnsSettings
     case schemaVersion
   }
 
   init(
     profiles: [ManagedProfile],
     selectedProfileID: UUID?,
+    routingMode: RoutingMode = .rule,
+    selectedNodeID: ProxyNodeID = .auto,
     localSOCKSEnabled: Bool = false,
     localSOCKSPort: UInt16 = 1082,
     latencyIntervalMinutes: Int = 10,
     latencyTestURL: String = LatencyTargetPolicy.defaultURL,
-    ipv6Enabled: Bool = false
+    ipv6Enabled: Bool = false,
+    dnsSettings: ManagedDNSSettings = .defaults
   ) {
     self.profiles = profiles
     self.selectedProfileID = selectedProfileID
+    self.routingMode = routingMode
+    self.selectedNodeID = selectedNodeID
     self.localSOCKSEnabled = localSOCKSEnabled
     self.localSOCKSPort = localSOCKSPort
     self.latencyIntervalMinutes = max(latencyIntervalMinutes, 1)
     self.latencyTestURL = latencyTestURL
     self.ipv6Enabled = ipv6Enabled
+    self.dnsSettings = dnsSettings
   }
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    let version = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
-    guard (1...Self.currentSchemaVersion).contains(version) else {
-      throw DecodingError.dataCorruptedError(
-        forKey: .schemaVersion,
-        in: container,
-        debugDescription: "Unsupported profile-library schema version."
-      )
+    guard container.contains(.schemaVersion) else {
+      throw ProfileLibrarySchemaMismatch.legacy(version: nil)
     }
-    if version == 1 {
-      let legacy = try LegacyProfileLibraryDTO(from: decoder).currentLibrary()
-      profiles = ProfileLibraryMigrator.migrateLegacyConnections(in: legacy.profiles)
-      selectedProfileID = legacy.selectedProfileID
-      localSOCKSEnabled = legacy.localSOCKSEnabled
-      localSOCKSPort = legacy.localSOCKSPort
-      latencyIntervalMinutes = legacy.latencyIntervalMinutes
-      latencyTestURL = legacy.latencyTestURL
-      ipv6Enabled = legacy.ipv6Enabled
-      requiresMigration = true
-      return
+    let version = try container.decode(Int.self, forKey: .schemaVersion)
+    guard version == Self.currentSchemaVersion else {
+      if version < Self.currentSchemaVersion {
+        throw ProfileLibrarySchemaMismatch.legacy(version: version)
+      }
+      throw ProfileLibrarySchemaMismatch.unsupportedFuture(version: version)
     }
     profiles = try container.decode([ManagedProfile].self, forKey: .profiles)
-    selectedProfileID = try container.decodeIfPresent(UUID.self, forKey: .selectedProfileID)
-    localSOCKSEnabled =
-      try container.decodeIfPresent(Bool.self, forKey: .localSOCKSEnabled) ?? false
-    localSOCKSPort =
-      try container.decodeIfPresent(UInt16.self, forKey: .localSOCKSPort) ?? 1082
-    let storedInterval =
-      try container.decodeIfPresent(Int.self, forKey: .latencyIntervalMinutes) ?? 10
+    selectedProfileID = try container.decode(UUID?.self, forKey: .selectedProfileID)
+    routingMode = try container.decode(RoutingMode.self, forKey: .routingMode)
+    selectedNodeID = try container.decode(ProxyNodeID.self, forKey: .selectedNodeID)
+    localSOCKSEnabled = try container.decode(Bool.self, forKey: .localSOCKSEnabled)
+    localSOCKSPort = try container.decode(UInt16.self, forKey: .localSOCKSPort)
+    let storedInterval = try container.decode(Int.self, forKey: .latencyIntervalMinutes)
     latencyIntervalMinutes = max(storedInterval, 1)
-    let storedTarget =
-      try container.decodeIfPresent(String.self, forKey: .latencyTestURL)
-      ?? LatencyTargetPolicy.defaultURL
+    let storedTarget = try container.decode(String.self, forKey: .latencyTestURL)
     latencyTestURL = try LatencyTargetPolicy.normalized(storedTarget)
-    ipv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .ipv6Enabled) ?? false
-    if version < Self.currentSchemaVersion {
-      requiresMigration = true
-    }
+    ipv6Enabled = try container.decode(Bool.self, forKey: .ipv6Enabled)
+    dnsSettings =
+      container.contains(.dnsSettings)
+      ? try container.decode(ManagedDNSSettings.self, forKey: .dnsSettings).validated()
+      : .defaults
   }
 
   func encode(to encoder: Encoder) throws {
     var container = encoder.container(keyedBy: CodingKeys.self)
     try container.encode(profiles, forKey: .profiles)
-    try container.encodeIfPresent(selectedProfileID, forKey: .selectedProfileID)
+    try container.encode(selectedProfileID, forKey: .selectedProfileID)
+    try container.encode(routingMode, forKey: .routingMode)
+    try container.encode(selectedNodeID, forKey: .selectedNodeID)
     try container.encode(localSOCKSEnabled, forKey: .localSOCKSEnabled)
     try container.encode(localSOCKSPort, forKey: .localSOCKSPort)
     try container.encode(latencyIntervalMinutes, forKey: .latencyIntervalMinutes)
     try container.encode(latencyTestURL, forKey: .latencyTestURL)
     try container.encode(ipv6Enabled, forKey: .ipv6Enabled)
+    try container.encode(dnsSettings, forKey: .dnsSettings)
     try container.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
+  }
+
+  static func freshInstall() -> ProfileLibrary {
+    let profile = ManagedProfile(
+      name: SBMText.localized("Main"),
+      sources: [ManagedSource(name: SBMText.localized("Subscription"))]
+    )
+    return ProfileLibrary(profiles: [profile], selectedProfileID: profile.id)
   }
 
   static let empty = ProfileLibrary(profiles: [], selectedProfileID: nil)
@@ -371,7 +321,10 @@ struct ProfileLibrary: Codable, Equatable, Sendable {
 
 enum ManagedConnectionReconciler {
   static func reconcile(existing: CoreProfile?, fetched: CoreProfile) -> CoreProfile {
-    guard case .compatibility(let incoming) = fetched else { return fetched }
+    let incoming: VPNProfile
+    switch fetched {
+    case .compatibility(let profile): incoming = profile
+    }
     guard case .compatibility(let previous) = existing else { return fetched }
     var reusable = Dictionary(grouping: previous.connections, by: \.semanticIdentity)
     let reconciled = incoming.connections.map { connection -> ManagedConnection in
@@ -407,7 +360,10 @@ enum ManagedConnectionReconciler {
         routingPolicy: incoming.routingPolicy,
         nodeGroups: reconciledGroups,
         applicationRoutingRules: incoming.applicationRoutingRules,
-        websiteRoutingRules: previous.websiteRoutingRules
+        websiteRoutingRules: previous.websiteRoutingRules,
+        autoExcludedNodeIDs: reconciled.flatMap { connection in
+          previous.autoExcludedNodeIDs.filter { $0 == connection.id }
+        }
       )
     )
   }
@@ -418,11 +374,8 @@ enum ManagedConnectionReconciler {
       return left.routingPolicy != right.routingPolicy
         || left.applicationRoutingRules != right.applicationRoutingRules
         || left.websiteRoutingRules != right.websiteRoutingRules
+        || Set(left.autoExcludedNodeIDs) != Set(right.autoExcludedNodeIDs)
         || activationIdentities(left.connections) != activationIdentities(right.connections)
-    case (.native(let left)?, .native(let right)?):
-      return left.configuration != right.configuration || left.selectorTag != right.selectorTag
-        || left.applicationRoutingRules != right.applicationRoutingRules
-        || left.websiteRoutingRules != right.websiteRoutingRules
     case (nil, nil): return false
     default: return true
     }
@@ -433,92 +386,5 @@ enum ManagedConnectionReconciler {
       let id = connection.id.rawValue
       return "\(id.utf8.count):\(id)\(connection.semanticIdentity)"
     }.sorted()
-  }
-}
-
-enum ProfileLibraryMigrator {
-  /// Reconstructs the pre-v1.1.12 aggregate order. Its IDs were assigned to
-  /// all VLESS entries first, then all Hysteria2 entries, after source-order
-  /// filtering and exact old-payload de-duplication.
-  static func migrateLegacyConnections(in profiles: [ManagedProfile]) -> [ManagedProfile] {
-    profiles.map(migrateLegacyConnections(in:))
-  }
-
-  private static func migrateLegacyConnections(in profile: ManagedProfile) -> ManagedProfile {
-    var migrated = profile
-    var assigned: [String: ProxyNodeID] = [:]
-    var seen: Set<String> = []
-    var vlessCount = 0
-    var hysteriaCount = 0
-
-    for source in migrated.sources {
-      guard case .compatibility(let payload) = source.payload else { continue }
-      let filter = try? SourceNameFilter.matcher(for: source.excludeRegex)
-      for connection in payload.connections
-      where !SourceNameFilter.excludes(connection.displayName, using: filter) {
-        let legacyKey = legacyIdentity(connection)
-        guard seen.insert(legacyKey).inserted else { continue }
-        switch connection.kind {
-        case .vless:
-          vlessCount += 1
-          assigned[legacyKey] = ProxyNodeID(rawValue: "vless-\(vlessCount)")
-        case .hysteria2:
-          hysteriaCount += 1
-          assigned[legacyKey] = ProxyNodeID(rawValue: "hysteria2-\(hysteriaCount)")
-        default:
-          break
-        }
-      }
-    }
-
-    func migratedPayload(_ payload: CoreProfile?, aggregate: Bool) -> CoreProfile? {
-      guard case .compatibility(let compatibility) = payload else { return payload }
-      var fallbackVLESS = 0
-      var fallbackHysteria2 = 0
-      let connections = compatibility.connections.map { connection -> ManagedConnection in
-        let legacyKey = legacyIdentity(connection)
-        let id: ProxyNodeID
-        if let assignedID = assigned[legacyKey] {
-          id = assignedID
-        } else if aggregate {
-          switch connection.kind {
-          case .vless:
-            fallbackVLESS += 1
-            id = ProxyNodeID(rawValue: "vless-\(fallbackVLESS)")
-          case .hysteria2:
-            fallbackHysteria2 += 1
-            id = ProxyNodeID(rawValue: "hysteria2-\(fallbackHysteria2)")
-          default:
-            id = connection.id
-          }
-        } else {
-          // Excluded source entries never had an old aggregate ID. Giving them
-          // a fresh ID prevents a later filter change from aliasing a live node.
-          id = ProxyNodeID(rawValue: "node-\(UUID().uuidString)")
-        }
-        return ManagedConnection(
-          id: id, displayName: connection.displayName, outbound: connection.outbound)
-      }
-      return .compatibility(
-        VPNProfile(
-          connections: connections,
-          routingPolicy: compatibility.routingPolicy,
-          nodeGroups: compatibility.nodeGroups ?? [],
-          applicationRoutingRules: compatibility.applicationRoutingRules,
-          websiteRoutingRules: compatibility.websiteRoutingRules
-        ))
-    }
-
-    migrated.sources = migrated.sources.map { source in
-      var copy = source
-      copy.payload = migratedPayload(source.payload, aggregate: false)
-      return copy
-    }
-    migrated.payload = migratedPayload(migrated.payload, aggregate: true)
-    return migrated
-  }
-
-  private static func legacyIdentity(_ connection: ManagedConnection) -> String {
-    "\(connection.semanticIdentity)|\(connection.displayName)"
   }
 }

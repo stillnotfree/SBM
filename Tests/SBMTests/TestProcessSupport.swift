@@ -1,6 +1,45 @@
 import Darwin
 import Foundation
+import SBMShared
 import Testing
+
+// Default test responses represent a current helper after retirement. Tests
+// that model an inert or legacy response use the production initializer and
+// pass its optional receipt explicitly.
+extension HelperResponse {
+  init(
+    success: Bool,
+    coreRunning: Bool,
+    coreVersion: String? = nil,
+    mode: RoutingMode = .rule,
+    selectedNode: ProxyNodeID = .auto,
+    effectiveAutoNode: ProxyNodeID? = nil,
+    activeProfileID: UUID? = nil,
+    activeIPv6Enabled: Bool? = nil,
+    nodes: [ProxyNodeDescriptor] = [],
+    delays: [NodeDelay] = [],
+    automaticRecoveryExhausted: Bool = false,
+    runtimeOutcome: HelperRuntimeOutcome = .applied,
+    message: String
+  ) {
+    self.init(
+      success: success,
+      coreRunning: coreRunning,
+      coreVersion: coreVersion,
+      mode: mode,
+      selectedNode: selectedNode,
+      effectiveAutoNode: effectiveAutoNode,
+      activeProfileID: activeProfileID,
+      activeIPv6Enabled: activeIPv6Enabled,
+      nodes: nodes,
+      delays: delays,
+      automaticRecoveryExhausted: automaticRecoveryExhausted,
+      runtimeOutcome: runtimeOutcome,
+      legacy1115Retired: true,
+      message: message
+    )
+  }
+}
 
 enum TestProcessFailure: Error {
   case timedOut

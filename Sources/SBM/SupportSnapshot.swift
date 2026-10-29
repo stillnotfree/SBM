@@ -44,7 +44,6 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
 
   enum ProfileKind: String, Codable, Sendable, Equatable {
     case compatibilitySubscription = "compatibility_subscription"
-    case nativeJSON = "native_json"
     case none
   }
 
@@ -211,7 +210,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
 
   var statusText: String {
     var lines = [
-      SBMText.localized("SBM support snapshot (observations only)"),
+      SBMText.localized("SBM support snapshot"),
       SBMText.format("Schema: %@", String(schemaVersion)),
       SBMText.format("Captured: %@", capturedAt),
       SBMText.localized("Active DNS/network probes run: no"),
@@ -239,12 +238,13 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
         SBMText.localized(profile.libraryAvailable ? "available" : "unavailable"),
         "\(profile.sourceCount)\(profile.sourceCountCapped ? "+" : "")"
       ),
-      SBMText.format(
-        "Local SOCKS5: %@",
-        localSOCKS.enabled
-          ? SBMText.format("enabled on 127.0.0.1:%@", String(localSOCKS.port ?? 0))
-          : SBMText.localized("disabled")
-      ),
+      localSOCKS.enabled
+        ? SBMText.format(
+          "Local SOCKS5 saved configuration: enabled on 127.0.0.1:%@",
+          String(localSOCKS.port ?? 0)
+        )
+        : SBMText.localized("Local SOCKS5 saved configuration: disabled"),
+      SBMText.localized("Local SOCKS5 listener presence: not observed by this snapshot"),
       SBMText.format(
         "Selected protocol: %@",
         selectedProtocolKind?.rawValue ?? SBMText.localized("none")
@@ -278,7 +278,7 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
     let output = lines.joined(separator: "\n")
     guard output.utf8.count <= Self.maximumTextBytes else {
       return [
-        SBMText.localized("SBM support snapshot (observations only)"),
+        SBMText.localized("SBM support snapshot"),
         SBMText.localized("Snapshot text omitted: too large"),
         SBMText.localized("Active DNS/network probes run: no"),
       ].joined(separator: "\n")
@@ -362,6 +362,6 @@ struct SupportSnapshot: Codable, Sendable, Equatable {
 
 extension ProxyNodeKind {
   fileprivate static let allCasesExcludingAutomatic: [ProxyNodeKind] = [
-    .vless, .hysteria2, .shadowsocks, .native, .unknown,
+    .vless, .hysteria2, .shadowsocks, .unknown,
   ]
 }

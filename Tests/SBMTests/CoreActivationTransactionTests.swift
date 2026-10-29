@@ -5,6 +5,65 @@ import Testing
 
 @testable import SBMHelper
 
+private func apiResponse(_ head: String, body: String = "") -> Data {
+  Data((head + "\r\n\r\n" + body).utf8)
+}
+
+@Test func managedCoreChildSharesTheHelperGroupAndStopsOnlyItsOwnedPID() throws {
+  let workingDirectory = FileManager.default.temporaryDirectory
+  let child = try ManagedCoreChild.launch(
+    executableURL: URL(fileURLWithPath: "/bin/sleep"),
+    arguments: ["30"],
+    currentDirectoryURL: workingDirectory
+  )
+  let peer = try ManagedCoreChild.launch(
+    executableURL: URL(fileURLWithPath: "/bin/sleep"),
+    arguments: ["30"],
+    currentDirectoryURL: workingDirectory
+  )
+  defer {
+    _ = child.terminate()
+    _ = peer.terminate()
+  }
+
+  let childPID = try #require(child.pid)
+  let peerPID = try #require(peer.pid)
+  #expect(getpgid(childPID) == getpgrp())
+  #expect(getpgid(peerPID) == getpgrp())
+  #expect(child.terminate())
+  #expect(child.pid == nil)
+  #expect(peer.isRunning)
+
+  var waitStatus: Int32 = 0
+  let waitResult = waitpid(childPID, &waitStatus, WNOHANG)
+  let waitError = errno
+  #expect(waitResult == -1)
+  #expect(waitError == ECHILD)
+}
+
+@Test func managedCoreChildReapsAnUnexpectedExitAndClearsItsPID() throws {
+  let child = try ManagedCoreChild.launch(
+    executableURL: URL(fileURLWithPath: "/bin/sleep"),
+    arguments: ["30"],
+    currentDirectoryURL: FileManager.default.temporaryDirectory
+  )
+  defer { _ = child.terminate() }
+
+  let childPID = try #require(child.pid)
+  #expect(kill(childPID, SIGKILL) == 0)
+  let waitStarted = Date()
+  let exitStatus = try #require(child.waitUntilExit(timeout: 5))
+  #expect(Date().timeIntervalSince(waitStarted) < 2)
+  #expect(exitStatus == 128 + SIGKILL)
+  #expect(child.pid == nil)
+
+  var waitStatus: Int32 = 0
+  let waitResult = waitpid(childPID, &waitStatus, WNOHANG)
+  let waitError = errno
+  #expect(waitResult == -1)
+  #expect(waitError == ECHILD)
+}
+
 @Test func localAPIPortProbeIgnoresTimeWaitButRejectsLiveListener() throws {
   var listener = socket(AF_INET, SOCK_STREAM, 0)
   #expect(listener >= 0)
@@ -23,15 +82,31 @@ import Testing
   var address = sockaddr_in()
   address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
   address.sin_family = sa_family_t(AF_INET)
-  address.sin_port = 0
   address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-  #expect(
-    withUnsafePointer(to: &address) { pointer in
+  var boundListener = false
+  for candidatePort in UInt16(48_000)...UInt16(49_151) {
+    address.sin_port = candidatePort.bigEndian
+    let bindResult = withUnsafePointer(to: &address) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
         bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
       }
-    } == 0
-  )
+    }
+    if bindResult == 0 {
+      boundListener = true
+      break
+    }
+    let bindError = errno
+    guard bindError == EADDRINUSE else {
+      Issue.record(
+        "Failed to bind loopback test listener on port \(candidatePort): errno \(bindError)."
+      )
+      return
+    }
+  }
+  guard boundListener else {
+    Issue.record("Could not bind loopback test listener on any port in 48000...49151.")
+    return
+  }
   #expect(listen(listener, 1) == 0)
   var boundAddress = sockaddr_in()
   var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -316,9 +391,37 @@ private enum DeferredMarkerTestError: Error {
   case coreStillRunning
 }
 
-private enum StopTransactionTestError: Error {
+private enum StopTransactionTestError: Error, Equatable {
   case stop
   case persistence
+}
+
+private func durableStopTestState() -> PersistentState {
+  let profile = CoreProfile.compatibility(
+    VPNProfile(
+      connections: [
+        ManagedConnection(
+          id: ProxyNodeID(rawValue: "durable-stop-test"),
+          displayName: "Durable Stop Test",
+          outbound: .shadowsocks(
+            ShadowsocksProfile(
+              server: "192.0.2.1",
+              port: 443,
+              method: "aes-256-gcm",
+              password: "test-password"
+            )
+          )
+        )
+      ]
+    )
+  )
+  var state = PersistentState()
+  state.profile = profile
+  state.activeProfileID = UUID(uuidString: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")!
+  state.nodes = profile.nodes
+  state.desiredRunning = true
+  state.deferredRuntimeApplyPending = true
+  return state
 }
 
 @Test func deferredCandidatePersistsMarkerOnlyAfterValidationAndKeepsActiveState() throws {
@@ -434,36 +537,36 @@ private enum StopTransactionTestError: Error {
 }
 
 @Test func failedCoreStopDoesNotPersistDesiredStateChange() {
-  var previous = PersistentState()
-  previous.desiredRunning = true
-  previous.automaticRecoveryAttempted = true
-  previous.deferredRuntimeApplyPending = true
+  var state = PersistentState()
+  state.desiredRunning = true
+  state.automaticRecoveryAttempted = true
+  state.deferredRuntimeApplyPending = true
   var saves = 0
 
-  #expect(throws: StopTransactionTestError.self) {
+  #expect(throws: StopTransactionTestError.stop) {
     try CoreStopTransaction.run(
-      previousState: previous,
+      state: &state,
       stopKnownGood: { throw StopTransactionTestError.stop },
       save: { _ in saves += 1 }
     )
   }
 
-  #expect(previous.desiredRunning)
-  #expect(previous.automaticRecoveryAttempted)
-  #expect(previous.deferredRuntimeApplyPending)
+  #expect(state.desiredRunning)
+  #expect(state.automaticRecoveryAttempted)
+  #expect(state.deferredRuntimeApplyPending)
   #expect(saves == 0)
 }
 
 @Test func successfulCoreStopPersistsOnlyAfterStopProof() throws {
-  var previous = PersistentState()
-  previous.desiredRunning = true
-  previous.automaticRecoveryAttempted = true
-  previous.deferredRuntimeApplyPending = true
+  var state = PersistentState()
+  state.desiredRunning = true
+  state.automaticRecoveryAttempted = true
+  state.deferredRuntimeApplyPending = true
   var stopProven = false
   var persisted: PersistentState?
 
-  let stopped = try CoreStopTransaction.run(
-    previousState: previous,
+  try CoreStopTransaction.run(
+    state: &state,
     stopKnownGood: { stopProven = true },
     save: { snapshot in
       #expect(stopProven)
@@ -471,9 +574,214 @@ private enum StopTransactionTestError: Error {
     }
   )
 
-  #expect(!stopped.desiredRunning)
-  #expect(!stopped.automaticRecoveryAttempted)
-  #expect(!stopped.deferredRuntimeApplyPending)
-  #expect(persisted?.desiredRunning == false)
-  #expect(previous.desiredRunning)
+  #expect(!state.desiredRunning)
+  #expect(!state.automaticRecoveryAttempted)
+  #expect(!state.deferredRuntimeApplyPending)
+  let saved = try #require(persisted)
+  #expect(saved.desiredRunning == state.desiredRunning)
+  #expect(saved.automaticRecoveryAttempted == state.automaticRecoveryAttempted)
+  #expect(saved.deferredRuntimeApplyPending == state.deferredRuntimeApplyPending)
+}
+
+@Test func persistenceFailureAfterProvenCoreStopKeepsLiveStateOff() {
+  var state = PersistentState()
+  state.desiredRunning = true
+  state.automaticRecoveryAttempted = true
+  state.deferredRuntimeApplyPending = true
+
+  #expect(throws: StopTransactionTestError.persistence) {
+    try CoreStopTransaction.run(
+      state: &state,
+      stopKnownGood: {},
+      save: { _ in throw StopTransactionTestError.persistence }
+    )
+  }
+
+  #expect(!state.desiredRunning)
+  #expect(!state.automaticRecoveryAttempted)
+  #expect(!state.deferredRuntimeApplyPending)
+  #expect(
+    DesiredRuntimeRecoveryPolicy.decision(
+      recoveryAuthorized: true,
+      desiredRunning: state.desiredRunning,
+      coreRunning: false,
+      profileAvailable: true,
+      configurationAvailable: true,
+      recoveryAlreadyAttempted: state.automaticRecoveryAttempted
+    ) == .stop
+  )
+}
+
+@Test func unauthorizedDesiredRuntimeRecoveryIsNoActionForEveryState() {
+  for desiredRunning in [false, true] {
+    for coreRunning in [false, true] {
+      for profileAvailable in [false, true] {
+        for configurationAvailable in [false, true] {
+          for recoveryAlreadyAttempted in [false, true] {
+            #expect(
+              DesiredRuntimeRecoveryPolicy.decision(
+                recoveryAuthorized: false,
+                desiredRunning: desiredRunning,
+                coreRunning: coreRunning,
+                profileAvailable: profileAvailable,
+                configurationAvailable: configurationAvailable,
+                recoveryAlreadyAttempted: recoveryAlreadyAttempted
+              ) == .noAction
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+@Test func stopSaveFailureBeforeReplacementIsRetriedInNextHelperLifetime() throws {
+  var durableBytes = try JSONEncoder().encode(durableStopTestState())
+  let firstLifetimeState = try JSONDecoder().decode(PersistentState.self, from: durableBytes)
+  #expect(firstLifetimeState.desiredRunning)
+  #expect(firstLifetimeState.profile != nil)
+  #expect(firstLifetimeState.activeProfileID != nil)
+
+  var firstLifetime = firstLifetimeState
+  var physicalCoreRunning = true
+  #expect(throws: StopTransactionTestError.persistence) {
+    try CoreStopTransaction.run(
+      state: &firstLifetime,
+      stopKnownGood: { physicalCoreRunning = false },
+      save: { _ in throw StopTransactionTestError.persistence }
+    )
+  }
+  #expect(!physicalCoreRunning)
+  #expect(!firstLifetime.desiredRunning)
+  #expect(firstLifetime.profile != nil)
+
+  let secondLifetime = try JSONDecoder().decode(PersistentState.self, from: durableBytes)
+  #expect(secondLifetime.desiredRunning)
+  #expect(secondLifetime.profile != nil)
+  #expect(secondLifetime.activeProfileID == firstLifetimeState.activeProfileID)
+
+  var retryState = secondLifetime
+  try CoreStopTransaction.run(
+    state: &retryState,
+    stopKnownGood: { #expect(!physicalCoreRunning) },
+    save: { durableBytes = try JSONEncoder().encode($0) }
+  )
+  let finalDurableState = try JSONDecoder().decode(PersistentState.self, from: durableBytes)
+  #expect(!retryState.desiredRunning)
+  #expect(!retryState.deferredRuntimeApplyPending)
+  #expect(!finalDurableState.desiredRunning)
+  #expect(!finalDurableState.deferredRuntimeApplyPending)
+}
+
+@Test func stopSaveFailureAfterReplacementIsSafelyRetriedInNextHelperLifetime() throws {
+  var durableBytes = try JSONEncoder().encode(durableStopTestState())
+  var firstLifetime = try JSONDecoder().decode(PersistentState.self, from: durableBytes)
+  var physicalCoreRunning = true
+
+  #expect(throws: StopTransactionTestError.persistence) {
+    try CoreStopTransaction.run(
+      state: &firstLifetime,
+      stopKnownGood: { physicalCoreRunning = false },
+      save: { snapshot in
+        durableBytes = try JSONEncoder().encode(snapshot)
+        // Model a failure after replacement, during the existing sync boundary.
+        throw StopTransactionTestError.persistence
+      }
+    )
+  }
+  #expect(!physicalCoreRunning)
+  #expect(!firstLifetime.desiredRunning)
+
+  var secondLifetime = try JSONDecoder().decode(PersistentState.self, from: durableBytes)
+  #expect(!secondLifetime.desiredRunning)
+  #expect(secondLifetime.profile != nil)
+  var retryStopCount = 0
+  try CoreStopTransaction.run(
+    state: &secondLifetime,
+    stopKnownGood: {
+      retryStopCount += 1
+      physicalCoreRunning = false
+    },
+    save: { durableBytes = try JSONEncoder().encode($0) }
+  )
+  let finalDurableState = try JSONDecoder().decode(PersistentState.self, from: durableBytes)
+  #expect(retryStopCount == 1)
+  #expect(!physicalCoreRunning)
+  #expect(!secondLifetime.desiredRunning)
+  #expect(!finalDurableState.desiredRunning)
+  #expect(!finalDurableState.deferredRuntimeApplyPending)
+}
+
+@Test func clashAPIResponseRequiresCompleteContentLengthAndHTTPStatus() throws {
+  let complete = try CoreManager.parseAPIResponse(
+    apiResponse("HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh: 5", body: "hello")
+  )
+  #expect(String(data: complete, encoding: .utf8) == "hello")
+
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.parseAPIResponse(
+      apiResponse("HTTP/1.1 200 OK\r\nContent-Length: 5", body: "he")
+    )
+  }
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.parseAPIResponse(
+      apiResponse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3", body: "hey")
+    )
+  }
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.parseAPIResponse(apiResponse("HTTP/1.1 503 Unavailable"))
+  }
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.parseAPIResponse(Data("HTTP/1.1 200 OK\r\nContent-Length: 0".utf8))
+  }
+}
+
+@Test func clashAPIResponseSupportsStrictChunkedAndConnectionCloseBodies() throws {
+  let chunked = try CoreManager.parseAPIResponse(
+    apiResponse(
+      "HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: Chunked",
+      body: "5\r\nhello\r\n0\r\n\r\n"
+    )
+  )
+  #expect(String(data: chunked, encoding: .utf8) == "hello")
+
+  let closeDelimited = try CoreManager.parseAPIResponse(
+    apiResponse("HTTP/1.1 200 OK\r\nContent-Type: application/json", body: "{}")
+  )
+  #expect(String(data: closeDelimited, encoding: .utf8) == "{}")
+
+  for malformedChunked in [
+    "z\r\nhello\r\n0\r\n\r\n",
+    "5\r\nhello\r\n",
+    "5\r\nhelloXX0\r\n\r\n",
+  ] {
+    #expect(throws: CoreFailure.self) {
+      try CoreManager.parseAPIResponse(
+        apiResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", body: malformedChunked)
+      )
+    }
+  }
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.parseAPIResponse(
+      apiResponse(
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked",
+        body: "0\r\n\r\n"
+      )
+    )
+  }
+}
+
+@Test func clashAPIResponseAcceptsExactRawCapAndRejectsCapPlusOne() throws {
+  let maximum = 1_048_576
+  let prefix = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Pad: "
+  let separator = "\r\n\r\n"
+  let paddingCount = maximum - prefix.utf8.count - separator.utf8.count
+  let exact = Data((prefix + String(repeating: "a", count: paddingCount) + separator).utf8)
+  #expect(exact.count == maximum)
+  #expect(try CoreManager.parseAPIResponse(exact).isEmpty)
+
+  let overLimit = Data(repeating: 0x78, count: maximum + 1)
+  #expect(throws: CoreFailure.self) {
+    try CoreManager.parseAPIResponse(overLimit)
+  }
 }

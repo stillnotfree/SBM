@@ -7,6 +7,7 @@ import SwiftUI
 private final class AppDelegate: NSObject, NSApplicationDelegate {
   weak var model: AppModel?
   private var terminationPending = false
+  private var terminationAuthorized = false
   private var wakeObserver: NSObjectProtocol?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -27,14 +28,36 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard let model else { return .terminateNow }
-    guard !terminationPending else { return .terminateLater }
+    if terminationAuthorized {
+      terminationAuthorized = false
+      terminationPending = false
+      return .terminateNow
+    }
+    guard !terminationPending else { return .terminateCancel }
     terminationPending = true
     Task {
       let stopped = await model.disconnectBeforeQuit()
+      if stopped {
+        terminationAuthorized = true
+        sender.terminate(nil)
+        return
+      }
+
+      let alert = NSAlert()
+      alert.alertStyle = .warning
+      alert.messageText = SBMText.localized("Disconnect Not Confirmed")
+      alert.informativeText = SBMText.localized(
+        "SBM remains open because it could not verify that the VPN stopped."
+      )
+      if let safeError = model.safeCurrentError {
+        alert.informativeText += "\n\n\(safeError)"
+      }
+      alert.addButton(withTitle: SBMText.localized("OK"))
+      NSApplication.shared.activate()
+      alert.runModal()
       terminationPending = false
-      sender.reply(toApplicationShouldTerminate: stopped)
     }
-    return .terminateLater
+    return .terminateCancel
   }
 
 }
@@ -43,6 +66,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 struct SBMApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   @State private var model = AppModel(environment: .production)
+  @State private var settingsEditing = false
 
   init() {
     NSApplication.shared.setActivationPolicy(.accessory)
@@ -52,7 +76,7 @@ struct SBMApp: App {
     MenuBarExtra {
       MenuContentView(model: model)
         .onAppear {
-          model.refresh()
+          model.refresh(observeAutoNode: true)
         }
     } label: {
       Image(
@@ -65,7 +89,16 @@ struct SBMApp: App {
     .menuBarExtraStyle(.menu)
 
     Window("Settings", id: "profiles") {
-      SettingsView(model: model)
+      ZStack {
+        if settingsEditing {
+          SettingsView(model: model)
+        }
+      }
+      .onAppear { settingsEditing = true }
+      .onDisappear {
+        settingsEditing = false
+        model.endSettingsEditing()
+      }
     }
     .defaultSize(width: 720, height: 620)
     .defaultPosition(.center)
@@ -74,25 +107,17 @@ struct SBMApp: App {
       DiagnosticsView(model: model)
     }
     .defaultSize(width: 620, height: 420)
-
-    Window("About SBM", id: "about") {
-      AboutView(model: model)
-    }
-    .defaultSize(width: 440, height: 330)
-    .windowResizability(.contentSize)
   }
 }
 
 enum SBMWindow: String, CaseIterable {
   case profiles
   case diagnostics
-  case about
 
   var title: String {
     switch self {
     case .profiles: SBMText.localized("Settings")
     case .diagnostics: SBMText.localized("Diagnostics")
-    case .about: SBMText.localized("About SBM")
     }
   }
 
@@ -105,38 +130,105 @@ enum SBMWindow: String, CaseIterable {
   }
 }
 
+@MainActor
+func menuPresentationTitle(_ value: String) -> String {
+  let font = NSFont.menuFont(ofSize: 0)
+  let attributes: [NSAttributedString.Key: Any] = [.font: font]
+  let maxWidth: CGFloat = 180
+  func width(_ text: String) -> CGFloat {
+    (text as NSString).size(withAttributes: attributes).width
+  }
+
+  guard width(value) > maxWidth else { return value }
+
+  let characters = Array(value)
+  var lower = 0
+  var upper = characters.count
+  while lower < upper {
+    let middle = (lower + upper + 1) / 2
+    let prefix = String(characters.prefix(middle))
+    if width(prefix + "…") <= maxWidth {
+      lower = middle
+    } else {
+      upper = middle - 1
+    }
+  }
+  return String(characters.prefix(lower)) + "…"
+}
+
+func menuErrorSummary(
+  isInstalledInApplications: Bool,
+  helperEnabled: Bool,
+  helperReachable: Bool
+) -> String {
+  if !isInstalledInApplications {
+    return SBMText.localized("Move SBM to Applications")
+  }
+  if !helperEnabled { return SBMText.localized("Helper not enabled") }
+  if !helperReachable { return SBMText.localized("Helper unavailable") }
+  return SBMText.localized("Something went wrong")
+}
+
 private struct MenuContentView: View {
   @Bindable var model: AppModel
   @Environment(\.openWindow) private var openWindow
 
   var body: some View {
     Button {
-      if let enabled = model.connectionPresentation.nextEnabledState {
+      if let enabled = model.connectionAction {
         model.setCoreEnabled(enabled)
       }
     } label: {
-      Label(
-        model.connectionPresentation.title,
-        systemImage: model.connectionPresentation.systemImage
-      )
+      Label {
+        menuText(model.connectionPresentation.title)
+      } icon: {
+        Image(systemName: model.connectionPresentation.systemImage)
+      }
     }
-    .disabled(model.connectionPresentation.nextEnabledState == nil || model.helperSetupInProgress)
+    .disabled(!model.connectionActionEnabled)
+
+    if let error = model.safeCurrentError {
+      let isInstalledInApplications = model.isInstalledInApplications
+      let errorDetails =
+        isInstalledInApplications
+        ? error
+        : SBMText.localized(
+          "Move SBM.app to the Applications folder, eject the DMG, then open the installed copy."
+        )
+      menuText(
+        menuErrorSummary(
+          isInstalledInApplications: isInstalledInApplications,
+          helperEnabled: model.helperEnabled,
+          helperReachable: model.helperReachable
+        )
+      )
+      .font(.caption)
+      .foregroundStyle(.orange)
+      .accessibilityLabel(errorDetails)
+      .help(errorDetails)
+    }
 
     if let deferred = model.deferredRuntimeApplyPresentation {
-      Label(deferred.headline, systemImage: "arrow.triangle.2.circlepath")
+      Label {
+        menuText(deferred.headline)
+      } icon: {
+        Image(systemName: "arrow.triangle.2.circlepath")
+      }
       if deferred.phase == .applying || deferred.phase == .reconnecting {
         ProgressView()
           .controlSize(.small)
       }
       if let error = model.deferredRuntimeApplyError {
-        Text(error)
+        menuText(error)
           .foregroundStyle(.secondary)
       }
-      Button(deferred.action.title) {
+      Button {
         model.reconnectToApply()
+      } label: {
+        menuText(deferred.action.title)
       }
       .disabled(
-        model.helperSetupInProgress
+        !model.runtimeMenuControlsEnabled
           || model.observedCoreState == .unknown
           || !deferred.actionEnabled
       )
@@ -150,16 +242,16 @@ private struct MenuContentView: View {
           model.selectProfile(profile.id)
         } label: {
           if model.selectedProfileID == profile.id {
-            Label(profile.name, systemImage: "checkmark")
+            menuLabel(profile.name, systemImage: "checkmark")
           } else {
-            Text(profile.name)
+            menuText(profile.name)
           }
         }
       }
     } label: {
-      Text(SBMText.format("Profile: %@", model.selectedProfileName))
+      menuText(SBMText.format("Profile: %@", model.selectedProfileName))
     }
-    .disabled(model.helperSetupInProgress)
+    .disabled(!model.runtimeMenuControlsEnabled)
 
     Menu {
       ForEach(RoutingMode.allCases, id: \.self) { mode in
@@ -167,16 +259,16 @@ private struct MenuContentView: View {
           model.setRoutingMode(mode)
         } label: {
           if model.routingMode == mode {
-            Label(SBMText.localized(mode.rawValue), systemImage: "checkmark")
+            menuLabel(SBMText.localized(mode.rawValue), systemImage: "checkmark")
           } else {
-            Text(SBMText.localized(mode.rawValue))
+            menuText(SBMText.localized(mode.rawValue))
           }
         }
       }
     } label: {
-      Text(SBMText.format("Mode: %@", SBMText.localized(model.routingMode.rawValue)))
+      menuText(SBMText.format("Mode: %@", SBMText.localized(model.routingMode.rawValue)))
     }
-    .disabled(model.helperSetupInProgress)
+    .disabled(!model.runtimeMenuControlsEnabled)
 
     Menu {
       if let automaticNode = model.automaticNode {
@@ -185,17 +277,19 @@ private struct MenuContentView: View {
       if !model.nodeSections.isEmpty {
         Divider()
         ForEach(model.nodeSections) { section in
-          Section(section.name) {
+          Section {
             ForEach(section.nodes) { node in
               serverButton(node)
             }
+          } header: {
+            menuText(section.name)
           }
         }
       }
     } label: {
-      Text(SBMText.format("Server: %@", selectedNodeName))
+      menuText(SBMText.format("Server: %@", selectedNodeName))
     }
-    .disabled(model.helperSetupInProgress)
+    .disabled(!model.runtimeMenuControlsEnabled)
 
     Divider()
 
@@ -213,76 +307,102 @@ private struct MenuContentView: View {
 
     if !model.helperEnabled {
       if model.helperRequiresApproval {
-        Button(
-          model.helperApprovalPending
-            ? model.helperStatus : "Approve Background Helper…"
-        ) {
+        Button {
           model.enableHelper()
+        } label: {
+          menuText(
+            SBMText.localized(
+              model.helperApprovalPending
+                ? "Waiting for approval…" : "Approve Helper…"
+            )
+          )
         }
       } else {
-        Button(
-          model.helperSetupInProgress
-            ? model.helperStatus : "Enable Background Helper"
-        ) {
+        Button {
           model.enableHelper()
+        } label: {
+          menuText(
+            SBMText.localized(
+              model.helperSetupInProgress
+                ? "Enabling helper…" : "Enable Helper"
+            )
+          )
         }
         .disabled(model.helperSetupInProgress)
       }
     } else if !model.helperReachable {
-      Button(
-        model.helperSetupInProgress
-          ? model.helperStatus
-          : model.helperUpdateRequired
-            ? "Update Background Helper" : "Repair Background Helper"
-      ) {
+      Button {
         model.repairHelper()
+      } label: {
+        menuText(
+          SBMText.localized(
+            model.helperSetupInProgress
+              ? (model.helperUpdateRequired ? "Updating helper…" : "Repairing helper…")
+              : model.helperUpdateRequired
+                ? "Update Helper" : "Repair Helper"
+          )
+        )
       }
       .disabled(model.helperSetupInProgress)
     }
 
-    Button(model.isRefreshing ? "Refreshing…" : "Refresh") {
+    Button {
       model.refreshExternalState()
+    } label: {
+      menuText(
+        SBMText.localized(model.isRefreshing ? "Refreshing…" : "Refresh")
+      )
     }
-    .disabled(model.isRefreshing)
+    .disabled(!model.runtimeMenuControlsEnabled || model.isRefreshing)
     .keyboardShortcut("r")
 
     Divider()
 
-    Button("About SBM…") {
-      presentWindow(.about)
-    }
-
-    Button("Check for Updates…") {
-      model.checkForUpdates()
-      presentWindow(.about)
-    }
-
-    Button(model.coreIsKnownStopped ? "Quit" : "Disconnect & Quit") {
+    Button {
       NSApplication.shared.terminate(nil)
+    } label: {
+      menuText(
+        SBMText.localized(model.coreIsKnownStopped ? "Quit" : "Disconnect & Quit")
+      )
     }
     .keyboardShortcut("q")
   }
 
   private var selectedNodeName: String {
-    model.nodes.first(where: { $0.id == model.selectedNodeID })?.name
+    if let childName = model.effectiveAutoNodeName {
+      return SBMText.format("Auto → %@", childName)
+    }
+    return model.nodes.first(where: { $0.id == model.selectedNodeID })?.name
       ?? SBMText.localized("Unknown")
+  }
+
+  private func menuText(_ value: String) -> some View {
+    Text(menuPresentationTitle(value))
+      .accessibilityLabel(value)
+  }
+
+  private func menuLabel(_ value: String, systemImage: String) -> some View {
+    Label(menuPresentationTitle(value), systemImage: systemImage)
+      .accessibilityLabel(value)
   }
 
   private func presentWindow(_ target: SBMWindow) {
     NSApplication.shared.activate()
-    openWindow(id: target.rawValue)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-      guard
-        let window = NSApplication.shared.windows.first(where: {
-          $0.identifier == target.identifier
-        })
-          ?? NSApplication.shared.windows.first(where: { $0.title == target.title })
-      else {
-        return
+    DispatchQueue.main.async {
+      openWindow(id: target.rawValue)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        guard
+          let window = NSApplication.shared.windows.first(where: {
+            $0.identifier == target.identifier
+          })
+            ?? NSApplication.shared.windows.first(where: { $0.title == target.title })
+        else {
+          return
+        }
+        window.identifier = target.identifier
+        window.level = target.level
+        window.makeKeyAndOrderFront(nil)
       }
-      window.identifier = target.identifier
-      window.level = target.level
-      window.makeKeyAndOrderFront(nil)
     }
   }
 
@@ -297,12 +417,12 @@ private struct MenuContentView: View {
       model.setSelectedNode(node.id)
     } label: {
       if selected {
-        Label(node.name, systemImage: "checkmark")
+        menuLabel(node.name, systemImage: "checkmark")
       } else {
         Label {
-          Text(node.name)
+          menuText(node.name)
         } icon: {
-          Image(nsImage: selectionPlaceholderImage())
+          Image(systemName: "checkmark").hidden()
         }
       }
     }
@@ -312,77 +432,6 @@ private struct MenuContentView: View {
     )
   }
 
-  private func selectionPlaceholderImage() -> NSImage {
-    let image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { _ in
-      true
-    }
-    image.isTemplate = true
-    return image
-  }
-}
-
-private struct AboutView: View {
-  @Bindable var model: AppModel
-
-  private var version: String {
-    Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-      ?? "Development"
-  }
-
-  private var build: String {
-    Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "local"
-  }
-
-  var body: some View {
-    VStack(spacing: 14) {
-      Image(nsImage: NSApplication.shared.applicationIconImage)
-        .resizable()
-        .scaledToFit()
-        .frame(width: 64, height: 64)
-
-      Text("SBM")
-        .font(.title2.weight(.semibold))
-      Text(SBMText.format("Version %@ (%@)", version, build))
-        .foregroundStyle(.secondary)
-
-      Text("Native Apple Silicon menu bar client for sing-box.")
-        .font(.callout)
-        .multilineTextAlignment(.center)
-        .foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
-
-      Text(model.updateStatus)
-        .font(.caption)
-        .foregroundStyle(.secondary)
-
-      if model.isDownloadingUpdate {
-        ProgressView(value: model.updateDownloadProgress ?? 0)
-        Text(
-          "\(Int(((model.updateDownloadProgress ?? 0) * 100).rounded()))%"
-        )
-        .font(.caption.monospacedDigit())
-        .foregroundStyle(.secondary)
-      }
-
-      if model.availableUpdateVersion != nil {
-        Button("Download Verified Update") {
-          model.downloadAndOpenUpdate()
-        }
-        .disabled(model.isDownloadingUpdate)
-      } else {
-        Button("Check for Updates") {
-          model.checkForUpdates()
-        }
-        .disabled(model.isCheckingForUpdates)
-      }
-
-      Text("© 2026 stillnotfree")
-        .font(.caption)
-        .foregroundStyle(.tertiary)
-    }
-    .padding(24)
-    .frame(width: 420)
-  }
 }
 
 private struct DiagnosticsView: View {
@@ -392,8 +441,6 @@ private struct DiagnosticsView: View {
     let snapshot = model.supportSnapshot
     VStack(alignment: .leading, spacing: 12) {
       HStack {
-        Label("Diagnostics", systemImage: "stethoscope")
-          .font(.title2.weight(.semibold))
         Spacer()
         Button("Copy Text") {
           NSPasteboard.general.clearContents()

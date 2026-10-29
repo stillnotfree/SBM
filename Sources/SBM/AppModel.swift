@@ -1,8 +1,20 @@
 import AppKit
 import Foundation
+import OSLog
 import Observation
 import SBMShared
 import ServiceManagement
+
+enum RuntimeApplyStatus: Equatable, Sendable {
+  case saved
+  case applying
+  case active
+  case reconnectRequired
+  case failed
+}
+
+private let restoreLastVPNStateDefaultsKey = "RestoreLastVPNStateEnabled"
+private let lastExplicitVPNConnectedDefaultsKey = "LastExplicitVPNIntentConnected"
 
 struct ResolvedApplicationBundle: Equatable {
   let displayName: String
@@ -96,7 +108,6 @@ enum RoutingPolicyDocument {
 struct ProxyNode: Identifiable, Hashable {
   let id: ProxyNodeID
   let name: String
-  let symbol: String
   let groupID: String?
   let groupName: String?
   let groupOrder: Int?
@@ -246,10 +257,10 @@ enum ConnectionPresentation: Equatable {
 
   var systemImage: String {
     switch self {
-    case .connected, .failed(previousRuntimePreserved: true): "lock.shield.fill"
+    case .connected, .failed(previousRuntimePreserved: true): "shield.fill"
     case .connecting, .disconnecting: "arrow.trianglehead.2.clockwise.rotate.90"
     case .unknown: "exclamationmark.shield"
-    case .disconnected, .failed(previousRuntimePreserved: false): "lock.shield"
+    case .disconnected, .failed(previousRuntimePreserved: false): "shield"
     }
   }
 
@@ -305,31 +316,6 @@ enum RuntimeLivenessPolicy {
     guard let lastObservationAt else { return false }
     return now.timeIntervalSince(lastObservationAt) <= freshnessWindow
   }
-
-  static func presentationState(
-    observed: ObservedCoreState,
-    lastObservationAt: Date?,
-    now: Date
-  ) -> ObservedCoreState {
-    guard observed == .running else { return observed }
-    return isFresh(lastObservationAt: lastObservationAt, now: now) ? .running : .unknown
-  }
-}
-
-enum AutomaticConnectionPolicy {
-  static func shouldConnect(
-    didAttemptAutomaticConnection: Bool,
-    automaticRecoveryExhausted: Bool,
-    helperReady: Bool,
-    profileAvailable: Bool,
-    coreRunningForSelectedProfile: Bool
-  ) -> Bool {
-    !didAttemptAutomaticConnection
-      && !automaticRecoveryExhausted
-      && helperReady
-      && profileAvailable
-      && !coreRunningForSelectedProfile
-  }
 }
 
 @MainActor
@@ -339,12 +325,14 @@ final class AppModel {
     case website
     case application
     case policy
+    case autoSelection
 
     var routingName: String {
       switch self {
       case .website: SBMText.localized("Website rule")
       case .application: SBMText.localized("Application rule")
       case .policy: SBMText.localized("Routing policy")
+      case .autoSelection: SBMText.localized("Auto selection")
       }
     }
   }
@@ -400,13 +388,19 @@ final class AppModel {
   }
   var selectedNodeID: ProxyNodeID = .auto {
     didSet {
+      if oldValue != selectedNodeID, selectedNodeID != .auto {
+        effectiveAutoNodeID = nil
+      }
       if oldValue != selectedNodeID { invalidateRoutingInspector() }
     }
   }
-  var helperStatus = SBMText.localized("Checking…")
   var helperUpdateRequired = false
   var helperEnabled = false
-  var helperReachable = false
+  var helperReachable = false {
+    didSet {
+      if !helperReachable { effectiveAutoNodeID = nil }
+    }
+  }
   var helperRequiresApproval = false
   private(set) var helperApprovalPending = false
   private(set) var helperApprovalPolling = false
@@ -424,6 +418,7 @@ final class AppModel {
   var observedCoreState: ObservedCoreState = .unknown {
     didSet {
       if observedCoreState != .running {
+        effectiveAutoNodeID = nil
         activeIPv6Enabled = nil
         lastRuntimeObservationAt = nil
         stopRuntimeLivenessPolling()
@@ -442,6 +437,12 @@ final class AppModel {
   var helperRevision: Int?
   var coreVersion: String?
   var launchAtLoginEnabled = false
+  var restoreLastVPNStateEnabled = false
+  private(set) var launchAtLoginError: String?
+  private(set) var startupRestoreError: String?
+  private var startupRestorePending = false
+  private var terminalAdmissionClosed = false
+  private var durableStopProofRequired = false
   private var busyOperationCount = 0
   var isBusy: Bool { busyOperationCount > 0 }
   var helperSetupInProgress = false
@@ -450,9 +451,14 @@ final class AppModel {
       if let lastError, !lastError.isEmpty { recordRecentError(lastError) }
     }
   }
+  var safeCurrentError: String? {
+    guard let lastError, !lastError.isEmpty else { return nil }
+    return SafeDiagnosticError.sanitize(
+      lastError, secrets: DiagnosticSecrets.collect(from: profiles))
+  }
   private(set) var recentErrors: [RecentError] = []
-  var updateStatus = SBMText.localized("Not checked")
-  var availableUpdateVersion: String?
+  var updateStatus = ""
+  var availableUpdateVersion: String? { availableUpdate?.version }
   var isCheckingForUpdates = false
   var isDownloadingUpdate = false
   var updateDownloadProgress: Double?
@@ -460,9 +466,13 @@ final class AppModel {
   var profiles: [ManagedProfile] = []
   var selectedProfileID: UUID? {
     didSet {
-      if oldValue != selectedProfileID { invalidateRoutingInspector() }
+      if oldValue != selectedProfileID {
+        effectiveAutoNodeID = nil
+        invalidateRoutingInspector()
+      }
     }
   }
+  private(set) var effectiveAutoNodeID: ProxyNodeID?
   var profileName = ""
   private(set) var profileNameError: String?
   var selectedSourceID: UUID?
@@ -498,8 +508,10 @@ final class AppModel {
   var websiteRoutingEditingRuleID: UUID?
   var subscriptionURL = ""
   var subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
-  var subscriptionAppVersion = SubscriptionHeaders.defaultAppVersion
+  var subscriptionAppVersion = SubscriptionHeaders.defaultAppVersion ?? ""
   var subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
+  var subscriptionDeviceOSVersion = SubscriptionHeaders.defaultDeviceOSVersion ?? ""
+  var subscriptionDeviceModel = SubscriptionHeaders.defaultDeviceModel ?? ""
   var subscriptionHWID = SubscriptionHeaders.makeHardwareID()
   var subscriptionStatus = SBMText.localized("No subscription synced")
   var subscriptionStatusLevel: SubscriptionStatusLevel = .neutral
@@ -512,7 +524,7 @@ final class AppModel {
     latencySettingsIssue?.canRetrySynchronization == true
   }
   var canRetryLocalSOCKSSynchronization: Bool {
-    localSOCKSIssue?.canRetrySynchronization == true
+    localSOCKSIssue?.canRetrySynchronization == true && shouldApplyDesiredRuntime
   }
   var runtimeApplyStatus: RuntimeApplyStatus = .saved
   private var syncingOperationCount = 0
@@ -562,39 +574,36 @@ final class AppModel {
   var latencyIntervalMinutesDraft = 10
   var latencyTestURL = LatencyTargetPolicy.defaultURL
   var latencyTestURLDraft = LatencyTargetPolicy.defaultURL
-  private(set) var latencyApplyInProgress = false
+  var dnsSettings = ManagedDNSSettings.defaults
+  var latencyApplyInProgress: Bool { latencySyncTask != nil }
   private var subscriptionRefreshTask: Task<Void, Never>?
   private var profileRefreshTask: Task<Void, Never>?
   private var refreshRequestedByUser = false
   private var latencyRefreshTask: Task<Void, Never>?
   private var latencyOperationTask: Task<Void, Never>?
   private var latencyOperationGeneration = 0
-  private var profileStoreLoadError: String?
+  private var profileStoreLoadFailure: (any Error)?
   private var helperRepairTask: Task<Void, Never>?
   private var helperApprovalPollTask: Task<Void, Never>?
   private var helperApprovalSettingsPresented = false
   private var refreshGeneration = 0
+  private var statusRefreshTask: Task<Void, Never>?
+  private var sourceSyncTask: Task<Void, Never>?
+  private var runtimeReadbackTask: Task<Void, Never>?
+  private var latencySyncTask: Task<Void, Never>?
   private var routingMutationRevisions: [UUID: UInt64] = [:]
   private var routingMutationQueues: [UUID: Task<Void, Never>] = [:]
   private var routingMutationQueueTokens: [UUID: UUID] = [:]
   private var routingMutationStatuses: [UUID: [RoutingMutationKind: RoutingMutationStatus]] = [:]
-  private var routingInspectionGeneration = 0
   private var runtimeFailurePreservedPrevious = false
   private var runtimeFailureProfileID: UUID?
   private var deferredRuntimeApplyPending = false
   private(set) var deferredRuntimeApplyPhase: DeferredRuntimeApplyPhase = .idle
   private(set) var deferredRuntimeApplyError: String?
-  /// `nil` means startup has not yet adopted a helper observation or received
-  /// explicit user intent. Explicit Disconnect is always stored as `false`.
-  private var desiredCoreRunning: Bool?
-  private var refreshInProgress = false
-  var isStatusRefreshInProgress: Bool { refreshInProgress }
   var isRefreshing: Bool { refreshRequestedByUser && profileRefreshTask != nil }
   private var lastLatencyTestAt: Date?
   var latencyTestCompleted = false
   var latencyTestInProgress = false
-  private var didAttemptAutomaticConnection = false
-  private var automaticRecoveryExhausted = false
   private var helperActiveProfileID: UUID?
   private var availableUpdate: AppUpdate?
 
@@ -602,7 +611,6 @@ final class AppModel {
     ProxyNode(
       id: .auto,
       name: SBMText.localized("Auto"),
-      symbol: "wand.and.stars",
       groupID: nil,
       groupName: nil,
       groupOrder: nil,
@@ -619,34 +627,109 @@ final class AppModel {
     ProxyNodeSectionBuilder.make(from: nodes)
   }
 
+  var autoSelectionSections: [ProxyNodeSection] {
+    guard case .compatibility(let profile) = selectedProfile?.payload else { return [] }
+    let desiredNodes = CoreProfile.compatibility(profile).nodes.filter { $0.id != .auto }
+      .map { descriptor in
+        let metadata = groupMetadata(for: descriptor.id)
+        return ProxyNode(
+          id: descriptor.id,
+          name: descriptor.name,
+          groupID: metadata?.id,
+          groupName: metadata?.name,
+          groupOrder: metadata?.groupOrder,
+          nodeOrder: metadata?.nodeOrder,
+          delay: nil
+        )
+      }
+    return ProxyNodeSectionBuilder.make(from: desiredNodes)
+  }
+
+  var autoSelectionExcludedNodeIDs: Set<ProxyNodeID> {
+    guard case .compatibility(let profile) = selectedProfile?.payload else { return [] }
+    return Set(profile.autoExcludedNodeIDs)
+  }
+
+  var autoSelectionAllExcluded: Bool {
+    guard case .compatibility(let profile) = selectedProfile?.payload else { return false }
+    return !profile.connections.isEmpty
+      && profile.connections.allSatisfy { profile.autoExcludedNodeIDs.contains($0.id) }
+  }
+
+  var autoSelectionStatus: RoutingMutationPresentation {
+    routingMutationPresentation(for: .autoSelection, profileID: selectedProfileID)
+  }
+
+  var effectiveAutoNodeName: String? {
+    guard selectedNodeID == .auto,
+      observedCoreState == .running,
+      helperActiveProfileID == selectedProfileID,
+      let effectiveAutoNodeID
+    else { return nil }
+    return nodes.first(where: { $0.id == effectiveAutoNodeID })?.name
+  }
+
   var profileRecoveryRequired: Bool {
-    profileStoreLoadError != nil
+    (profileStoreLoadFailure as? ProfileStoreFailure)?.isMalformedCurrentLibrary == true
   }
 
   var profileRecoveryMessage: String {
-    profileStoreLoadError ?? SBMText.localized("Profile library is available.")
+    profileStoreLoadFailure?.localizedDescription
+      ?? SBMText.localized("Profile library is available.")
+  }
+
+  var profileLoadIssueMessage: String? {
+    guard let profileStoreLoadFailure, !profileRecoveryRequired else { return nil }
+    return profileStoreLoadFailure.localizedDescription
+  }
+
+  var canBackUpProfileLibrary: Bool {
+    profileStoreLoadFailure == nil && !isSyncing && routingMutationQueues.isEmpty
+  }
+
+  var profileReplacementRuntimeIsSafe: Bool {
+    guard !runtimeMutationController.isApplying,
+      !helperSetupInProgress
+    else { return false }
+    let registrationState = helperService.registrationState
+    return coreIsKnownStopped || registrationState == .notRegistered
+      || registrationState == .notFound
+  }
+
+  var canRestoreProfileLibrary: Bool {
+    canBackUpProfileLibrary && profileReplacementRuntimeIsSafe
   }
 
   private let helperService: any HelperServiceManaging
   private let helperLifecycleSender: @Sendable (HelperRequest, Int) async throws -> HelperResponse
   private let helperRequestSender: @Sendable (HelperRequest) async throws -> HelperResponse
-  private let helperApprovalDefaults: UserDefaults
   private let helperApprovalPollDuration: Duration
   private let helperApprovalPollInterval: Duration
   private let applicationBundleURL: URL
   private let subscriptionManager: SubscriptionManager
-  private let runtimeApplyCoordinator: RuntimeApplyCoordinator<HelperRequest, HelperResponse>
+  private let runtimeMutationController: RuntimeMutationController
   private let profileValidator: @Sendable (CoreProfile) async throws -> HelperResponse
   private let profileLibrarySaver: (ProfileLibrary) throws -> Void
-  private let routingRuleSetMatcher: @Sendable ([String], String) async throws -> [String: Bool]
-  private let routingRuleSetRetryDelay: Duration
   private let runtimeStateReader: @Sendable () async throws -> HelperResponse
-  private let latencySender: @Sendable (ProxyNodeID) async throws -> HelperResponse
-  private let latencyCycleSender: (@Sendable () async throws -> HelperResponse)?
+  private let latencySender: @Sendable (ProxyNodeID?) async throws -> HelperResponse
+  private let latencySettleDelay: Duration
+  private let updateChecker: @Sendable (String) async throws -> AppUpdate?
+  private let updateDownloader:
+    @Sendable (
+      AppUpdate, @escaping @Sendable (Double) -> Void
+    ) async throws -> URL
+  private let updateOpener: (URL) -> Bool
+  private static let lifecycleLogger = Logger(
+    subsystem: "com.stillnotfree.sbm",
+    category: "helper-lifecycle"
+  )
+  private var terminalColdOffClaim: ColdOffProof?
   private let latencyPublicationCoordinator = LatencyPublicationCoordinator()
+  private let userDefaults: UserDefaults
   private var menuTrackingObservers: [NSObjectProtocol] = []
+  private var updateOperationTask: Task<Void, Never>?
+  private var updateDownloadAttemptID: UUID?
   private let loginItemService = SMAppService.mainApp
-  private(set) var dependencyEnvironmentKind: AppEnvironmentKind
 
   private func setSubscriptionStatus(
     _ value: String,
@@ -690,7 +773,6 @@ final class AppModel {
     subscriptionManager: SubscriptionManager? = nil,
     helperLifecycleSender:
       (@Sendable (HelperRequest, Int) async throws -> HelperResponse)? = nil,
-    helperApprovalDefaults: UserDefaults? = nil,
     helperApprovalPollDuration: Duration? = nil,
     helperApprovalPollInterval: Duration? = nil,
     applicationBundleURL: URL? = nil,
@@ -699,53 +781,71 @@ final class AppModel {
     profileValidator: (@Sendable (CoreProfile) async throws -> HelperResponse)? = nil,
     profileLibraryLoader: (() throws -> ProfileLibrary?)? = nil,
     profileLibrarySaver: ((ProfileLibrary) throws -> Void)? = nil,
-    routingRuleSetMatcher: (@Sendable ([String], String) async throws -> [String: Bool])? = nil,
-    routingRuleSetRetryDelay: Duration? = nil,
+    userDefaults: UserDefaults = .standard,
     runtimeStateReader: (@Sendable () async throws -> HelperResponse)? = nil,
-    latencySender: (@Sendable (ProxyNodeID) async throws -> HelperResponse)? = nil,
-    latencyCycleSender: (@Sendable () async throws -> HelperResponse)? = nil,
+    latencySender: (@Sendable (ProxyNodeID?) async throws -> HelperResponse)? = nil,
+    latencySettleDelay: Duration? = nil,
+    updateChecker: (@Sendable (String) async throws -> AppUpdate?)? = nil,
+    updateDownloader: (
+      @Sendable (
+        AppUpdate, @escaping @Sendable (Double) -> Void
+      ) async throws -> URL
+    )? = nil,
+    updateOpener: ((URL) -> Bool)? = nil,
     performStartup: Bool = true
   ) {
-    dependencyEnvironmentKind = environment.kind
+    self.userDefaults = userDefaults
+    let restoreEnabled = userDefaults.bool(forKey: restoreLastVPNStateDefaultsKey)
+    restoreLastVPNStateEnabled = restoreEnabled
+    startupRestorePending =
+      restoreEnabled
+      && userDefaults.bool(forKey: lastExplicitVPNConnectedDefaultsKey)
     self.helperService = helperService ?? environment.helperService
     self.helperLifecycleSender = helperLifecycleSender ?? environment.helperLifecycleSender
     self.helperRequestSender = helperRequestSender ?? environment.helperRequestSender
-    self.helperApprovalDefaults = helperApprovalDefaults ?? environment.helperApprovalDefaults
     self.helperApprovalPollDuration =
       helperApprovalPollDuration ?? environment.helperApprovalPollDuration
     self.helperApprovalPollInterval =
       helperApprovalPollInterval ?? environment.helperApprovalPollInterval
     self.applicationBundleURL = applicationBundleURL ?? environment.applicationBundleURL
     self.subscriptionManager = subscriptionManager ?? environment.subscriptionManager
-    runtimeApplyCoordinator = RuntimeApplyCoordinator(
+    runtimeMutationController = RuntimeMutationController(
       sender: runtimeSender ?? environment.runtimeSender
     )
     self.profileValidator = profileValidator ?? environment.profileValidator
     self.profileLibrarySaver = profileLibrarySaver ?? environment.profileLibrarySaver
-    self.routingRuleSetMatcher = routingRuleSetMatcher ?? environment.routingRuleSetMatcher
-    self.routingRuleSetRetryDelay =
-      routingRuleSetRetryDelay ?? environment.routingRuleSetRetryDelay
     self.runtimeStateReader = runtimeStateReader ?? environment.runtimeStateReader
     self.latencySender = latencySender ?? environment.latencySender
-    if let latencyCycleSender {
-      self.latencyCycleSender = latencyCycleSender
-    } else if latencySender == nil {
-      self.latencyCycleSender = environment.latencyCycleSender
-    } else {
-      self.latencyCycleSender = nil
-    }
+    self.latencySettleDelay = latencySettleDelay ?? environment.latencySettleDelay
+    self.updateChecker =
+      updateChecker ?? { currentVersion in
+        try await UpdateService.latest(currentVersion: currentVersion)
+      }
+    self.updateDownloader =
+      updateDownloader ?? { update, progress in
+        try await UpdateService.download(update, progress: progress)
+      }
+    self.updateOpener = updateOpener ?? { NSWorkspace.shared.open($0) }
     if environment.kind == .production {
       installMenuTrackingObservers()
     }
     let stored: ProfileLibrary
     do {
-      stored = try (profileLibraryLoader ?? environment.profileLibraryLoader)() ?? .empty
+      if let loaded = try (profileLibraryLoader ?? environment.profileLibraryLoader)() {
+        stored = loaded
+      } else {
+        let freshInstall = ProfileLibrary.freshInstall()
+        try self.profileLibrarySaver(freshInstall)
+        stored = freshInstall
+      }
     } catch {
       stored = .empty
-      profileStoreLoadError = error.localizedDescription
+      profileStoreLoadFailure = error
     }
     profiles = stored.profiles
     selectedProfileID = stored.selectedProfileID
+    routingMode = stored.routingMode
+    selectedNodeID = stored.selectedNodeID
     localSOCKSEnabled = stored.localSOCKSEnabled
     localSOCKSPort = stored.localSOCKSPort
     localSOCKSEnabledDraft = stored.localSOCKSEnabled
@@ -755,27 +855,24 @@ final class AppModel {
     latencyTestURL = stored.latencyTestURL
     latencyTestURLDraft = stored.latencyTestURL
     ipv6Enabled = stored.ipv6Enabled
-    helperApprovalPending = self.helperApprovalDefaults.bool(
-      forKey: HelperApprovalPersistence.pendingKey
-    )
+    dnsSettings = stored.dnsSettings
     if selectedProfileID == nil || !profiles.contains(where: { $0.id == selectedProfileID }) {
       selectedProfileID = profiles.first?.id
     }
     loadSelectedProfileEditor()
     updateNodes()
-    if let profileStoreLoadError {
-      lastError = profileStoreLoadError
+    if let profileStoreLoadFailure {
+      lastError = profileStoreLoadFailure.localizedDescription
     }
     guard performStartup else { return }
     guard isInstalledInApplications else {
-      helperStatus = SBMText.localized("Move the app to Applications")
       lastError =
         SBMText.localized(
           "Move SBM.app to the Applications folder, eject the DMG, then open the installed copy."
         )
       return
     }
-    enableLaunchAtLoginIfNeeded()
+    refreshLaunchAtLoginStatus()
     refreshRegistrationStatus()
     bootstrapHelper()
     if !profiles.isEmpty {
@@ -790,6 +887,47 @@ final class AppModel {
       ?? (coreRunning ? SBMText.localized("Active configuration") : SBMText.localized("None"))
   }
 
+  func backUpProfileLibrary(to url: URL) {
+    guard canBackUpProfileLibrary else {
+      lastError = SBMText.localized("Backup is unavailable while profile changes are in progress.")
+      return
+    }
+    let accessed = url.startAccessingSecurityScopedResource()
+    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+    do {
+      try ProfileStore.exportProfileLibrary(to: url)
+      lastError = nil
+    } catch {
+      _ = setSettingsError(SBMText.localized("Profile backup failed"), error: error)
+    }
+  }
+
+  func restoreProfileLibrary(from url: URL) {
+    guard canRestoreProfileLibrary else {
+      lastError = SBMText.localized("Restore requires idle profile changes and a stopped runtime.")
+      return
+    }
+    startupRestorePending = false
+    let accessed = url.startAccessingSecurityScopedResource()
+    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+    do {
+      let stored = try ProfileStore.importProfileLibrary(from: url)
+      deferredRuntimeApplyPending = false
+      deferredRuntimeApplyPhase = .idle
+      deferredRuntimeApplyError = nil
+      routingMutationRevisions.removeAll()
+      routingMutationQueueTokens.removeAll()
+      routingMutationStatuses.removeAll()
+      runtimeApplyStatus = .saved
+      runtimeFailurePreservedPrevious = false
+      runtimeFailureProfileID = nil
+      applyProfileLibrary(stored, reconcileRuntime: false)
+      lastError = nil
+    } catch {
+      _ = setSettingsError(SBMText.localized("Profile restore failed"), error: error)
+    }
+  }
+
   func importRecoveredProfileLibrary(from url: URL) {
     let accessed = url.startAccessingSecurityScopedResource()
     defer {
@@ -797,7 +935,7 @@ final class AppModel {
     }
     do {
       let stored = try ProfileStore.importProfileLibrary(from: url)
-      profileStoreLoadError = nil
+      profileStoreLoadFailure = nil
       applyProfileLibrary(stored)
       lastError = nil
       setSubscriptionStatus(SBMText.localized("Profile library recovered"), level: .success)
@@ -807,14 +945,15 @@ final class AppModel {
   }
 
   func resetCorruptProfileLibrary() {
-    guard !coreRunning else {
+    guard profileRecoveryRequired else { return }
+    guard profileReplacementRuntimeIsSafe else {
       lastError = SBMText.localized(
         "Disconnect the VPN before starting with an empty profile library.")
       return
     }
     do {
       let stored = try ProfileStore.resetProfileLibrary()
-      profileStoreLoadError = nil
+      profileStoreLoadFailure = nil
       applyProfileLibrary(stored)
       lastError = nil
       setSubscriptionStatus(
@@ -888,29 +1027,10 @@ final class AppModel {
     }
   }
 
-  var routingPolicyStatusLevel: SubscriptionStatusLevel {
-    switch runtimeApplyStatus {
-    case .active where coreRunning && helperActiveProfileID == selectedProfileID:
-      return hasRoutingPolicy ? .success : .neutral
-    case .failed
-    where runtimeFailureProfileID == nil || runtimeFailureProfileID == selectedProfileID:
-      return .warning
-    case .failed:
-      return .neutral
-    case .saved where hasRoutingPolicy:
-      return .warning
-    case .reconnectRequired:
-      return .warning
-    case .applying, .saved, .active:
-      return .neutral
-    }
-  }
-
-  var desiredRuntimeGeneration: UInt64 { runtimeApplyCoordinator.currentGeneration }
-
   var connectionPresentation: ConnectionPresentation {
     if runtimeApplyStatus == .applying {
-      return (desiredCoreRunning ?? coreRunning) ? .connecting : .disconnecting
+      return (runtimeMutationController.desiredRunning ?? coreRunning)
+        ? .connecting : .disconnecting
     }
     if runtimeApplyStatus == .failed {
       guard observedCoreState != .unknown else { return .unknown }
@@ -928,6 +1048,26 @@ final class AppModel {
     case .stopped: return .disconnected
     case .unknown: return .unknown
     }
+  }
+
+  var connectionAction: Bool? {
+    if runtimeApplyStatus == .failed {
+      switch observedCoreState {
+      case .running: return false
+      case .stopped: return true
+      case .unknown: return connectionPresentation.nextEnabledState
+      }
+    }
+    return connectionPresentation.nextEnabledState
+  }
+
+  var connectionActionEnabled: Bool {
+    guard let action = connectionAction, !helperSetupInProgress else { return false }
+    return action ? currentHelperIsReady : currentRegisteredHelperIsCompatible
+  }
+
+  var runtimeMenuControlsEnabled: Bool {
+    currentHelperIsReady && !helperSetupInProgress
   }
 
   var deferredRuntimeApplyPresentation: DeferredRuntimeApplyPresentation? {
@@ -950,10 +1090,6 @@ final class AppModel {
     )
   }
 
-  func applyDeferredRuntimeChange() {
-    reconnectToApply()
-  }
-
   var profileNameSaveEnabled: Bool {
     guard selectedProfileID != nil else { return false }
     let candidate = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -970,11 +1106,17 @@ final class AppModel {
     guard (try? SubscriptionClient.validateDisplayName(normalizedName)) != nil else {
       return false
     }
+    let appVersion = subscriptionAppVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+    let deviceOSVersion = subscriptionDeviceOSVersion.trimmingCharacters(
+      in: .whitespacesAndNewlines
+    )
+    let deviceModel = subscriptionDeviceModel.trimmingCharacters(in: .whitespacesAndNewlines)
     let headers = SubscriptionHeaders(
       userAgent: subscriptionUserAgent.trimmingCharacters(in: .whitespacesAndNewlines),
-      appVersion: subscriptionAppVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        ? nil : subscriptionAppVersion.trimmingCharacters(in: .whitespacesAndNewlines),
+      appVersion: appVersion.isEmpty ? nil : appVersion,
       deviceOS: subscriptionDeviceOS.trimmingCharacters(in: .whitespacesAndNewlines),
+      deviceOSVersion: deviceOSVersion.isEmpty ? nil : deviceOSVersion,
+      deviceModel: deviceModel.isEmpty ? nil : deviceModel,
       hardwareID: subscriptionHWID.trimmingCharacters(in: .whitespacesAndNewlines)
     )
     guard (try? SubscriptionClient.validate(headers: headers)) != nil else { return false }
@@ -984,6 +1126,38 @@ final class AppModel {
     } catch {
       return false
     }
+  }
+
+  var sourceDraftNeedsSaveOrSync: Bool {
+    guard let selectedSourceID,
+      let source = selectedProfile?.sources.first(where: { $0.id == selectedSourceID })
+    else { return false }
+    let trimmedName = sourceName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let candidateName = trimmedName.isEmpty ? SBMText.localized("Subscription") : trimmedName
+    let candidateURL =
+      (try? SubscriptionClient.validateSourceValue(subscriptionURL))
+      ?? subscriptionURL
+    let candidateFilter =
+      (try? SourceNameFilter.normalized(sourceExcludeRegex))
+      ?? sourceExcludeRegex
+    let appVersion = subscriptionAppVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+    let deviceOSVersion = subscriptionDeviceOSVersion.trimmingCharacters(
+      in: .whitespacesAndNewlines
+    )
+    let deviceModel = subscriptionDeviceModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    let candidateHeaders = SubscriptionHeaders(
+      userAgent: subscriptionUserAgent.trimmingCharacters(in: .whitespacesAndNewlines),
+      appVersion: appVersion.isEmpty ? nil : appVersion,
+      deviceOS: subscriptionDeviceOS.trimmingCharacters(in: .whitespacesAndNewlines),
+      deviceOSVersion: deviceOSVersion.isEmpty ? nil : deviceOSVersion,
+      deviceModel: deviceModel.isEmpty ? nil : deviceModel,
+      hardwareID: subscriptionHWID.trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    return source.payload == nil || sourceEditorError != nil
+      || candidateName != source.name
+      || candidateURL != source.value
+      || candidateFilter != (source.excludeRegex ?? "")
+      || candidateHeaders != source.headers
   }
 
   var latencySettingsDirty: Bool {
@@ -1008,19 +1182,16 @@ final class AppModel {
 
   private var shouldApplyDesiredRuntime: Bool {
     deferredRuntimeApplyPhase != .reconnecting
-      && desiredCoreRunning != false
-      && (coreRunning || runtimeApplyCoordinator.isApplying)
+      && runtimeMutationController.desiredRunning != false
+      && (coreRunning || runtimeMutationController.isApplying)
   }
 
   var canManageRoutingPolicy: Bool {
-    guard case .compatibility = selectedProfile?.payload else { return false }
-    return true
+    selectedProfile?.payload != nil
   }
 
   var canManageSources: Bool {
-    guard let payload = selectedProfile?.payload else { return selectedProfile != nil }
-    guard case .compatibility = payload else { return false }
-    return true
+    selectedProfile != nil
   }
 
   var selectedProfileSources: [ManagedSource] {
@@ -1054,6 +1225,53 @@ final class AppModel {
 
   var routingPolicyMutationStatus: RoutingMutationPresentation {
     routingMutationPresentation(for: .policy, profileID: selectedProfileID)
+  }
+
+  func setNodeIncludedInAuto(
+    _ nodeID: ProxyNodeID,
+    included: Bool,
+    profileID: UUID,
+    sourceID: UUID
+  ) {
+    enqueueRoutingMutation(
+      profileID: profileID,
+      kind: .autoSelection,
+      successMessage: SBMText.localized(
+        included ? "Node included in Auto" : "Node excluded from Auto"),
+      operation: { payload in
+        guard case .compatibility(let profile) = payload,
+          nodeID != .auto,
+          profile.nodeGroups?.contains(where: {
+            $0.id == sourceID.uuidString && $0.nodes.contains(nodeID)
+          }) == true,
+          profile.connections.contains(where: { $0.id == nodeID })
+        else {
+          throw RoutingMutationFailure.ruleMissing(
+            SBMText.localized("The selected node changed before Auto could be updated.")
+          )
+        }
+        var exclusions = profile.autoExcludedNodeIDs
+        if included {
+          exclusions.removeAll { $0 == nodeID }
+        } else if !exclusions.contains(nodeID) {
+          exclusions.append(nodeID)
+        }
+        let ordered =
+          profile.connections.flatMap { connection in
+            exclusions.filter { $0 == connection.id }
+          } + exclusions.filter { id in !profile.connections.contains { $0.id == id } }
+        return .compatibility(
+          VPNProfile(
+            connections: profile.connections,
+            routingPolicy: profile.routingPolicy,
+            nodeGroups: profile.nodeGroups ?? [],
+            applicationRoutingRules: profile.applicationRoutingRules,
+            websiteRoutingRules: profile.websiteRoutingRules,
+            autoExcludedNodeIDs: ordered
+          )
+        )
+      }
+    )
   }
 
   var websiteRoutingActionTitle: String {
@@ -1174,13 +1392,6 @@ final class AppModel {
     )
   }
 
-  var routingInspectorApplicationLabel: String {
-    guard let routingInspectorApplicationID,
-      let rule = applicationRoutingRules.first(where: { $0.id == routingInspectorApplicationID })
-    else { return SBMText.localized("Default traffic") }
-    return rule.displayName
-  }
-
   var fixedApplicationRoutingNodes: [ProxyNode] {
     let fixedIDs = Set(
       (selectedProfile?.payload?.nodes ?? [])
@@ -1203,7 +1414,7 @@ final class AppModel {
     return true
   }
 
-  func addApplicationRoutingRule(from url: URL) {
+  func addApplicationRoutingRule(from url: URL, profileID: UUID) {
     let accessed = url.startAccessingSecurityScopedResource()
     defer {
       if accessed { url.stopAccessingSecurityScopedResource() }
@@ -1215,12 +1426,12 @@ final class AppModel {
       presentRoutingMutationFailure(
         error,
         kind: .application,
-        profileID: selectedProfileID
+        profileID: profileID
       )
       return
     }
     enqueueApplicationRoutingMutation(
-      profileID: selectedProfileID,
+      profileID: profileID,
       successMessage: SBMText.localized("Application rule saved")
     ) { payload in
       guard payload.applicationRoutingRules.count < 32 else {
@@ -1250,7 +1461,7 @@ final class AppModel {
     }
   }
 
-  func replaceApplicationRoutingRule(_ id: UUID, from url: URL) {
+  func replaceApplicationRoutingRule(_ id: UUID, from url: URL, profileID: UUID) {
     let accessed = url.startAccessingSecurityScopedResource()
     defer {
       if accessed { url.stopAccessingSecurityScopedResource() }
@@ -1262,12 +1473,12 @@ final class AppModel {
       presentRoutingMutationFailure(
         error,
         kind: .application,
-        profileID: selectedProfileID
+        profileID: profileID
       )
       return
     }
     enqueueApplicationRoutingMutation(
-      profileID: selectedProfileID,
+      profileID: profileID,
       successMessage: SBMText.localized("Application rule updated")
     ) { payload in
       guard let current = payload.applicationRoutingRules.first(where: { $0.id == id })
@@ -1351,8 +1562,6 @@ final class AppModel {
     {
       routingInspectorApplicationID = nil
     }
-    routingInspectionGeneration &+= 1
-    let inspectionGeneration = routingInspectionGeneration
     do {
       guard let payload = selectedProfile?.payload else {
         throw RoutingInspectionFailure.unavailable
@@ -1376,65 +1585,17 @@ final class AppModel {
       let result = RoutingInspector.inspect(
         route: composed.route,
         context: context,
-        outboundDecisions: composed.outboundDecisions,
-        selectorOutbound: composed.selectorOutbound
+        outboundDecisions: composed.outboundDecisions
       )
       let contextLabel = selectedApplication?.displayName ?? SBMText.localized("Default traffic")
       let output = composed.presentation(for: result)
       let details = composed.details(for: result, contextLabel: contextLabel)
       let snapshot = currentRoutingInspectionSnapshot()
-      let ruleSetTags = RoutingInspector.referencedRuleSetTags(in: composed.route)
-      guard result.decision == .indeterminate, !ruleSetTags.isEmpty else {
-        routingInspectorState = .result(
-          snapshot: snapshot,
-          output: output,
-          details: details
-        )
-        return
-      }
-      guard ruleSetTags.count <= 8, currentHelperIsReady, coreRunning,
-        helperActiveProfileID == selectedProfileID
-      else {
-        routingInspectorState = .result(
-          snapshot: snapshot,
-          output: SBMText.localized("Connect this profile to inspect its active rule-set cache."),
-          details: details
-        )
-        return
-      }
-      let destination = routingInspectorInput.trimmingCharacters(in: .whitespacesAndNewlines)
-      routingInspectorState = .checking(snapshot: snapshot, details: details)
-      Task {
-        do {
-          let matches = try await matchActiveRuleSets(ruleSetTags, destination: destination)
-          guard inspectionGeneration == routingInspectionGeneration,
-            routingInspectorState.snapshot == snapshot,
-            currentRoutingInspectionSnapshot() == snapshot
-          else { return }
-          let exact = RoutingInspector.inspect(
-            route: composed.route,
-            context: context,
-            outboundDecisions: composed.outboundDecisions,
-            selectorOutbound: composed.selectorOutbound,
-            ruleSetMatches: matches
-          )
-          routingInspectorState = .result(
-            snapshot: snapshot,
-            output: composed.presentation(for: exact),
-            details: composed.details(for: exact, contextLabel: contextLabel)
-          )
-        } catch {
-          guard inspectionGeneration == routingInspectionGeneration,
-            routingInspectorState.snapshot == snapshot,
-            currentRoutingInspectionSnapshot() == snapshot
-          else { return }
-          routingInspectorState = .failed(
-            snapshot: snapshot,
-            output: SBMText.localized("Active rule-set data is unavailable."),
-            details: error.localizedDescription
-          )
-        }
-      }
+      routingInspectorState = .result(
+        snapshot: snapshot,
+        output: output,
+        details: details
+      )
     } catch {
       routingInspectorState = .failed(
         snapshot: currentRoutingInspectionSnapshot(),
@@ -1461,30 +1622,12 @@ final class AppModel {
       selectedNodeID: selectedNodeID,
       mode: routingMode,
       routingRevision: selectedProfileID.flatMap { routingMutationRevisions[$0] } ?? 0,
-      ipv6Enabled: ipv6Enabled,
-      activeProfileID: helperActiveProfileID,
-      coreRunning: coreRunning,
-      helperRevision: helperRevision
+      ipv6Enabled: ipv6Enabled
     )
   }
 
   private func invalidateRoutingInspector() {
-    routingInspectionGeneration &+= 1
     routingInspectorState = .idle
-  }
-
-  private func matchActiveRuleSets(_ tags: [String], destination: String) async throws
-    -> [String: Bool]
-  {
-    for attempt in 0..<5 {
-      do {
-        return try await routingRuleSetMatcher(tags, destination)
-      } catch {
-        guard attempt < 4 else { throw error }
-        try await Task.sleep(for: routingRuleSetRetryDelay)
-      }
-    }
-    throw CancellationError()
   }
 
   var supportSnapshot: SupportSnapshot {
@@ -1495,7 +1638,6 @@ final class AppModel {
     let profileKind: SupportSnapshot.ProfileKind
     switch selectedProfile?.payload {
     case .compatibility: profileKind = .compatibilitySubscription
-    case .native: profileKind = .nativeJSON
     case nil: profileKind = .none
     }
     let delays = Dictionary(
@@ -1534,7 +1676,7 @@ final class AppModel {
       routingMode: routingMode,
       profileKind: profileKind,
       profileUpdatedAt: selectedProfile?.updatedAt,
-      profileLibraryAvailable: profileStoreLoadError == nil,
+      profileLibraryAvailable: profileStoreLoadFailure == nil,
       sourceCount: selectedProfile?.sources.count ?? 0,
       localSOCKSEnabled: localSOCKSEnabled,
       localSOCKSPort: localSOCKSPort,
@@ -1549,13 +1691,12 @@ final class AppModel {
     )
   }
 
-  var diagnosticReport: String { supportSnapshot.text }
-
   func clearRecentErrors() {
     recentErrors.removeAll(keepingCapacity: true)
   }
 
   func applicationDidBecomeActive() {
+    refreshLaunchAtLoginStatus()
     guard helperApprovalPending else {
       refresh()
       return
@@ -1564,7 +1705,13 @@ final class AppModel {
     continueHelperApprovalFlow()
   }
 
-  func refresh() {
+  func refresh(observeAutoNode: Bool = false) {
+    guard isInstalledInApplications else { return }
+    guard !terminalAdmissionClosed else { return }
+    if observeAutoNode {
+      effectiveAutoNodeID = nil
+    }
+    guard !runtimeMutationController.isApplying else { return }
     guard !helperApprovalPending else {
       continueHelperApprovalFlow()
       return
@@ -1574,64 +1721,96 @@ final class AppModel {
       observedCoreState = .unknown
       return
     }
-    guard !helperSetupInProgress, !refreshInProgress else { return }
+    guard !helperSetupInProgress, statusRefreshTask == nil else { return }
 
     refreshGeneration += 1
     let generation = refreshGeneration
-    let runtimeGeneration = runtimeApplyCoordinator.currentGeneration
+    let selectedProfileBasis = selectedProfileID
+    let runtimeGeneration = runtimeMutationController.currentGeneration
     let errorBasis = lastError
-    refreshInProgress = true
-    Task {
-      defer {
-        if refreshGeneration == generation {
-          refreshInProgress = false
-        }
-      }
+    statusRefreshTask = Task {
+      defer { statusRefreshTask = nil }
       do {
+        let authorizeDesiredRuntimeRecovery =
+          !terminalAdmissionClosed
+          && !durableStopProofRequired
+          && observedCoreState == .running
+          && runtimeMutationController.desiredRunning == true
+        if authorizeDesiredRuntimeRecovery {
+          terminalColdOffClaim?.release()
+          terminalColdOffClaim = nil
+        }
         let response = try await helperLifecycleSender(
-          HelperRequest(action: .status),
+          HelperRequest(
+            action: .status,
+            observeAutoNode: observeAutoNode ? true : nil,
+            recoverDesiredRuntime: authorizeDesiredRuntimeRecovery ? true : nil
+          ),
           5
         )
         guard refreshGeneration == generation, !helperSetupInProgress else { return }
+        guard helperService.registrationState == .enabled else {
+          refreshRegistrationStatus()
+          return
+        }
+        let runtimeCurrent = runtimeGeneration == runtimeMutationController.currentGeneration
         guard response.protocolVersion == HelperConstants.protocolVersion,
           response.helperVersion == HelperConstants.helperVersion,
           response.helperRevision == HelperConstants.helperRevision
         else {
-          helperStatus = SBMText.localized("Helper update required")
+          guard runtimeCurrent else { return }
           helperUpdateRequired = true
           helperReachable = false
           observedCoreState = .unknown
+          helperActiveProfileID = nil
+          coreVersion = nil
           lastError = AppModelFailure.helperRevisionMismatch.localizedDescription
           return
         }
-        let runtimeCurrent = runtimeGeneration == runtimeApplyCoordinator.currentGeneration
-        apply(
+        let compatible = apply(
           response,
           policy: .observation(
             runtimeCurrent: runtimeCurrent,
             adoptDesiredRuntime: runtimeCurrent && runtimeGeneration == 0
-          )
+          ),
+          updateNodeDescriptors: false
         )
-        helperReachable = true
-        if lastError == errorBasis {
+        if runtimeCurrent && compatible { helperReachable = true }
+        if runtimeCurrent && lastError == errorBasis {
           lastError = response.success ? nil : SBMText.localized(response.message)
         }
-        connectAutomaticallyIfNeeded()
+        if observeAutoNode,
+          let selectedProfileBasis,
+          selectedProfileBasis == selectedProfileID,
+          runtimeGeneration == runtimeMutationController.currentGeneration,
+          selectedNodeID == .auto,
+          response.coreRunning,
+          response.activeProfileID == selectedProfileBasis,
+          response.selectedNode == .auto,
+          let effectiveAutoNode = response.effectiveAutoNode,
+          nodes.contains(where: { $0.id == effectiveAutoNode })
+        {
+          effectiveAutoNodeID = effectiveAutoNode
+        }
       } catch {
         guard refreshGeneration == generation, !helperSetupInProgress else { return }
-        helperStatus = SBMText.localized("Helper unavailable")
+        guard helperService.registrationState == .enabled else {
+          refreshRegistrationStatus()
+          return
+        }
+        guard runtimeGeneration == runtimeMutationController.currentGeneration else { return }
         helperUpdateRequired = false
         helperReachable = false
-        if runtimeGeneration == runtimeApplyCoordinator.currentGeneration {
-          observedCoreState = .unknown
-        }
+        observedCoreState = .unknown
+        helperActiveProfileID = nil
+        coreVersion = nil
         if lastError == errorBasis { lastError = error.localizedDescription }
       }
     }
   }
 
   private func startRuntimeLivenessPolling() {
-    guard runtimeLivenessTask == nil else { return }
+    guard !terminalAdmissionClosed, runtimeLivenessTask == nil else { return }
     runtimeLivenessTask = Task { [weak self] in
       while !Task.isCancelled {
         do {
@@ -1656,9 +1835,9 @@ final class AppModel {
   }
 
   func checkForUpdates(userInitiated: Bool = true) {
-    guard !isCheckingForUpdates else { return }
+    guard !terminalAdmissionClosed, updateOperationTask == nil else { return }
     if !userInitiated,
-      let previous = UserDefaults.standard.object(
+      let previous = userDefaults.object(
         forKey: "LastUpdateCheck"
       ) as? Date,
       Date().timeIntervalSince(previous) < 24 * 60 * 60
@@ -1666,109 +1845,137 @@ final class AppModel {
       return
     }
     isCheckingForUpdates = true
-    if userInitiated { updateStatus = SBMText.localized("Checking…") }
-    Task {
-      defer { isCheckingForUpdates = false }
+    updateOperationTask = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        self.isCheckingForUpdates = false
+        self.updateOperationTask = nil
+      }
       do {
-        let update = try await UpdateService.latest(
-          currentVersion: applicationVersion
-        )
-        UserDefaults.standard.set(Date(), forKey: "LastUpdateCheck")
-        availableUpdate = update
-        availableUpdateVersion = update?.version
-        updateStatus =
+        let update = try await self.updateChecker(self.applicationVersion)
+        guard !Task.isCancelled, !self.terminalAdmissionClosed else { return }
+        self.userDefaults.set(Date(), forKey: "LastUpdateCheck")
+        self.availableUpdate = update
+        self.updateStatus =
           update.map { SBMText.format("Version %@ is available", $0.version) }
           ?? SBMText.localized("SBM is up to date")
       } catch {
+        guard !Task.isCancelled, !self.terminalAdmissionClosed else { return }
+        self.updateStatus = SBMText.localized("Update check failed")
         if userInitiated {
-          updateStatus = SBMText.localized("Update check failed")
-          lastError = error.localizedDescription
+          self.lastError = error.localizedDescription
         }
       }
     }
   }
 
   func downloadAndOpenUpdate() {
+    guard !terminalAdmissionClosed else { return }
     guard let update = availableUpdate else {
       checkForUpdates()
       return
     }
-    guard !isDownloadingUpdate else { return }
+    guard updateOperationTask == nil else { return }
     isDownloadingUpdate = true
     updateDownloadProgress = 0
     updateStatus = SBMText.format("Downloading %@…", update.version)
-    Task {
+    let attemptID = UUID()
+    updateDownloadAttemptID = attemptID
+    updateOperationTask = Task { [weak self] in
+      guard let self else { return }
       defer {
-        isDownloadingUpdate = false
-        updateDownloadProgress = nil
+        if self.updateDownloadAttemptID == attemptID {
+          self.updateDownloadAttemptID = nil
+          self.isDownloadingUpdate = false
+          self.updateDownloadProgress = nil
+        }
+        self.updateOperationTask = nil
       }
       do {
-        let image = try await UpdateService.download(update) { [weak self] fraction in
+        let image = try await self.updateDownloader(update) { [weak self] fraction in
           Task { @MainActor [weak self] in
-            guard self?.isDownloadingUpdate == true else { return }
-            self?.updateDownloadProgress = fraction
-            self?.updateStatus = SBMText.format(
+            guard let self,
+              !self.terminalAdmissionClosed,
+              self.updateDownloadAttemptID == attemptID
+            else { return }
+            self.updateDownloadProgress = fraction
+            self.updateStatus = SBMText.format(
               "Downloading %@… %lld%%",
               update.version,
               Int((fraction * 100).rounded())
             )
           }
         }
-        guard NSWorkspace.shared.open(image) else {
+        guard !Task.isCancelled, !self.terminalAdmissionClosed else { return }
+        guard self.updateOpener(image) else {
           throw UpdateFailure.downloadFailed
         }
-        updateStatus = SBMText.localized("Verified DMG opened")
-        lastError = nil
+        guard !Task.isCancelled, !self.terminalAdmissionClosed else { return }
+        self.updateStatus = SBMText.localized(
+          "DMG authenticated by the SBM project publisher and opened")
+        self.lastError = nil
       } catch {
-        updateStatus = SBMText.localized("Update failed")
-        lastError = error.localizedDescription
+        guard !Task.isCancelled, !self.terminalAdmissionClosed else { return }
+        self.updateStatus = SBMText.localized("Update failed")
+        self.lastError = error.localizedDescription
       }
     }
   }
 
   func enableHelper() {
+    guard !terminalAdmissionClosed else { return }
     guard isInstalledInApplications else {
       lastError = SBMText.localized(
         "Move SBM.app to the Applications folder, eject the DMG, then open the installed copy."
       )
       return
     }
-    if helperRequiresApproval {
+    if terminalColdOffClaim != nil {
+      repairHelper()
+      return
+    }
+    if helperService.registrationState == .requiresApproval {
       beginHelperApprovalFlow(openSystemSettings: true)
       return
     }
     guard helperRepairTask == nil else {
-      helperStatus = SBMText.localized("Helper setup already in progress…")
       return
     }
     invalidateRefresh()
     beginBusyOperation()
     helperSetupInProgress = true
-    helperStatus = SBMText.localized("Enabling background helper…")
     lastError = nil
     helperRepairTask = Task {
       defer {
         endBusyOperation()
         helperSetupInProgress = false
         helperRepairTask = nil
+        if startupRestorePending && helperEnabled && !durableStopProofRequired {
+          refresh()
+        }
       }
       do {
-        let response = try await enableCurrentHelper()
-        apply(
+        await runtimeMutationController.drainAcceptedWork()
+        try Task.checkCancellation()
+        let runtimeGeneration = runtimeMutationController.currentGeneration
+        let response = try await upgradeLegacyHelper()
+        try Task.checkCancellation()
+        let compatible = apply(
           response,
           policy: .observation(
-            runtimeCurrent: true,
-            adoptDesiredRuntime: runtimeApplyCoordinator.currentGeneration == 0
+            runtimeCurrent: runtimeGeneration == runtimeMutationController.currentGeneration,
+            adoptDesiredRuntime: runtimeGeneration == 0
           )
         )
-        helperReachable = true
-        helperStatus = SBMText.localized("Helper enabled")
+        helperReachable = compatible
+        if !response.success { lastError = SBMText.localized(response.message) }
         completeHelperApprovalFlow()
-        connectAutomaticallyIfNeeded()
       } catch HelperLifecycleFailure.approvalRequired,
         HelperLifecycleFailure.registrationDidNotFinish
       {
         beginHelperApprovalFlow(openSystemSettings: true)
+      } catch is CancellationError {
+        refreshRegistrationStatus()
       } catch {
         completeHelperApprovalFlow()
         helperReachable = false
@@ -1780,8 +1987,18 @@ final class AppModel {
   }
 
   func repairHelper() {
+    guard !terminalAdmissionClosed else { return }
+    guard isInstalledInApplications else {
+      lastError = SBMText.localized(
+        "Move SBM.app to the Applications folder, eject the DMG, then open the installed copy."
+      )
+      return
+    }
+    if helperService.registrationState == .requiresApproval {
+      beginHelperApprovalFlow(openSystemSettings: true)
+      return
+    }
     guard helperRepairTask == nil else {
-      helperStatus = SBMText.localized("Helper update already in progress…")
       return
     }
     invalidateRefresh()
@@ -1789,78 +2006,163 @@ final class AppModel {
     helperSetupInProgress = true
     helperReachable = false
     observedCoreState = .unknown
-    helperStatus = SBMText.localized("Repairing helper…")
     lastError = nil
 
     helperRepairTask = Task {
+      var coldOffClaim: ColdOffProof?
+      var coldOffProved = false
+      var runtimeGeneration = runtimeMutationController.currentGeneration
       defer {
         endBusyOperation()
         helperSetupInProgress = false
         helperRepairTask = nil
+        if startupRestorePending && helperEnabled && !durableStopProofRequired {
+          refresh()
+        }
       }
       do {
-        if helperEnabled {
-          if let current = try? await helperLifecycleSender(
-            HelperRequest(action: .status),
-            5
-          ),
+        await runtimeMutationController.drainAcceptedWork()
+        try Task.checkCancellation()
+        runtimeGeneration = runtimeMutationController.currentGeneration
+        if let existingClaim = terminalColdOffClaim,
+          (try? existingClaim.requireOFFMarker()) != nil
+        {
+          coldOffClaim = existingClaim
+          coldOffProved = true
+        } else {
+          terminalColdOffClaim?.release()
+          terminalColdOffClaim = nil
+        }
+        if helperEnabled && !coldOffProved {
+          let current: HelperResponse?
+          do {
+            current = try await helperLifecycleSender(HelperRequest(action: .status), 5)
+          } catch is CancellationError {
+            throw CancellationError()
+          } catch {
+            current = nil
+          }
+          if let current,
             current.protocolVersion == HelperConstants.protocolVersion,
             current.helperVersion == HelperConstants.helperVersion,
             current.helperRevision == HelperConstants.helperRevision
           {
-            apply(
-              current,
-              policy: .observation(
-                runtimeCurrent: true,
-                adoptDesiredRuntime: runtimeApplyCoordinator.currentGeneration == 0
+            if current.legacy1115Retired == false, current.success, !current.coreRunning {
+              guard runtimeGeneration == runtimeMutationController.currentGeneration else {
+                throw CancellationError()
+              }
+              let retired = try await upgradeLegacyHelper()
+              try Task.checkCancellation()
+              let compatible = apply(
+                retired,
+                policy: .observation(
+                  runtimeCurrent: runtimeGeneration == runtimeMutationController.currentGeneration,
+                  adoptDesiredRuntime: runtimeGeneration == 0
+                )
               )
-            )
-            helperReachable = true
-            helperStatus = SBMText.localized("Helper ready")
-            lastError = current.success ? nil : SBMText.localized(current.message)
-            completeHelperApprovalFlow()
-            connectAutomaticallyIfNeeded()
-            return
+              helperReachable = compatible
+              if !retired.success { lastError = SBMText.localized(retired.message) }
+              completeHelperApprovalFlow()
+              return
+            }
+            if current.legacy1115Retired == true {
+              let compatible = apply(
+                current,
+                policy: .observation(
+                  runtimeCurrent: runtimeGeneration == runtimeMutationController.currentGeneration,
+                  adoptDesiredRuntime: runtimeGeneration == 0
+                )
+              )
+              helperReachable = compatible
+              lastError = current.success ? nil : SBMText.localized(current.message)
+              completeHelperApprovalFlow()
+              return
+            }
+            guard current.legacy1115Retired == nil else {
+              throw HelperLifecycleFailure.startupTimedOut(
+                "The registered helper has no valid legacy-retirement receipt."
+              )
+            }
           }
-          helperStatus = SBMText.localized("Stopping previous helper…")
-          _ = try? await helperLifecycleSender(
-            HelperRequest(action: .stop, stopReason: .helperReplacement),
-            5
-          )
         }
-        helperStatus = SBMText.localized("Replacing background helper…")
-        let response = try await HelperLifecycle.replace(
+        try Task.checkCancellation()
+        durableStopProofRequired = true
+        if let coldOffClaim {
+          try HelperClient.validateHeldColdOffClaim(
+            bundleURL: applicationBundleURL,
+            claim: coldOffClaim
+          )
+        } else {
+          coldOffClaim = try HelperClient.acquireColdOffClaim(bundleURL: applicationBundleURL)
+          terminalColdOffClaim = coldOffClaim
+          coldOffProved = true
+        }
+        guard runtimeGeneration == runtimeMutationController.currentGeneration else {
+          throw CancellationError()
+        }
+        coldOffProved = true
+        durableStopProofRequired = false
+        runtimeMutationController.desiredRunning = false
+        observedCoreState = .stopped
+        startupRestorePending = false
+        runtimeGeneration = runtimeMutationController.currentGeneration
+        try Task.checkCancellation()
+        durableStopProofRequired = true
+        var response = try await HelperLifecycle.replace(
           service: helperService,
-          waiting: { [weak self] in
-            self?.helperStatus = SBMText.localized("Waiting for macOS to replace helper…")
-          }
+          coldOffClaim: coldOffClaim,
+          candidateBundleURL: applicationBundleURL
         ) {
           try await self.helperLifecycleSender(
             HelperRequest(action: .status),
             5
           )
         }
-        apply(
+        if response.legacy1115Retired != true {
+          response = try await upgradeLegacyHelper()
+        }
+        try Task.checkCancellation()
+        let compatible = apply(
           response,
           policy: .observation(
-            runtimeCurrent: true,
-            adoptDesiredRuntime: runtimeApplyCoordinator.currentGeneration == 0
+            runtimeCurrent: runtimeGeneration == runtimeMutationController.currentGeneration,
+            adoptDesiredRuntime: runtimeGeneration == 0
           )
         )
-        helperReachable = true
-        helperStatus = SBMText.localized("Helper updated")
+        helperReachable = compatible
+        durableStopProofRequired = !(compatible && response.success && !response.coreRunning)
+        terminalColdOffClaim = nil
+        if !response.success { lastError = SBMText.localized(response.message) }
         completeHelperApprovalFlow()
-        connectAutomaticallyIfNeeded()
       } catch HelperLifecycleFailure.approvalRequired,
         HelperLifecycleFailure.registrationDidNotFinish
       {
+        if coldOffProved {
+          _ = retainCurrentColdOffClaim(
+            coldOffClaim,
+            expectedGeneration: runtimeGeneration
+          )
+        }
         beginHelperApprovalFlow(openSystemSettings: true)
       } catch is CancellationError {
         refreshRegistrationStatus()
+        if coldOffProved {
+          _ = retainCurrentColdOffClaim(
+            coldOffClaim,
+            expectedGeneration: runtimeGeneration
+          )
+        }
       } catch {
         completeHelperApprovalFlow()
         helperReachable = false
-        observedCoreState = .unknown
+        if coldOffProved {
+          _ = retainCurrentColdOffClaim(
+            coldOffClaim,
+            expectedGeneration: runtimeGeneration
+          )
+        } else {
+          observedCoreState = .unknown
+        }
         lastError = SBMText.format(
           "Background helper repair failed: %@", error.localizedDescription)
         refreshRegistrationStatus()
@@ -1868,30 +2170,132 @@ final class AppModel {
     }
   }
 
-  func openBackgroundItems() {
-    helperService.openSystemSettings()
+  private func retainCurrentColdOffClaim(
+    _ claim: ColdOffProof?,
+    expectedGeneration: UInt64
+  ) -> Bool {
+    guard expectedGeneration == runtimeMutationController.currentGeneration else { return false }
+
+    var retainedClaim = claim
+    if let claim {
+      do {
+        try claim.requireOFFMarker()
+      } catch {
+        claim.release()
+        if terminalColdOffClaim === claim { terminalColdOffClaim = nil }
+        retainedClaim = nil
+      }
+    }
+    if retainedClaim == nil {
+      do {
+        retainedClaim = try ColdOffProof.acquireClaim()
+      } catch {
+        guard expectedGeneration == runtimeMutationController.currentGeneration else {
+          return false
+        }
+        terminalColdOffClaim?.release()
+        terminalColdOffClaim = nil
+        durableStopProofRequired = true
+        observedCoreState = .unknown
+        return false
+      }
+    }
+
+    guard expectedGeneration == runtimeMutationController.currentGeneration else {
+      retainedClaim?.release()
+      return false
+    }
+    terminalColdOffClaim = retainedClaim
+    durableStopProofRequired = false
+    runtimeMutationController.desiredRunning = false
+    observedCoreState = .stopped
+    startupRestorePending = false
+    Self.lifecycleLogger.notice("Retained a validated held Cold OFF claim.")
+    return true
+  }
+
+  func setLaunchAtLoginEnabled(_ enabled: Bool) {
+    guard isInstalledInApplications else {
+      launchAtLoginError = SBMText.localized(
+        "Move SBM.app to the Applications folder, eject the DMG, then open the installed copy."
+      )
+      return
+    }
+    launchAtLoginError = nil
+    Task {
+      do {
+        if enabled {
+          try loginItemService.register()
+        } else {
+          try await loginItemService.unregister()
+        }
+      } catch {
+        refreshLaunchAtLoginStatus()
+        launchAtLoginError = boundedSettingsError(
+          SBMText.localized("Launch at Login could not be changed"),
+          error: error
+        )
+        return
+      }
+      refreshLaunchAtLoginStatus()
+      guard launchAtLoginEnabled != enabled else { return }
+      launchAtLoginError = SBMText.localized(
+        enabled && loginItemService.status == .requiresApproval
+          ? "Allow SBM to launch at login in System Settings."
+          : "Launch at Login did not reach the requested state. Check System Settings."
+      )
+    }
+  }
+
+  func setRestoreLastVPNStateEnabled(_ enabled: Bool) {
+    guard enabled != restoreLastVPNStateEnabled else { return }
+    userDefaults.set(enabled, forKey: restoreLastVPNStateDefaultsKey)
+    restoreLastVPNStateEnabled = enabled
+    if !enabled { startupRestorePending = false }
   }
 
   func setCoreEnabled(_ enabled: Bool) {
-    guard deferredRuntimeApplyPhase != .reconnecting else { return }
-    guard desiredCoreRunning != enabled || !runtimeApplyCoordinator.isApplying else { return }
-    desiredCoreRunning = enabled
-    didAttemptAutomaticConnection = true
+    guard !terminalAdmissionClosed else { return }
+    let reconnectingDisconnect = deferredRuntimeApplyPhase == .reconnecting && !enabled
+    if deferredRuntimeApplyPhase == .reconnecting, enabled { return }
+    guard
+      reconnectingDisconnect
+        || runtimeMutationController.desiredRunning != enabled
+        || !runtimeMutationController.isApplying
+    else { return }
+    guard !enabled || selectedProfile?.payload != nil else {
+      lastError = SBMText.localized(
+        "Connect could not start because the selected profile is unavailable.")
+      return
+    }
+    startupRestorePending = false
+    userDefaults.set(enabled, forKey: lastExplicitVPNConnectedDefaultsKey)
+    runtimeMutationController.desiredRunning = enabled
     if !enabled {
+      if deferredRuntimeApplyPhase == .reconnecting { deferredRuntimeApplyPhase = .pending }
       profileRefreshTask?.cancel()
       cancelLatencyOperation()
     }
-    guard helperEnabled else {
-      lastError = SBMText.localized("Enable the background helper before connecting.")
-      return
-    }
-    guard currentHelperIsReady else {
-      lastError = SBMText.localized("Update or repair the background helper before connecting.")
-      return
+    if enabled {
+      guard helperEnabled else {
+        lastError = SBMText.localized("Enable the background helper before connecting.")
+        return
+      }
+      guard currentHelperIsReady else {
+        lastError = SBMText.localized("Update or repair the background helper before connecting.")
+        return
+      }
+    } else {
+      guard currentRegisteredHelperIsCompatible else {
+        lastError =
+          helperUpdateRequired
+          ? AppModelFailure.helperRevisionMismatch.localizedDescription
+          : AppModelFailure.helperNotReady.localizedDescription
+        return
+      }
     }
     let request: HelperRequest
     if enabled, let payload = selectedProfile?.payload {
-      didAttemptAutomaticConnection = true
       request = makeStartRequest(profile: payload, profileID: selectedProfileID)
     } else {
       request = HelperRequest(action: .stop, stopReason: .userDisconnect)
@@ -1915,18 +2319,18 @@ final class AppModel {
 
     deferredRuntimeApplyPhase = .reconnecting
     deferredRuntimeApplyError = nil
-    didAttemptAutomaticConnection = true
     let wasRunning = observedCoreState == .running
-    desiredCoreRunning = wasRunning || desiredCoreRunning == true
+    runtimeMutationController.desiredRunning =
+      wasRunning || runtimeMutationController.desiredRunning == true
     if wasRunning {
-      desiredCoreRunning = false
+      runtimeMutationController.desiredRunning = false
       submitRuntimeApply(
         HelperRequest(action: .stop, stopReason: .reconnectToApply),
         onCurrentResult: { [weak self] result in
           guard let self else { return }
           switch result {
           case .success(let response) where response.success && !response.coreRunning:
-            self.desiredCoreRunning = true
+            self.runtimeMutationController.desiredRunning = true
             self.startLatestDeferredRuntime()
           case .success(let response):
             self.finishDeferredRuntimeReconnectFailure(
@@ -1949,7 +2353,7 @@ final class AppModel {
         }
       )
     } else {
-      desiredCoreRunning = true
+      runtimeMutationController.desiredRunning = true
       startLatestDeferredRuntime()
     }
   }
@@ -1964,15 +2368,16 @@ final class AppModel {
       )
       return
     }
+    let request = makeStartRequest(profile: payload, profileID: selectedProfileID)
     submitRuntimeApply(
-      makeStartRequest(profile: payload, profileID: selectedProfileID),
+      request,
       onCurrentResult: { [weak self] result in
         guard let self else { return }
         switch result {
         case .success(let response)
         where response.success && response.coreRunning
           && response.runtimeOutcome == .applied:
-          self.confirmDeferredRuntimeReconnect()
+          self.confirmDeferredRuntimeReconnect(basis: request)
         case .success(let response):
           self.finishDeferredRuntimeReconnectFailure(
             SBMText.format(
@@ -1996,13 +2401,23 @@ final class AppModel {
     )
   }
 
-  private func confirmDeferredRuntimeReconnect() {
-    let generation = runtimeApplyCoordinator.currentGeneration
-    Task { [weak self] in
+  private func confirmDeferredRuntimeReconnect(basis: HelperRequest) {
+    guard !terminalAdmissionClosed else { return }
+    let generation = runtimeMutationController.currentGeneration
+    let previousTask = runtimeReadbackTask
+    previousTask?.cancel()
+    runtimeReadbackTask = Task { [weak self] in
+      if let previousTask { await previousTask.value }
       guard let self else { return }
+      defer {
+        if !Task.isCancelled || self.terminalAdmissionClosed {
+          self.runtimeReadbackTask = nil
+        }
+      }
+      guard self.reconnectConfirmationIsCurrent(generation: generation) else { return }
       do {
         let response = try await runtimeStateReader()
-        guard generation == self.runtimeApplyCoordinator.currentGeneration else { return }
+        guard self.reconnectConfirmationIsCurrent(generation: generation) else { return }
         guard response.protocolVersion == HelperConstants.protocolVersion,
           response.helperVersion == HelperConstants.helperVersion,
           response.helperRevision == HelperConstants.helperRevision
@@ -2027,16 +2442,23 @@ final class AppModel {
           )
           return
         }
+        guard self.reconnectStartStillMatchesDesiredState(basis) else {
+          self.deferredRuntimeApplyPending = true
+          self.deferredRuntimeApplyPhase = .pending
+          self.runtimeApplyStatus = .reconnectRequired
+          return
+        }
         self.deferredRuntimeApplyPending = false
         self.deferredRuntimeApplyPhase = .idle
         self.deferredRuntimeApplyError = nil
         self.clearDeferredRuntimePendingPresentations()
-        self.desiredCoreRunning = true
+        self.runtimeMutationController.desiredRunning = true
         self.runtimeApplyStatus = .active
         self.runtimeFailurePreservedPrevious = false
         self.runtimeFailureProfileID = nil
         self.lastError = nil
       } catch {
+        guard self.reconnectConfirmationIsCurrent(generation: generation) else { return }
         self.finishDeferredRuntimeReconnectFailure(
           SBMText.localized(
             "Reconnect to Apply completed, but authoritative helper status could not be read"
@@ -2047,10 +2469,33 @@ final class AppModel {
     }
   }
 
+  private func reconnectConfirmationIsCurrent(generation: UInt64) -> Bool {
+    !terminalAdmissionClosed && !Task.isCancelled
+      && generation == runtimeMutationController.currentGeneration
+      && deferredRuntimeApplyPhase == .reconnecting
+  }
+
+  private func reconnectStartStillMatchesDesiredState(_ basis: HelperRequest) -> Bool {
+    guard let profileID = selectedProfileID, let payload = selectedProfile?.payload else {
+      return false
+    }
+    let current = makeStartRequest(profile: payload, profileID: profileID)
+    return basis.profileID == current.profileID
+      && basis.profile == current.profile
+      && basis.mode == current.mode
+      && basis.node == current.node
+      && basis.localSOCKSEnabled == current.localSOCKSEnabled
+      && basis.localSOCKSPort == current.localSOCKSPort
+      && basis.latencyTestURL == current.latencyTestURL
+      && basis.ipv6Enabled == current.ipv6Enabled
+      && basis.dnsSettings == current.dnsSettings
+  }
+
   private func finishDeferredRuntimeReconnectFailure(
     _ prefix: String,
     error: (any Error)? = nil
   ) {
+    guard deferredRuntimeApplyPhase == .reconnecting else { return }
     deferredRuntimeApplyPhase = .failed
     let message: String
     if let error {
@@ -2063,62 +2508,177 @@ final class AppModel {
     deferredRuntimeApplyError = message
     deferredRuntimeApplyPending = true
     runtimeApplyStatus = .reconnectRequired
-    desiredCoreRunning = observedCoreState == .running ? true : false
+    runtimeMutationController.desiredRunning = observedCoreState == .running ? true : false
   }
 
   func disconnectBeforeQuit() async -> Bool {
-    if coreIsKnownStopped {
-      subscriptionRefreshTask?.cancel()
-      helperRepairTask?.cancel()
-      helperApprovalPollTask?.cancel()
-      return true
-    }
-    desiredCoreRunning = false
-    didAttemptAutomaticConnection = true
-    profileRefreshTask?.cancel()
-    cancelLatencyOperation()
+    guard !terminalAdmissionClosed else { return false }
+    let previousDesiredRunning = runtimeMutationController.desiredRunning
+    let interruptedLatencySync = latencySyncTask != nil
+    terminalAdmissionClosed = true
+    startupRestorePending = false
+    runtimeMutationController.desiredRunning = false
+    await cancelAndDrainAcceptedWork()
 
-    let result = await withCheckedContinuation { continuation in
-      submitRuntimeApply(
-        HelperRequest(action: .shutdown, stopReason: .appTermination),
-        onCurrentResult: { continuation.resume(returning: $0) },
-        onSuperseded: {
-          continuation.resume(
-            returning: .failure(AppModelFailure.runtimeMutationSuperseded)
-          )
+    let registrationState = helperService.registrationState
+    let legacyRegistrationState = helperService.legacyRegistrationState
+    let legacyRegistrationIsAbsent =
+      legacyRegistrationState == .notRegistered || legacyRegistrationState == .notFound
+    let noCurrentHelperWasObserved =
+      registrationState == .notRegistered || registrationState == .notFound
+    if noCurrentHelperWasObserved, legacyRegistrationIsAbsent,
+      !runtimeMutationController.isApplying
+    {
+      if !durableStopProofRequired {
+        if let claim = terminalColdOffClaim {
+          if retainCurrentColdOffClaim(
+            claim,
+            expectedGeneration: runtimeMutationController.currentGeneration
+          ) {
+            subscriptionRefreshTask?.cancel()
+            return true
+          }
+        } else {
+          subscriptionRefreshTask?.cancel()
+          return true
         }
-      )
+      }
+    }
+
+    var shutdownGeneration = runtimeMutationController.currentGeneration
+    let result = await withCheckedContinuation { continuation in
+      shutdownGeneration =
+        submitRuntimeApply(
+          HelperRequest(action: .shutdown, stopReason: .appTermination),
+          onCurrentResult: { continuation.resume(returning: $0) },
+          onSuperseded: {
+            continuation.resume(
+              returning: .failure(AppModelFailure.runtimeMutationSuperseded)
+            )
+          }
+        ) ?? shutdownGeneration
     }
     switch result {
     case .success(let response) where response.success && !response.coreRunning:
+      durableStopProofRequired = false
+      observedCoreState = .stopped
       lastError = nil
       subscriptionRefreshTask?.cancel()
-      helperRepairTask?.cancel()
-      helperApprovalPollTask?.cancel()
       return true
     case .success(let response):
       lastError =
         SBMText.localized("Unable to disconnect before quitting: ")
         + AppModelFailure.coreStopFailed(response.message).localizedDescription
-      return false
     case .failure(let error):
       lastError = SBMText.format(
         "Unable to disconnect before quitting: %@", error.localizedDescription)
-      return false
+    }
+
+    Self.lifecycleLogger.error(
+      "Terminal Shutdown did not prove OFF; checking for a fresh Cold OFF claim."
+    )
+    if let claim = terminalColdOffClaim,
+      retainCurrentColdOffClaim(
+        claim,
+        expectedGeneration: shutdownGeneration
+      )
+    {
+      lastError = nil
+      subscriptionRefreshTask?.cancel()
+      return true
+    }
+    do {
+      let claim = try ColdOffProof.acquireClaim()
+      terminalColdOffClaim?.release()
+      terminalColdOffClaim = claim
+      durableStopProofRequired = false
+      observedCoreState = .stopped
+      lastError = nil
+      subscriptionRefreshTask?.cancel()
+      return true
+    } catch {
+      durableStopProofRequired = true
+      lastError = SBMText.format(
+        "Unable to disconnect before quitting: %@", error.localizedDescription)
+    }
+    if shutdownGeneration == runtimeMutationController.currentGeneration,
+      runtimeMutationController.desiredRunning == false
+    {
+      runtimeMutationController.desiredRunning = previousDesiredRunning
+    }
+    if interruptedLatencySync { markLatencySynchronizationPending(showAsLastError: false) }
+    reopenTerminalAdmission()
+    return false
+  }
+
+  private func cancelAndDrainAcceptedWork() async {
+    let statusTask = statusRefreshTask
+    let syncTask = sourceSyncTask
+    let refreshTask = profileRefreshTask
+    let repairTask = helperRepairTask
+    let approvalTask = helperApprovalPollTask
+    let readbackTask = runtimeReadbackTask
+    let latencySyncTask = self.latencySyncTask
+    let latencyTask = latencyOperationTask
+    let updateTask = updateOperationTask
+    let routingTasks = Array(routingMutationQueues.values)
+
+    statusTask?.cancel()
+    syncTask?.cancel()
+    refreshTask?.cancel()
+    repairTask?.cancel()
+    approvalTask?.cancel()
+    readbackTask?.cancel()
+    latencySyncTask?.cancel()
+    updateTask?.cancel()
+    for task in routingTasks { task.cancel() }
+    cancelLatencyOperation()
+
+    if let statusTask { await statusTask.value }
+    if let syncTask { await syncTask.value }
+    if let refreshTask { await refreshTask.value }
+    if let repairTask { await repairTask.value }
+    if let approvalTask { await approvalTask.value }
+    if let readbackTask { await readbackTask.value }
+    if let latencySyncTask { await latencySyncTask.value }
+    for task in routingTasks { await task.value }
+    if let latencyTask { await latencyTask.value }
+    if let updateTask { await updateTask.value }
+  }
+
+  private func reopenTerminalAdmission() {
+    terminalAdmissionClosed = false
+    terminalColdOffClaim?.release()
+    terminalColdOffClaim = nil
+    if deferredRuntimeApplyPhase == .reconnecting {
+      deferredRuntimeApplyPending = true
+      deferredRuntimeApplyPhase = .pending
+      runtimeApplyStatus = .reconnectRequired
+    }
+    if helperApprovalPending { startHelperApprovalPolling() }
+    if coreRunning {
+      startRuntimeLivenessPolling()
+      scheduleNextLatencyRefresh()
     }
   }
 
   func setRoutingMode(_ mode: RoutingMode) {
+    guard mode != routingMode else { return }
+    do {
+      try persistProfileLibrary(routingMode: mode)
+    } catch {
+      _ = setSettingsError(SBMText.localized("Routing mode was not saved"), error: error)
+      return
+    }
     routingMode = mode
     guard deferredRuntimeApplyPhase != .reconnecting else { return }
-    guard desiredCoreRunning != false else {
-      if !runtimeApplyCoordinator.isApplying {
-        runtimeApplyCoordinator.markSaved()
+    guard runtimeMutationController.desiredRunning != false else {
+      if !runtimeMutationController.isApplying {
         runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
       }
       return
     }
-    if runtimeApplyCoordinator.isApplying {
+    if runtimeMutationController.isApplying {
       applyCurrentDesiredRuntimeIfNeeded()
     } else {
       submitRuntimeApply(HelperRequest(action: .setMode, mode: mode))
@@ -2126,11 +2686,17 @@ final class AppModel {
   }
 
   func setSelectedNode(_ node: ProxyNodeID) {
+    guard node != selectedNodeID else { return }
+    do {
+      try persistProfileLibrary(selectedNodeID: node)
+    } catch {
+      _ = setSettingsError(SBMText.localized("Selected node was not saved"), error: error)
+      return
+    }
     selectedNodeID = node
     guard deferredRuntimeApplyPhase != .reconnecting else { return }
-    guard desiredCoreRunning != false else {
-      if !runtimeApplyCoordinator.isApplying {
-        runtimeApplyCoordinator.markSaved()
+    guard runtimeMutationController.desiredRunning != false else {
+      if !runtimeMutationController.isApplying {
         runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
       }
       return
@@ -2139,13 +2705,12 @@ final class AppModel {
       deferredRuntimeApplyPending = true
       deferredRuntimeApplyPhase = .pending
       deferredRuntimeApplyError = nil
-      if !runtimeApplyCoordinator.isApplying {
-        runtimeApplyCoordinator.markSaved()
+      if !runtimeMutationController.isApplying {
         runtimeApplyStatus = .reconnectRequired
       }
       return
     }
-    if runtimeApplyCoordinator.isApplying {
+    if runtimeMutationController.isApplying {
       applyCurrentDesiredRuntimeIfNeeded()
     } else {
       submitRuntimeApply(HelperRequest(action: .setNode, node: node))
@@ -2180,6 +2745,7 @@ final class AppModel {
   }
 
   func testLatency() {
+    guard !terminalAdmissionClosed else { return }
     guard currentHelperIsReady else {
       lastError = SBMText.localized(
         "Update or repair the background helper before testing latency.")
@@ -2202,8 +2768,8 @@ final class AppModel {
     let generation = latencyOperationGeneration
     let profileID = selectedProfileID
     let activeProfileID = helperActiveProfileID
-    let runtimeGeneration = runtimeApplyCoordinator.currentGeneration
-    let requestedNodes = nodes.map(\.id)
+    let runtimeGeneration = runtimeMutationController.currentGeneration
+    let requestedNodes = nodes.map(\.id).filter { $0 != .auto }
     latencyOperationTask = Task {
       defer {
         if generation == latencyOperationGeneration {
@@ -2213,47 +2779,37 @@ final class AppModel {
         }
       }
       do {
-        var responses: [HelperResponse] = []
-        if let latencyCycleSender {
+        for node in requestedNodes {
           try Task.checkCancellation()
-          responses = [try await latencyCycleSender()]
+          let response = try await latencySender(node)
           try Task.checkCancellation()
-          guard generation == latencyOperationGeneration,
-            selectedProfileID == profileID,
-            helperActiveProfileID == activeProfileID,
-            runtimeApplyCoordinator.currentGeneration == runtimeGeneration
-          else { return }
-        } else {
-          for node in requestedNodes {
-            try Task.checkCancellation()
-            let response = try await latencySender(node)
-            try Task.checkCancellation()
-            guard generation == latencyOperationGeneration,
-              selectedProfileID == profileID,
-              helperActiveProfileID == activeProfileID,
-              runtimeApplyCoordinator.currentGeneration == runtimeGeneration
-            else { return }
-            responses.append(response)
-          }
-        }
-        guard !responses.isEmpty else { return }
-        for response in responses {
           guard response.protocolVersion == HelperConstants.protocolVersion,
             response.helperVersion == HelperConstants.helperVersion,
             response.helperRevision == HelperConstants.helperRevision
           else {
             throw AppModelFailure.helperRevisionMismatch
           }
+          guard generation == latencyOperationGeneration,
+            selectedProfileID == profileID,
+            helperActiveProfileID == activeProfileID,
+            runtimeMutationController.currentGeneration == runtimeGeneration
+          else { return }
+        }
+        try await Task.sleep(for: latencySettleDelay)
+        try Task.checkCancellation()
+        let response = try await latencySender(nil)
+        try Task.checkCancellation()
+        guard response.protocolVersion == HelperConstants.protocolVersion,
+          response.helperVersion == HelperConstants.helperVersion,
+          response.helperRevision == HelperConstants.helperRevision
+        else {
+          throw AppModelFailure.helperRevisionMismatch
         }
         guard generation == latencyOperationGeneration,
           selectedProfileID == profileID,
           helperActiveProfileID == activeProfileID,
-          runtimeApplyCoordinator.currentGeneration == runtimeGeneration
+          runtimeMutationController.currentGeneration == runtimeGeneration
         else { return }
-        let response =
-          responses.count == 1
-          ? responses[0]
-          : combinedLatencyResponse(responses, requestedNodes: requestedNodes)
         let publication = LatencyPublication(
           response: response,
           profileID: profileID,
@@ -2267,7 +2823,11 @@ final class AppModel {
       } catch is CancellationError {
         return
       } catch {
-        guard generation == latencyOperationGeneration else { return }
+        guard generation == latencyOperationGeneration,
+          selectedProfileID == profileID,
+          helperActiveProfileID == activeProfileID,
+          runtimeMutationController.currentGeneration == runtimeGeneration
+        else { return }
         helperReachable = false
         observedCoreState = .unknown
         lastError = error.localizedDescription
@@ -2275,39 +2835,11 @@ final class AppModel {
     }
   }
 
-  private func combinedLatencyResponse(
-    _ responses: [HelperResponse],
-    requestedNodes: [ProxyNodeID]
-  ) -> HelperResponse {
-    let last = responses[responses.count - 1]
-    var delaysByID: [ProxyNodeID: NodeDelay] = [:]
-    for response in responses {
-      for delay in response.delays {
-        delaysByID[delay.node] = delay
-      }
-    }
-    return HelperResponse(
-      success: responses.allSatisfy(\.success),
-      coreRunning: last.coreRunning,
-      coreVersion: last.coreVersion,
-      mode: last.mode,
-      selectedNode: last.selectedNode,
-      activeProfileID: last.activeProfileID,
-      activeIPv6Enabled: last.activeIPv6Enabled,
-      nodes: last.nodes,
-      delays: requestedNodes.compactMap { delaysByID[$0] },
-      automaticRecoveryExhausted: last.automaticRecoveryExhausted,
-      ruleSetMatches: last.ruleSetMatches,
-      runtimeOutcome: last.runtimeOutcome,
-      message: last.message
-    )
-  }
-
   private func publishLatencyIfCurrent(_ publication: LatencyPublication) {
     guard publication.profileID == selectedProfileID,
       publication.activeProfileID == helperActiveProfileID,
       publication.operationGeneration == latencyOperationGeneration,
-      publication.runtimeGeneration == runtimeApplyCoordinator.currentGeneration
+      publication.runtimeGeneration == runtimeMutationController.currentGeneration
     else { return }
     publishLatency(publication)
   }
@@ -2322,20 +2854,11 @@ final class AppModel {
     for delay in publication.response.delays {
       delaysByID[delay.node] = delay
     }
-    let nodeIDs = Set(nodes.map(\.id))
-    let measured = publication.response.delays
-      .filter { nodeIDs.contains($0.node) }
-      .compactMap(\.milliseconds)
-    var updatedNodes = nodes.map { node in
+    let updatedNodes = nodes.map { node in
       guard let delay = delaysByID[node.id] else { return node }
       var updated = node
       updated.delay = delay.milliseconds
       return updated
-    }
-    if let autoIndex = updatedNodes.firstIndex(where: { $0.id == .auto }),
-      updatedNodes[autoIndex].delay == nil
-    {
-      updatedNodes[autoIndex].delay = measured.min()
     }
     nodes = updatedNodes
     latencyTestCompleted = publication.response.success
@@ -2361,15 +2884,6 @@ final class AppModel {
       return
     }
     testLatency()
-  }
-
-  func setLatencyIntervalMinutes(_ value: Int) {
-    latencyIntervalMinutesDraft = value
-  }
-
-  @discardableResult
-  func applyLatencyTestURL() -> Bool {
-    applyLatencySettings()
   }
 
   @discardableResult
@@ -2407,10 +2921,7 @@ final class AppModel {
     if currentHelperIsReady {
       synchronizeLatencyTarget(normalized)
     } else {
-      let message = SBMText.localized(
-        "Saved locally; background helper synchronization is pending.")
-      latencySettingsIssue = .runtimeSynchronization(message)
-      lastError = message
+      markLatencySynchronizationPending()
     }
     return true
   }
@@ -2426,12 +2937,33 @@ final class AppModel {
     synchronizeLatencyTarget(latencyTestURL)
   }
 
-  func resetLatencySettings() {
-    latencyIntervalMinutesDraft = 10
-    latencyTestURLDraft = LatencyTargetPolicy.defaultURL
+  /// Discard only the closed Settings window's editor state. Saved work stays owned by the model.
+  func endSettingsEditing() {
+    var editorErrors = [profileNameError, sourceEditorError]
+    if case .validation(let message) = latencySettingsIssue {
+      editorErrors.append(message)
+      latencySettingsIssue = nil
+    }
+    if case .validation(let message) = localSOCKSIssue {
+      editorErrors.append(message)
+      localSOCKSIssue = nil
+    }
+    if let lastError, editorErrors.contains(lastError) { self.lastError = nil }
+    clearStaleDNSValidationError(for: dnsSettings)
+    loadSelectedProfileEditor()
+    localSOCKSEnabledDraft = localSOCKSEnabled
+    localSOCKSPortDraft = localSOCKSPort
+    latencyIntervalMinutesDraft = latencyIntervalMinutes
+    latencyTestURLDraft = latencyTestURL
+    cancelWebsiteRoutingEdit()
+    websiteRoutingTarget = .selectedProxy
+    routingInspectorInput = ""
+    routingInspectorApplicationID = nil
+    invalidateRoutingInspector()
   }
 
-  func resetLatencyTestURL() {
+  func resetLatencySettings() {
+    latencyIntervalMinutesDraft = 10
     latencyTestURLDraft = LatencyTargetPolicy.defaultURL
   }
 
@@ -2466,19 +2998,24 @@ final class AppModel {
       return true
     }
     localSOCKSApplyInProgress = true
-    applyCurrentDesiredRuntimeIfNeeded { [weak self] result in
-      guard let self else { return }
-      self.localSOCKSApplyInProgress = false
-      if case .failure(let error) = result {
-        let message = self.setSettingsError(
-          SBMText.localized("Local SOCKS5 runtime synchronization failed"),
-          error: error
-        )
-        self.localSOCKSIssue = .runtimeSynchronization(message)
-      } else {
-        self.localSOCKSIssue = nil
+    applyCurrentDesiredRuntimeIfNeeded(
+      onCurrentResult: { [weak self] result in
+        guard let self else { return }
+        self.localSOCKSApplyInProgress = false
+        if case .failure(let error) = result {
+          let message = self.setSettingsError(
+            SBMText.localized("Local SOCKS5 runtime synchronization failed"),
+            error: error
+          )
+          self.localSOCKSIssue = .runtimeSynchronization(message)
+        } else {
+          self.localSOCKSIssue = nil
+        }
+      },
+      onSuperseded: { [weak self] in
+        self?.localSOCKSApplyInProgress = false
       }
-    }
+    )
     return true
   }
 
@@ -2492,8 +3029,7 @@ final class AppModel {
     }
     ipv6Enabled = enabled
     guard shouldApplyDesiredRuntime else {
-      if !runtimeApplyCoordinator.isApplying {
-        runtimeApplyCoordinator.markSaved()
+      if !runtimeMutationController.isApplying {
         runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
       }
       lastError = nil
@@ -2502,22 +3038,59 @@ final class AppModel {
     applyCurrentDesiredRuntimeIfNeeded()
   }
 
-  func retryLocalSOCKSSynchronization() {
-    guard canRetryLocalSOCKSSynchronization else { return }
-    localSOCKSApplyInProgress = true
-    applyCurrentDesiredRuntimeIfNeeded { [weak self] result in
-      guard let self else { return }
-      self.localSOCKSApplyInProgress = false
-      if case .failure(let error) = result {
-        let message = self.setSettingsError(
-          SBMText.localized("Local SOCKS5 runtime synchronization failed"),
-          error: error
-        )
-        self.localSOCKSIssue = .runtimeSynchronization(message)
-      } else {
-        self.localSOCKSIssue = nil
-      }
+  func saveDNSSettings(_ proposed: ManagedDNSSettings) -> Bool {
+    guard let settings = try? proposed.validated() else {
+      lastError = SBMText.localized("DNS settings are invalid")
+      return false
     }
+    if lastError == SBMText.localized("DNS settings are invalid") { lastError = nil }
+    guard settings != dnsSettings else { return true }
+    do {
+      try persistProfileLibrary(dnsSettings: settings)
+    } catch {
+      _ = setSettingsError(SBMText.localized("DNS settings were not saved"), error: error)
+      return false
+    }
+    dnsSettings = settings
+    lastError = nil
+    guard shouldApplyDesiredRuntime else {
+      if !runtimeMutationController.isApplying {
+        runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
+      }
+      return true
+    }
+    applyCurrentDesiredRuntimeIfNeeded()
+    return true
+  }
+
+  func clearStaleDNSValidationError(for proposed: ManagedDNSSettings) {
+    guard (try? proposed.validated()) != nil,
+      lastError == SBMText.localized("DNS settings are invalid")
+    else { return }
+    lastError = nil
+  }
+
+  func retryLocalSOCKSSynchronization() {
+    guard canRetryLocalSOCKSSynchronization, shouldApplyDesiredRuntime else { return }
+    localSOCKSApplyInProgress = true
+    applyCurrentDesiredRuntimeIfNeeded(
+      onCurrentResult: { [weak self] result in
+        guard let self else { return }
+        self.localSOCKSApplyInProgress = false
+        if case .failure(let error) = result {
+          let message = self.setSettingsError(
+            SBMText.localized("Local SOCKS5 runtime synchronization failed"),
+            error: error
+          )
+          self.localSOCKSIssue = .runtimeSynchronization(message)
+        } else {
+          self.localSOCKSIssue = nil
+        }
+      },
+      onSuperseded: { [weak self] in
+        self?.localSOCKSApplyInProgress = false
+      }
+    )
   }
 
   func saveAndSyncSubscription() {
@@ -2556,7 +3129,9 @@ final class AppModel {
     guard canManageSources, let selectedProfileID,
       let profileIndex = profiles.firstIndex(where: { $0.id == selectedProfileID })
     else { return }
-    let source = ManagedSource(name: "Subscription \(profiles[profileIndex].sources.count + 1)")
+    let source = ManagedSource(
+      name: SBMText.format("Subscription %@", String(profiles[profileIndex].sources.count + 1))
+    )
     let previousSelection = selectedSourceID
     profiles[profileIndex].sources.append(source)
     selectedSourceID = source.id
@@ -2577,39 +3152,42 @@ final class AppModel {
     }
   }
 
-  func deleteSelectedSource() {
-    guard let selectedProfileID, let selectedSourceID,
-      let profileIndex = profiles.firstIndex(where: { $0.id == selectedProfileID }),
+  func deleteSelectedSource(profileID: UUID, sourceID: UUID) {
+    guard let profileIndex = profiles.firstIndex(where: { $0.id == profileID }),
       let sourceIndex = profiles[profileIndex].sources.firstIndex(where: {
-        $0.id == selectedSourceID
+        $0.id == sourceID
       })
     else { return }
 
     let previous = profiles
+    let selectedProfileIsTarget = selectedProfileID == profileID
+    let selectedSourceIsTarget = selectedProfileIsTarget && selectedSourceID == sourceID
     profiles[profileIndex].sources.remove(at: sourceIndex)
     do {
       try rebuildCompatibilityPayload(at: profileIndex)
-      self.selectedSourceID = profiles[profileIndex].sources.first?.id
-      loadSelectedSourceEditor()
-      try persistProfileLibrary()
-      updateNodes()
-      profileAvailable = profiles[profileIndex].payload != nil
-      let status =
-        profileAvailable
-        ? SBMText.localized("Source removed")
-        : SBMText.localized("No sources synced")
-      setSubscriptionStatus(
-        status,
-        level: profileAvailable ? .success : .neutral
-      )
-      lastError = nil
-      if self.selectedProfileID == selectedProfileID {
-        applyCurrentDesiredRuntimeIfNeeded()
+      if selectedSourceIsTarget {
+        selectedSourceID = profiles[profileIndex].sources.first?.id
+        loadSelectedSourceEditor()
       }
+      try persistProfileLibrary()
+      startSubscriptionRefreshLoop()
+      if selectedProfileIsTarget {
+        updateNodes()
+        profileAvailable = profiles[profileIndex].payload != nil
+        let status =
+          profileAvailable
+          ? SBMText.localized("Source removed")
+          : SBMText.localized("No sources synced")
+        setSubscriptionStatus(status, level: profileAvailable ? .success : .neutral)
+      }
+      lastError = nil
+      if selectedProfileIsTarget { applyCurrentDesiredRuntimeIfNeeded() }
     } catch {
       profiles = previous
-      loadSelectedProfileEditor()
-      updateNodes()
+      if selectedProfileIsTarget {
+        loadSelectedProfileEditor()
+        updateNodes()
+      }
       lastError = error.localizedDescription
     }
   }
@@ -2621,15 +3199,12 @@ final class AppModel {
   }
 
   func resetSubscriptionRequestPreset() {
-    let reset = SubscriptionHeaders(
-      userAgent: subscriptionUserAgent,
-      appVersion: subscriptionAppVersion.isEmpty ? nil : subscriptionAppVersion,
-      deviceOS: subscriptionDeviceOS,
-      hardwareID: subscriptionHWID
-    ).resettingRequestPreset()
+    let reset = SubscriptionHeaders(hardwareID: subscriptionHWID).resettingRequestPreset()
     subscriptionUserAgent = reset.userAgent
     subscriptionAppVersion = reset.appVersion ?? ""
     subscriptionDeviceOS = reset.deviceOS
+    subscriptionDeviceOSVersion = reset.deviceOSVersion ?? ""
+    subscriptionDeviceModel = reset.deviceModel ?? ""
     subscriptionHWID = reset.hardwareID
   }
 
@@ -2654,55 +3229,6 @@ final class AppModel {
     }
   }
 
-  func importNativeProfile(from url: URL) {
-    let accessed = url.startAccessingSecurityScopedResource()
-    defer {
-      if accessed { url.stopAccessingSecurityScopedResource() }
-    }
-    let name = url.deletingPathExtension().lastPathComponent
-    let result = Result { try Data(contentsOf: url, options: [.mappedIfSafe]) }
-    beginSyncingOperation()
-    Task {
-      defer { endSyncingOperation() }
-      do {
-        let native = try NativeProfileParser.parse(result.get())
-        let payload = CoreProfile.native(native)
-        try await validateProfile(payload)
-        let imported = ManagedProfile(
-          name: name,
-          payload: payload,
-          updatedAt: Date()
-        )
-        let previousSelection = selectedProfileID
-        profiles.append(imported)
-        selectedProfileID = imported.id
-        loadSelectedProfileEditor()
-        updateNodes()
-        profileAvailable = true
-        setSubscriptionStatus(SBMText.localized("Imported JSON profile"), level: .success)
-        do {
-          try persistProfileLibrary()
-        } catch {
-          if let index = profiles.firstIndex(where: { $0.id == imported.id }) {
-            profiles.remove(at: index)
-          }
-          if selectedProfileID == imported.id {
-            selectedProfileID = previousSelection
-          }
-          loadSelectedProfileEditor()
-          updateNodes()
-          profileAvailable = selectedProfile?.payload != nil
-          throw error
-        }
-        lastError = nil
-        applyCurrentDesiredRuntimeIfNeeded()
-      } catch {
-        lastError = error.localizedDescription
-        setSubscriptionStatus(SBMText.localized("Import failed"), level: .warning)
-      }
-    }
-  }
-
   func importRoutingPolicy(from url: URL) {
     let accessed = url.startAccessingSecurityScopedResource()
     defer {
@@ -2717,22 +3243,19 @@ final class AppModel {
       )
       return
     }
-    let result = Result { try Data(contentsOf: url, options: [.mappedIfSafe]) }
+    let result = Result { try RoutingPolicyParser.parse(contentsOf: url) }
     beginSyncingOperation()
     Task {
       do {
-        let policy = try RoutingPolicyParser.parse(result.get())
+        let policy = try result.get()
         enqueueRoutingMutation(
           profileID: selectedProfileID,
           kind: .policy,
           successMessage: SBMText.localized("Routing policy saved"),
           operation: { payload in
-            guard case .compatibility(let current) = payload else {
-              throw RoutingMutationFailure.profileChanged(
-                SBMText.localized(
-                  "The profile changed while the routing policy was being prepared. Try again."
-                )
-              )
+            let current: VPNProfile
+            switch payload {
+            case .compatibility(let profile): current = profile
             }
             return .compatibility(
               VPNProfile(
@@ -2740,7 +3263,8 @@ final class AppModel {
                 routingPolicy: policy,
                 nodeGroups: current.nodeGroups ?? [],
                 applicationRoutingRules: current.applicationRoutingRules,
-                websiteRoutingRules: current.websiteRoutingRules
+                websiteRoutingRules: current.websiteRoutingRules,
+                autoExcludedNodeIDs: current.autoExcludedNodeIDs
               )
             )
           },
@@ -2755,68 +3279,34 @@ final class AppModel {
 
   func clearRoutingPolicy() {
     guard let selectedProfileID,
-      let index = profiles.firstIndex(where: { $0.id == selectedProfileID }),
-      case .compatibility(let current) = profiles[index].payload,
+      let profile = profiles.first(where: { $0.id == selectedProfileID }),
+      case .compatibility(let current) = profile.payload,
       current.routingPolicy != nil
     else { return }
-    let updated = CoreProfile.compatibility(
-      VPNProfile(
-        connections: current.connections,
-        nodeGroups: current.nodeGroups ?? [],
-        applicationRoutingRules: current.applicationRoutingRules,
-        websiteRoutingRules: current.websiteRoutingRules
-      )
-    )
-    let previousProfile = profiles[index]
-    var committedProfile = previousProfile
-    committedProfile.payload = updated
-    profiles[index] = committedProfile
-    do {
-      try persistProfileLibrary()
-    } catch {
-      if profiles[index] == committedProfile { profiles[index] = previousProfile }
-      lastError = error.localizedDescription
-      return
-    }
-    if shouldApplyDesiredRuntime(for: selectedProfileID) {
-      setSubscriptionStatus(SBMText.localized("Routing policy removal applying"), level: .neutral)
-      submitRuntimeApply(
-        makeStartRequest(profile: updated, profileID: selectedProfileID),
-        onCurrentResult: { [weak self] result in
-          guard let self else { return }
-          switch result {
-          case .success(let response) where response.runtimeOutcome == .reconnectRequired:
-            self.setSubscriptionStatus(
-              SBMText.localized("Routing policy removed and saved"), level: .success
-            )
-          case .success:
-            self.setSubscriptionStatus(
-              SBMText.localized("Routing policy removed and active"), level: .success
-            )
-          case .failure(let error):
-            self.rollbackProfileUpdate(
-              profileID: selectedProfileID,
-              committed: committedProfile,
-              previous: previousProfile,
-              originalError: error,
-              visibleProfileID: selectedProfileID
-            )
-            if self.selectedProfileID == selectedProfileID { self.updateNodes() }
-            self.setSubscriptionStatus(
-              SBMText.localized("Routing policy removal failed"), level: .warning
-            )
-          }
-        },
-        visibleProfileID: selectedProfileID
-      )
-    } else {
-      runtimeApplyCoordinator.markSaved()
-      if !runtimeApplyCoordinator.isApplying {
-        runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
+    enqueueRoutingMutation(
+      profileID: selectedProfileID,
+      kind: .policy,
+      successMessage: SBMText.localized("Routing policy removed"),
+      operation: { payload in
+        guard case .compatibility(let current) = payload,
+          current.routingPolicy != nil
+        else {
+          throw RoutingMutationFailure.profileChanged(
+            self.staleRoutingMutationMessage(for: .policy)
+          )
+        }
+        return .compatibility(
+          VPNProfile(
+            connections: current.connections,
+            routingPolicy: nil,
+            nodeGroups: current.nodeGroups ?? [],
+            applicationRoutingRules: current.applicationRoutingRules,
+            websiteRoutingRules: current.websiteRoutingRules,
+            autoExcludedNodeIDs: current.autoExcludedNodeIDs
+          )
+        )
       }
-      setSubscriptionStatus(SBMText.localized("Routing policy removed and saved"), level: .success)
-    }
-    lastError = nil
+    )
   }
 
   func addProfile() {
@@ -2827,7 +3317,7 @@ final class AppModel {
     let previousStatusLevel = subscriptionStatusLevel
     let profile = ManagedProfile(
       name: SBMText.localized("New Profile"),
-      sources: [ManagedSource()]
+      sources: [ManagedSource(name: SBMText.localized("Subscription"))]
     )
     profiles.append(profile)
     selectedProfileID = profile.id
@@ -2849,58 +3339,93 @@ final class AppModel {
     }
   }
 
-  func deleteSelectedProfile() {
-    guard let selectedProfileID,
-      let index = profiles.firstIndex(where: { $0.id == selectedProfileID })
+  func deleteSelectedProfile(profileID: UUID) {
+    guard let index = profiles.firstIndex(where: { $0.id == profileID })
     else { return }
-    let previousProfiles = profiles
-    let previousSelection = selectedProfileID
-    profiles.remove(at: index)
-    self.selectedProfileID = profiles.first?.id
-    loadSelectedProfileEditor()
-    updateNodes()
-    profileAvailable = selectedProfile?.payload != nil
-    setSubscriptionStatus(
-      profileAvailable ? SBMText.localized("Ready") : SBMText.localized("No subscription synced"),
-      level: profileAvailable ? .success : .neutral
+    let previous = (
+      profiles: profiles, profileID: selectedProfileID, nodeID: selectedNodeID,
+      sourceID: selectedSourceID, available: profileAvailable, status: subscriptionStatus,
+      level: subscriptionStatusLevel
     )
+    func restore(
+      _ snapshot: (
+        profiles: [ManagedProfile], profileID: UUID?, nodeID: ProxyNodeID, sourceID: UUID?,
+        available: Bool, status: String, level: SubscriptionStatusLevel
+      ),
+      on model: AppModel
+    ) {
+      (model.profiles, model.selectedProfileID, model.selectedNodeID, model.selectedSourceID) =
+        (snapshot.profiles, snapshot.profileID, snapshot.nodeID, snapshot.sourceID)
+      model.loadSelectedProfileEditor()
+      model.updateNodes()
+      model.profileAvailable = snapshot.available
+      model.setSubscriptionStatus(snapshot.status, level: snapshot.level)
+    }
+    let deletedSelectedProfile = previous.profileID == profileID
+    profiles.remove(at: index)
+    self.selectedProfileID = deletedSelectedProfile ? profiles.first?.id : previous.profileID
+    if deletedSelectedProfile {
+      loadSelectedProfileEditor()
+      updateNodes()
+      profileAvailable = selectedProfile?.payload != nil
+      setSubscriptionStatus(
+        profileAvailable ? SBMText.localized("Ready") : SBMText.localized("No subscription synced"),
+        level: profileAvailable ? .success : .neutral
+      )
+    }
     do {
       try persistProfileLibrary()
     } catch {
-      profiles = previousProfiles
-      self.selectedProfileID = previousSelection
-      loadSelectedProfileEditor()
-      updateNodes()
+      profiles = previous.profiles
+      if deletedSelectedProfile {
+        restore(previous, on: self)
+      }
       lastError = error.localizedDescription
       return
     }
-    let committedProfiles = profiles
-    let committedSelection = self.selectedProfileID
+    discardRoutingMutationState(for: profileID)
+    startSubscriptionRefreshLoop()
+    guard deletedSelectedProfile else { return }
+    let committed = (
+      profiles: profiles, profileID: self.selectedProfileID, nodeID: selectedNodeID,
+      sourceID: selectedSourceID, available: profileAvailable, status: subscriptionStatus,
+      level: subscriptionStatusLevel
+    )
+    let committedEditor = [
+      profileName, profileNameError, sourceName, sourceEditorError, sourceExcludeRegex,
+      subscriptionURL, subscriptionUserAgent, subscriptionAppVersion, subscriptionDeviceOS,
+      subscriptionDeviceOSVersion, subscriptionDeviceModel, subscriptionHWID,
+    ]
     guard shouldApplyDesiredRuntime else {
-      runtimeApplyCoordinator.markSaved()
       runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
       return
     }
     applyCurrentDesiredRuntimeIfNeeded { [weak self] result in
       guard let self, case .failure(let error) = result else { return }
-      guard self.profiles == committedProfiles,
-        self.selectedProfileID == committedSelection
+      guard self.profiles == committed.profiles,
+        self.selectedProfileID == committed.profileID,
+        self.selectedNodeID == committed.nodeID,
+        self.selectedSourceID == committed.sourceID,
+        self.profileAvailable == committed.available,
+        self.subscriptionStatus == committed.status,
+        self.subscriptionStatusLevel == committed.level,
+        [
+          self.profileName, self.profileNameError, self.sourceName, self.sourceEditorError,
+          self.sourceExcludeRegex, self.subscriptionURL, self.subscriptionUserAgent,
+          self.subscriptionAppVersion, self.subscriptionDeviceOS,
+          self.subscriptionDeviceOSVersion, self.subscriptionDeviceModel, self.subscriptionHWID,
+        ] == committedEditor
       else {
         self.lastError = error.localizedDescription
         return
       }
-      self.profiles = previousProfiles
-      self.selectedProfileID = previousSelection
-      self.loadSelectedProfileEditor()
-      self.updateNodes()
+      restore(previous, on: self)
       do {
         try self.persistProfileLibrary()
+        self.startSubscriptionRefreshLoop()
         self.lastError = error.localizedDescription
       } catch let persistenceError {
-        self.profiles = committedProfiles
-        self.selectedProfileID = committedSelection
-        self.loadSelectedProfileEditor()
-        self.updateNodes()
+        restore(committed, on: self)
         self.lastError =
           "\(error.localizedDescription) Rollback could not be saved: "
           + persistenceError.localizedDescription
@@ -2910,7 +3435,23 @@ final class AppModel {
 
   func selectProfile(_ id: UUID) {
     guard id != selectedProfileID, profiles.contains(where: { $0.id == id }) else { return }
-    let previousSelection = selectedProfileID
+    let previous = (
+      profileID: selectedProfileID, nodeID: selectedNodeID, available: profileAvailable,
+      status: subscriptionStatus, level: subscriptionStatusLevel
+    )
+    func restore(
+      _ snapshot: (
+        profileID: UUID?, nodeID: ProxyNodeID, available: Bool, status: String,
+        level: SubscriptionStatusLevel
+      ),
+      on model: AppModel
+    ) {
+      (model.selectedProfileID, model.selectedNodeID) = (snapshot.profileID, snapshot.nodeID)
+      model.loadSelectedProfileEditor()
+      model.updateNodes()
+      model.profileAvailable = snapshot.available
+      model.setSubscriptionStatus(snapshot.status, level: snapshot.level)
+    }
     selectedProfileID = id
     websiteRoutingInput = ""
     websiteRoutingEditingRuleID = nil
@@ -2925,30 +3466,28 @@ final class AppModel {
       try persistProfileLibrary()
       lastError = nil
     } catch {
-      selectedProfileID = previousSelection
-      loadSelectedProfileEditor()
-      updateNodes()
+      restore(previous, on: self)
       lastError = error.localizedDescription
       return
     }
 
+    let committed = (
+      profileID: selectedProfileID, nodeID: selectedNodeID, available: profileAvailable,
+      status: subscriptionStatus, level: subscriptionStatusLevel
+    )
     if shouldApplyDesiredRuntime {
       applyCurrentDesiredRuntimeIfNeeded { [weak self] result in
         guard let self, case .failure(let error) = result else { return }
-        guard self.selectedProfileID == id else {
+        guard self.selectedProfileID == committed.profileID else {
           self.lastError = error.localizedDescription
           return
         }
-        self.selectedProfileID = previousSelection
-        self.loadSelectedProfileEditor()
-        self.updateNodes()
+        restore(previous, on: self)
         do {
           try self.persistProfileLibrary()
           self.lastError = error.localizedDescription
         } catch let persistenceError {
-          self.selectedProfileID = id
-          self.loadSelectedProfileEditor()
-          self.updateNodes()
+          restore(committed, on: self)
           self.lastError =
             "\(error.localizedDescription) Rollback could not be saved: "
             + persistenceError.localizedDescription
@@ -2967,16 +3506,21 @@ final class AppModel {
   }
 
   private func syncSelectedSource() {
+    guard !terminalAdmissionClosed, sourceSyncTask == nil else { return }
     sourceEditorError = nil
     let value: String
     let name = sourceName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let appVersion = subscriptionAppVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+    let deviceOSVersion = subscriptionDeviceOSVersion.trimmingCharacters(
+      in: .whitespacesAndNewlines
+    )
+    let deviceModel = subscriptionDeviceModel.trimmingCharacters(in: .whitespacesAndNewlines)
     let headers = SubscriptionHeaders(
       userAgent: subscriptionUserAgent.trimmingCharacters(in: .whitespacesAndNewlines),
-      appVersion: {
-        let value = subscriptionAppVersion.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
-      }(),
+      appVersion: appVersion.isEmpty ? nil : appVersion,
       deviceOS: subscriptionDeviceOS.trimmingCharacters(in: .whitespacesAndNewlines),
+      deviceOSVersion: deviceOSVersion.isEmpty ? nil : deviceOSVersion,
+      deviceModel: deviceModel.isEmpty ? nil : deviceModel,
       hardwareID: subscriptionHWID.trimmingCharacters(in: .whitespacesAndNewlines)
     )
     guard let targetProfileID = selectedProfileID,
@@ -2987,14 +3531,6 @@ final class AppModel {
       })
     else {
       sourceEditorError = SBMText.localized("Add a subscription source first.")
-      lastError = sourceEditorError
-      return
-    }
-    if case .native = profiles[profileIndex].payload {
-      sourceEditorError = boundedSettingsError(
-        SBMText.localized("Save and Sync is unavailable"),
-        error: SubscriptionFailure.nativeProfileCannotBeMerged
-      )
       lastError = sourceEditorError
       return
     }
@@ -3032,17 +3568,18 @@ final class AppModel {
     beginSyncingOperation()
     setSubscriptionStatus(SBMText.localized("Syncing…"))
     let sourceToSync = profiles[profileIndex].sources[sourceIndex]
-    Task {
-      defer { endSyncingOperation() }
+    sourceSyncTask = Task {
+      defer {
+        endSyncingOperation()
+        sourceSyncTask = nil
+      }
       do {
         let result = try await subscriptionManager.synchronize(sourceToSync)
+        try Task.checkCancellation()
         let fetched = ManagedConnectionReconciler.reconcile(
           existing: sourceToSync.payload,
           fetched: result.profile
         )
-        guard case .compatibility = fetched else {
-          throw SubscriptionFailure.nativeProfileCannotBeMerged
-        }
         guard let currentProfile = profiles.first(where: { $0.id == targetProfileID }),
           let currentSourceIndex = currentProfile.sources.firstIndex(where: {
             $0.id == targetSourceID
@@ -3056,69 +3593,84 @@ final class AppModel {
         guard let effective = updatedProfile.payload else {
           throw SubscriptionFailure.missingProtocols
         }
+        let effectiveProfile: VPNProfile
+        switch effective {
+        case .compatibility(let profile): effectiveProfile = profile
+        }
         try await validateProfile(effective)
+        try Task.checkCancellation()
         guard try commitProfileUpdate(expected: currentProfile, updated: updatedProfile) else {
           throw AppModelFailure.staleProfileOperation
         }
-        if self.selectedProfileID == targetProfileID,
-          shouldApplyDesiredRuntime,
+        if selectedProfileID == targetProfileID {
+          profileAvailable = selectedProfile?.payload != nil
+          updateNodes()
+        }
+        if selectedProfileID == targetProfileID, shouldApplyDesiredRuntime,
           ManagedConnectionReconciler.requiresActivation(
             previous: currentProfile.payload,
             next: effective
           )
         {
-          setSubscriptionStatus(SBMText.localized("Sources updated; applying"), level: .neutral)
-          applyCurrentDesiredRuntimeIfNeeded { [weak self] applyResult in
-            guard let self else { return }
-            switch applyResult {
-            case .success(let response) where response.runtimeOutcome == .reconnectRequired:
-              if let warning = result.warningDescription {
-                self.setSubscriptionStatus(warning, level: .warning)
-              } else {
-                self.setSubscriptionStatus(
-                  SBMText.localized("Sources updated and saved"), level: .success
+          presentSubscriptionStatus(
+            SBMText.localized("Sources updated; applying"), level: .neutral,
+            profileID: targetProfileID, sourceID: targetSourceID
+          )
+          applyCurrentDesiredRuntimeIfNeeded(
+            onCurrentResult: { [weak self] applyResult in
+              guard let self else { return }
+              switch applyResult {
+              case .success(let response):
+                let successMessage =
+                  response.runtimeOutcome == .reconnectRequired
+                  ? "Sources updated and saved" : "Sources updated and active"
+                self.presentSubscriptionStatus(
+                  result.warningDescription ?? SBMText.localized(successMessage),
+                  level: result.warningDescription == nil ? .success : .warning,
+                  profileID: targetProfileID, sourceID: targetSourceID
+                )
+              case .failure(let error):
+                self.rollbackProfileUpdate(
+                  profileID: targetProfileID,
+                  committed: updatedProfile,
+                  previous: currentProfile,
+                  originalError: error,
+                  visibleProfileID: targetProfileID,
+                  visibleSourceID: targetSourceID
+                )
+                if self.selectedProfileID == targetProfileID {
+                  if self.selectedSourceID == targetSourceID { self.loadSelectedProfileEditor() }
+                  self.updateNodes()
+                  self.profileAvailable = self.selectedProfile?.payload != nil
+                }
+                self.presentSubscriptionStatus(
+                  SBMText.localized("Source apply failed"), level: .warning,
+                  profileID: targetProfileID, sourceID: targetSourceID
                 )
               }
-            case .success:
-              if let warning = result.warningDescription {
-                self.setSubscriptionStatus(warning, level: .warning)
-              } else {
-                self.setSubscriptionStatus(
-                  SBMText.localized("Sources updated and active"), level: .success
-                )
-              }
-            case .failure(let error):
-              self.rollbackProfileUpdate(
-                profileID: targetProfileID,
-                committed: updatedProfile,
-                previous: currentProfile,
-                originalError: error
-              )
-              self.loadSelectedProfileEditor()
-              self.updateNodes()
-              self.profileAvailable = self.selectedProfile?.payload != nil
-              self.setSubscriptionStatus(SBMText.localized("Source apply failed"), level: .warning)
-            }
-          }
-        } else if case .compatibility(let profile) = effective {
-          if let warning = result.warningDescription {
-            setSubscriptionStatus(warning, level: .warning)
-          } else {
-            setSubscriptionStatus(
-              SBMText.format("%@ ready", profileSummary(profile)), level: .success
-            )
-          }
+            },
+            visibleProfileID: targetProfileID, visibleSourceID: targetSourceID
+          )
+        } else if selectedProfileID == targetProfileID && selectedSourceID == targetSourceID {
+          let message =
+            result.warningDescription
+            ?? SBMText.format("%@ ready", profileSummary(effectiveProfile))
+          presentSubscriptionStatus(
+            message, level: result.warningDescription == nil ? .success : .warning,
+            profileID: targetProfileID, sourceID: targetSourceID
+          )
         }
-        profileAvailable = true
-        updateNodes()
-        if runtimeApplyStatus != .failed {
+        if selectedProfileID == targetProfileID, selectedSourceID == targetSourceID,
+          runtimeApplyStatus != .failed
+        {
           lastError = nil
         }
-        connectAutomaticallyIfNeeded()
+      } catch is CancellationError {
+        return
       } catch {
-        loadSelectedProfileEditor()
-        updateNodes()
-        profileAvailable = selectedProfile?.payload != nil
+        guard selectedProfileID == targetProfileID,
+          selectedSourceID == targetSourceID
+        else { return }
         setSubscriptionStatus(
           profileAvailable
             ? SBMText.localized("Using cached sources; sync failed")
@@ -3194,10 +3746,14 @@ final class AppModel {
     committed: ManagedProfile,
     previous: ManagedProfile,
     originalError: any Error,
-    visibleProfileID: UUID? = nil
+    visibleProfileID: UUID? = nil,
+    visibleSourceID: UUID? = nil
   ) {
     func present(_ message: String) {
-      guard visibleProfileID == nil || selectedProfileID == visibleProfileID else { return }
+      guard
+        (visibleProfileID == nil || selectedProfileID == visibleProfileID)
+          && (visibleSourceID == nil || selectedSourceID == visibleSourceID)
+      else { return }
       lastError = message
     }
     guard let index = profiles.firstIndex(where: { $0.id == profileID }),
@@ -3227,7 +3783,14 @@ final class AppModel {
   }
 
   private func startSubscriptionRefreshLoop() {
+    guard !terminalAdmissionClosed else { return }
     subscriptionRefreshTask?.cancel()
+    subscriptionRefreshTask = nil
+    guard
+      profiles.contains(where: { profile in
+        profile.sources.contains { SubscriptionClient.isRemoteSource($0.value) }
+      })
+    else { return }
     subscriptionRefreshTask = Task { [weak self] in
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(6 * 60 * 60))
@@ -3239,7 +3802,7 @@ final class AppModel {
 
   private func scheduleNextLatencyRefresh() {
     latencyRefreshTask?.cancel()
-    guard coreRunning else {
+    guard !terminalAdmissionClosed, coreRunning else {
       latencyRefreshTask = nil
       return
     }
@@ -3256,8 +3819,9 @@ final class AppModel {
     latencyRefreshTask?.cancel()
     latencyRefreshTask = Task { [weak self] in
       try? await Task.sleep(for: .seconds(seconds))
-      guard !Task.isCancelled else { return }
-      self?.refreshLatencyIfNeeded()
+      guard !Task.isCancelled, let self else { return }
+      self.latencyRefreshTask = nil
+      self.refreshLatencyIfNeeded()
     }
   }
 
@@ -3278,6 +3842,7 @@ final class AppModel {
   }
 
   private func refreshAllProfiles(userInitiated: Bool = false) {
+    guard !terminalAdmissionClosed else { return }
     if userInitiated { refreshRequestedByUser = true }
     guard currentHelperIsReady else {
       if userInitiated {
@@ -3322,6 +3887,8 @@ final class AppModel {
       var unchanged = 0
       var failed = 0
       var firstFailure: Error?
+      var parserWarningSourceCount = 0
+      var parserWarnings: [String] = []
       var refreshSnapshots: [UUID: RefreshActivationSnapshot] = [:]
 
       for (profileID, sourceSnapshot) in sources {
@@ -3335,13 +3902,14 @@ final class AppModel {
           }
           let result = try await subscriptionManager.synchronize(sourceSnapshot)
           try Task.checkCancellation()
+          if let warning = result.warningDescription {
+            parserWarningSourceCount += 1
+            if parserWarnings.count < 4 { parserWarnings.append(warning) }
+          }
           let fetched = ManagedConnectionReconciler.reconcile(
             existing: sourceSnapshot.payload,
             fetched: result.profile
           )
-          guard case .compatibility = fetched else {
-            throw SubscriptionFailure.nativeProfileCannotBeMerged
-          }
           guard let currentProfile = profiles.first(where: { $0.id == profileID }),
             let sourceIndex = currentProfile.sources.firstIndex(where: {
               $0.id == sourceSnapshot.id
@@ -3411,6 +3979,20 @@ final class AppModel {
         String(unchanged),
         String(failed)
       )
+      let omittedWarningCount = parserWarningSourceCount - parserWarnings.count
+      let warningDetails = parserWarnings.joined(separator: "; ")
+      var warningSuffix = ""
+      if parserWarningSourceCount > 0 {
+        warningSuffix = "; \(warningDetails)"
+        if omittedWarningCount > 0 {
+          warningSuffix +=
+            "; "
+            + SBMText.format("Additional source warnings: %@", String(omittedWarningCount))
+        }
+      }
+      let summaryWithWarnings = summary + warningSuffix
+      let sweepStatusLevel: SubscriptionStatusLevel =
+        failed == 0 && parserWarningSourceCount == 0 ? .success : .warning
       if applying {
         setSubscriptionStatus(SBMText.localized("Refreshing current profile…"), level: .neutral)
         let result: Result<HelperResponse, any Error>? = await withCheckedContinuation {
@@ -3430,34 +4012,34 @@ final class AppModel {
         }
         switch result {
         case .success(let response)? where response.runtimeOutcome == .reconnectRequired:
-          setSubscriptionStatus(summary, level: failed == 0 ? .success : .warning)
+          setSubscriptionStatus(summaryWithWarnings, level: sweepStatusLevel)
           lastError = firstFailure?.localizedDescription
         case .success?:
-          setSubscriptionStatus(summary, level: failed == 0 ? .success : .warning)
+          setSubscriptionStatus(summaryWithWarnings, level: sweepStatusLevel)
           lastError = firstFailure?.localizedDescription
         case .failure(let error)?:
           loadSelectedProfileEditor()
           updateNodes()
           setSubscriptionStatus(
-            runtimeFailurePreservedPrevious
+            (runtimeFailurePreservedPrevious
               ? SBMText.localized("Sources saved; apply failed — previous VPN remains active")
-              : SBMText.localized("Sources saved; apply failed"),
+              : SBMText.localized("Sources saved; apply failed")) + warningSuffix,
             level: .warning
           )
           lastError = error.localizedDescription
         case nil:
           setSubscriptionStatus(
-            "\(summary); newer connection change is applying",
-            level: failed == 0 ? .neutral : .warning
+            "\(summaryWithWarnings); newer connection change is applying",
+            level: parserWarningSourceCount > 0 || failed > 0 ? .warning : .neutral
           )
           lastError = firstFailure?.localizedDescription
         }
       } else {
-        setSubscriptionStatus(summary, level: failed == 0 ? .success : .warning)
+        setSubscriptionStatus(summaryWithWarnings, level: sweepStatusLevel)
         lastError = firstFailure?.localizedDescription
       }
+      profileAvailable = selectedProfile?.payload != nil
       updateNodes()
-      connectAutomaticallyIfNeeded()
     }
   }
 
@@ -3478,10 +4060,12 @@ final class AppModel {
     loadSelectedSourceEditor()
   }
 
-  private func applyProfileLibrary(_ stored: ProfileLibrary) {
+  private func applyProfileLibrary(_ stored: ProfileLibrary, reconcileRuntime: Bool = true) {
     subscriptionRefreshTask?.cancel()
     profiles = stored.profiles
     selectedProfileID = stored.selectedProfileID
+    routingMode = stored.routingMode
+    selectedNodeID = stored.selectedNodeID
     localSOCKSEnabled = stored.localSOCKSEnabled
     localSOCKSPort = stored.localSOCKSPort
     localSOCKSEnabledDraft = stored.localSOCKSEnabled
@@ -3491,6 +4075,7 @@ final class AppModel {
     latencyTestURL = stored.latencyTestURL
     latencyTestURLDraft = stored.latencyTestURL
     ipv6Enabled = stored.ipv6Enabled
+    dnsSettings = stored.dnsSettings
     if selectedProfileID == nil || !profiles.contains(where: { $0.id == selectedProfileID }) {
       selectedProfileID = profiles.first?.id
     }
@@ -3499,10 +4084,8 @@ final class AppModel {
     updateNodes()
     profileAvailable = selectedProfile?.payload != nil
     scheduleNextLatencyRefresh()
-    if !profiles.isEmpty {
-      startSubscriptionRefreshLoop()
-    }
-    applyCurrentDesiredRuntimeIfNeeded()
+    startSubscriptionRefreshLoop()
+    if reconcileRuntime { applyCurrentDesiredRuntimeIfNeeded() }
   }
 
   private func loadSelectedSourceEditor() {
@@ -3514,8 +4097,10 @@ final class AppModel {
       sourceExcludeRegex = ""
       subscriptionURL = ""
       subscriptionUserAgent = SubscriptionHeaders.defaultUserAgent
-      subscriptionAppVersion = SubscriptionHeaders.defaultAppVersion
+      subscriptionAppVersion = SubscriptionHeaders.defaultAppVersion ?? ""
       subscriptionDeviceOS = SubscriptionHeaders.defaultDeviceOS
+      subscriptionDeviceOSVersion = SubscriptionHeaders.defaultDeviceOSVersion ?? ""
+      subscriptionDeviceModel = SubscriptionHeaders.defaultDeviceModel ?? ""
       subscriptionHWID = SubscriptionHeaders.makeHardwareID()
       return
     }
@@ -3525,29 +4110,39 @@ final class AppModel {
     subscriptionUserAgent = source.headers.userAgent
     subscriptionAppVersion = source.headers.appVersion ?? ""
     subscriptionDeviceOS = source.headers.deviceOS
+    subscriptionDeviceOSVersion = source.headers.deviceOSVersion ?? ""
+    subscriptionDeviceModel = source.headers.deviceModel ?? ""
     subscriptionHWID = source.headers.hardwareID
   }
 
   private func persistProfileLibrary(
     profiles: [ManagedProfile]? = nil,
+    routingMode: RoutingMode? = nil,
+    selectedNodeID: ProxyNodeID? = nil,
     localSOCKSEnabled: Bool? = nil,
     localSOCKSPort: UInt16? = nil,
     latencyIntervalMinutes: Int? = nil,
     latencyTestURL: String? = nil,
-    ipv6Enabled: Bool? = nil
+    ipv6Enabled: Bool? = nil,
+    dnsSettings: ManagedDNSSettings? = nil
   ) throws {
-    if let profileStoreLoadError {
-      throw AppModelFailure.profileLibraryUnavailable(profileStoreLoadError)
+    if let profileStoreLoadFailure {
+      throw AppModelFailure.profileLibraryUnavailable(
+        profileStoreLoadFailure.localizedDescription
+      )
     }
     try profileLibrarySaver(
       ProfileLibrary(
         profiles: profiles ?? self.profiles,
         selectedProfileID: selectedProfileID,
+        routingMode: routingMode ?? self.routingMode,
+        selectedNodeID: selectedNodeID ?? self.selectedNodeID,
         localSOCKSEnabled: localSOCKSEnabled ?? self.localSOCKSEnabled,
         localSOCKSPort: localSOCKSPort ?? self.localSOCKSPort,
         latencyIntervalMinutes: latencyIntervalMinutes ?? self.latencyIntervalMinutes,
         latencyTestURL: latencyTestURL ?? self.latencyTestURL,
-        ipv6Enabled: ipv6Enabled ?? self.ipv6Enabled
+        ipv6Enabled: ipv6Enabled ?? self.ipv6Enabled,
+        dnsSettings: dnsSettings ?? self.dnsSettings
       )
     )
   }
@@ -3565,7 +4160,8 @@ final class AppModel {
       localSOCKSEnabled: localSOCKSEnabled,
       localSOCKSPort: localSOCKSPort,
       latencyTestURL: latencyTestURL,
-      ipv6Enabled: ipv6Enabled
+      ipv6Enabled: ipv6Enabled,
+      dnsSettings: dnsSettings
     )
   }
 
@@ -3621,6 +4217,10 @@ final class AppModel {
     onSuccess: (@MainActor () -> Void)? = nil,
     onFinished: (@MainActor () -> Void)? = nil
   ) {
+    guard !terminalAdmissionClosed else {
+      onFinished?()
+      return
+    }
     guard let profileID,
       let profile = profiles.first(where: { $0.id == profileID }),
       profile.payload != nil
@@ -3649,16 +4249,26 @@ final class AppModel {
     let queueToken = UUID()
     let task = Task { @MainActor [weak self] in
       guard let self else { return }
+      defer {
+        self.finishRoutingMutationQueue(profileID: profileID, token: queueToken)
+        onFinished?()
+      }
       if let predecessor { await predecessor.value }
+      guard !Task.isCancelled, !self.terminalAdmissionClosed else {
+        self.completeSupersededRoutingMutation(
+          identity: identity,
+          kind: kind,
+          onSuccess: onSuccess
+        )
+        return
+      }
       await self.performRoutingMutation(
         identity: identity,
         kind: kind,
         successMessage: successMessage,
         operation: operation,
-        onSuccess: onSuccess,
-        onFinished: onFinished
+        onSuccess: onSuccess
       )
-      self.finishRoutingMutationQueue(profileID: profileID, token: queueToken)
     }
     routingMutationQueues[profileID] = task
     routingMutationQueueTokens[profileID] = queueToken
@@ -3669,10 +4279,12 @@ final class AppModel {
     kind: RoutingMutationKind,
     successMessage: String,
     operation: @escaping @MainActor (CoreProfile) throws -> CoreProfile,
-    onSuccess: (@MainActor () -> Void)?,
-    onFinished: (@MainActor () -> Void)?
+    onSuccess: (@MainActor () -> Void)?
   ) async {
-    defer { onFinished?() }
+    guard !Task.isCancelled, !terminalAdmissionClosed else {
+      completeSupersededRoutingMutation(identity: identity, kind: kind, onSuccess: onSuccess)
+      return
+    }
     do {
       guard let currentProfile = profiles.first(where: { $0.id == identity.profileID }),
         let basePayload = currentProfile.payload
@@ -3683,6 +4295,10 @@ final class AppModel {
       }
       let updated = try operation(basePayload)
       try await validateProfile(updated)
+      guard !Task.isCancelled, !terminalAdmissionClosed else {
+        completeSupersededRoutingMutation(identity: identity, kind: kind, onSuccess: onSuccess)
+        return
+      }
       guard let latestProfile = profiles.first(where: { $0.id == identity.profileID }),
         latestProfile.payload == basePayload
       else {
@@ -3729,8 +4345,7 @@ final class AppModel {
           visibleProfileID: identity.profileID
         )
       } else {
-        runtimeApplyCoordinator.markSaved()
-        if !runtimeApplyCoordinator.isApplying {
+        if !runtimeMutationController.isApplying {
           runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
         }
         completeSavedRoutingMutation(
@@ -3740,7 +4355,13 @@ final class AppModel {
           onSuccess: onSuccess
         )
       }
+    } catch is CancellationError {
+      completeSupersededRoutingMutation(identity: identity, kind: kind, onSuccess: onSuccess)
     } catch {
+      guard !Task.isCancelled, !terminalAdmissionClosed else {
+        completeSupersededRoutingMutation(identity: identity, kind: kind, onSuccess: onSuccess)
+        return
+      }
       failRoutingMutation(identity: identity, kind: kind, error: error)
     }
   }
@@ -3936,7 +4557,7 @@ final class AppModel {
 
   private func clearDeferredRuntimePendingPresentations() {
     for profileID in Array(routingMutationStatuses.keys) {
-      for kind in [RoutingMutationKind.website, .application, .policy] {
+      for kind in [RoutingMutationKind.website, .application, .policy, .autoSelection] {
         guard let status = routingMutationStatuses[profileID]?[kind],
           status.presentation.state == .reconnectRequired
         else { continue }
@@ -3958,6 +4579,14 @@ final class AppModel {
     routingMutationQueueTokens[profileID] = nil
   }
 
+  private func discardRoutingMutationState(for profileID: UUID) {
+    routingMutationQueues[profileID]?.cancel()
+    routingMutationQueues[profileID] = nil
+    routingMutationQueueTokens[profileID] = nil
+    routingMutationRevisions[profileID] = nil
+    routingMutationStatuses[profileID] = nil
+  }
+
   private func staleRoutingMutationMessage(for kind: RoutingMutationKind) -> String {
     SBMText.format(
       "The profile changed while the %@ was validated. Try again.",
@@ -3977,17 +4606,8 @@ final class AppModel {
           routingPolicy: profile.routingPolicy,
           nodeGroups: profile.nodeGroups ?? [],
           applicationRoutingRules: rules,
-          websiteRoutingRules: profile.websiteRoutingRules
-        )
-      )
-    case .native(let profile):
-      return .native(
-        NativeProfile(
-          configuration: profile.configuration,
-          selectorTag: profile.selectorTag,
-          nodes: profile.nodes,
-          applicationRoutingRules: rules,
-          websiteRoutingRules: profile.websiteRoutingRules
+          websiteRoutingRules: profile.websiteRoutingRules,
+          autoExcludedNodeIDs: profile.autoExcludedNodeIDs
         )
       )
     }
@@ -4005,17 +4625,8 @@ final class AppModel {
           routingPolicy: profile.routingPolicy,
           nodeGroups: profile.nodeGroups ?? [],
           applicationRoutingRules: profile.applicationRoutingRules,
-          websiteRoutingRules: rules
-        )
-      )
-    case .native(let profile):
-      return .native(
-        NativeProfile(
-          configuration: profile.configuration,
-          selectorTag: profile.selectorTag,
-          nodes: profile.nodes,
-          applicationRoutingRules: profile.applicationRoutingRules,
-          websiteRoutingRules: rules
+          websiteRoutingRules: rules,
+          autoExcludedNodeIDs: profile.autoExcludedNodeIDs
         )
       )
     }
@@ -4023,16 +4634,20 @@ final class AppModel {
 
   private func shouldApplyDesiredRuntime(for profileID: UUID) -> Bool {
     selectedProfileID == profileID
-      && desiredCoreRunning != false
-      && (coreRunning || runtimeApplyCoordinator.isApplying)
+      && deferredRuntimeApplyPhase != .reconnecting
+      && runtimeMutationController.desiredRunning != false
+      && (coreRunning || runtimeMutationController.isApplying)
   }
 
   private func presentSubscriptionStatus(
     _ message: String,
     level: SubscriptionStatusLevel,
-    profileID: UUID
+    profileID: UUID,
+    sourceID: UUID? = nil
   ) {
-    guard selectedProfileID == profileID else { return }
+    guard selectedProfileID == profileID, sourceID == nil || selectedSourceID == sourceID else {
+      return
+    }
     setSubscriptionStatus(message, level: level)
   }
 
@@ -4050,7 +4665,6 @@ final class AppModel {
       return ProxyNode(
         id: descriptor.id,
         name: descriptor.name,
-        symbol: symbol(for: descriptor.kind),
         groupID: metadata?.id,
         groupName: metadata?.name,
         groupOrder: metadata?.groupOrder,
@@ -4063,76 +4677,60 @@ final class AppModel {
     }
   }
 
-  private func send(
-    _ request: HelperRequest,
-    completion: (@MainActor (Result<HelperResponse, any Error>) -> Void)? = nil
-  ) {
-    guard currentHelperIsReady else {
-      let failure = AppModelFailure.helperNotReady
-      lastError = failure.localizedDescription
-      completion?(.failure(failure))
-      return
-    }
-    let runtimeGeneration = runtimeApplyCoordinator.currentGeneration
-    let errorBasis = lastError
-    beginBusyOperation()
-    Task {
-      defer { endBusyOperation() }
-      do {
-        let response = try await helperRequestSender(request)
-        apply(
-          response,
-          policy: .observation(
-            runtimeCurrent: runtimeGeneration == runtimeApplyCoordinator.currentGeneration,
-            adoptDesiredRuntime: false
-          )
-        )
-        guard response.protocolVersion == HelperConstants.protocolVersion,
-          response.helperVersion == HelperConstants.helperVersion,
-          response.helperRevision == HelperConstants.helperRevision
-        else {
-          let failure = AppModelFailure.helperRevisionMismatch
-          if lastError == errorBasis { lastError = failure.localizedDescription }
-          completion?(.failure(failure))
-          return
-        }
-        if lastError == errorBasis {
-          lastError = response.success ? nil : SBMText.localized(response.message)
-        }
-        if response.success {
-          completion?(.success(response))
-        } else {
-          completion?(.failure(AppModelFailure.helperRequestFailed(response.message)))
-        }
-      } catch {
-        helperReachable = false
-        observedCoreState = .unknown
-        if lastError == errorBasis { lastError = error.localizedDescription }
-        completion?(.failure(error))
-      }
-    }
-  }
-
+  @discardableResult
   private func submitRuntimeApply(
     _ request: HelperRequest,
     onCurrentResult: (@MainActor (Result<HelperResponse, any Error>) -> Void)? = nil,
     onSuperseded: (@MainActor () -> Void)? = nil,
-    visibleProfileID: UUID? = nil
-  ) {
+    visibleProfileID: UUID? = nil,
+    visibleSourceID: UUID? = nil
+  ) -> UInt64? {
+    guard !terminalAdmissionClosed || request.action == .shutdown else {
+      onSuperseded?()
+      return nil
+    }
+    guard
+      !helperSetupInProgress
+        || request.action == .shutdown
+        || (request.action == .stop && request.stopReason == .userDisconnect)
+    else {
+      let failure = AppModelFailure.helperNotReady
+      if let onCurrentResult {
+        onCurrentResult(.failure(failure))
+      } else {
+        onSuperseded?()
+      }
+      return nil
+    }
+    effectiveAutoNodeID = nil
+    func mayPresent() -> Bool {
+      (visibleProfileID == nil || selectedProfileID == visibleProfileID)
+        && (visibleSourceID == nil || selectedSourceID == visibleSourceID)
+    }
     func present(_ message: String?) {
-      guard let message,
-        visibleProfileID == nil || selectedProfileID == visibleProfileID
-      else { return }
+      guard let message, mayPresent() else { return }
       lastError = message
     }
-    guard currentHelperIsReady else {
+    guard
+      currentHelperIsReady
+        || (request.action == .stop && request.stopReason == .userDisconnect
+          && currentRegisteredHelperIsCompatible)
+        || request.action == .shutdown
+    else {
       runtimeApplyStatus = .failed
       runtimeFailurePreservedPrevious = false
       runtimeFailureProfileID = request.profileID ?? visibleProfileID
       let failure = AppModelFailure.helperNotReady
       present(failure.localizedDescription)
       onCurrentResult?(.failure(failure))
-      return
+      return nil
+    }
+    if request.action == .stop || request.action == .shutdown {
+      durableStopProofRequired = true
+    }
+    if request.action == .start {
+      terminalColdOffClaim?.release()
+      terminalColdOffClaim = nil
     }
     runtimeApplyStatus = .applying
     runtimeFailurePreservedPrevious = false
@@ -4140,19 +4738,29 @@ final class AppModel {
     let previouslyActiveProfileID = helperActiveProfileID
     let previouslyRunning = coreRunning
     let knownGoodProfileID = previouslyActiveProfileID ?? request.profileID
-    runtimeApplyCoordinator.submit(request) { [weak self] outcome in
-      guard let self else { return }
+    let generation = runtimeMutationController.submit(request) { [weak self] outcome in
+      guard let self else {
+        onSuperseded?()
+        return
+      }
       switch outcome.result {
       case .success(let response):
-        self.apply(response, policy: outcome.isCurrent ? .currentMutation : .staleMutation)
+        let compatible = self.apply(
+          response,
+          policy: outcome.isCurrent ? .currentMutation : .staleMutation
+        )
         guard outcome.isCurrent else {
           onSuperseded?()
           return
         }
-        if response.protocolVersion != HelperConstants.protocolVersion
-          || response.helperVersion != HelperConstants.helperVersion
-          || response.helperRevision != HelperConstants.helperRevision
+        if compatible,
+          request.action == .stop || request.action == .shutdown,
+          response.success,
+          !response.coreRunning
         {
+          self.durableStopProofRequired = false
+        }
+        if !compatible {
           self.runtimeApplyStatus = .failed
           self.runtimeFailurePreservedPrevious = false
           self.runtimeFailureProfileID = request.profileID ?? visibleProfileID
@@ -4169,9 +4777,7 @@ final class AppModel {
           self.runtimeApplyStatus = .reconnectRequired
           self.runtimeFailurePreservedPrevious = false
           self.runtimeFailureProfileID = nil
-          if visibleProfileID == nil || self.selectedProfileID == visibleProfileID {
-            self.lastError = nil
-          }
+          if mayPresent() { self.lastError = nil }
           onCurrentResult?(.success(response))
         } else if response.success {
           let hadDeferredRuntimeApplyPending = self.deferredRuntimeApplyPending
@@ -4195,9 +4801,7 @@ final class AppModel {
             : (response.coreRunning ? .active : .saved)
           self.runtimeFailurePreservedPrevious = false
           self.runtimeFailureProfileID = nil
-          if visibleProfileID == nil || self.selectedProfileID == visibleProfileID {
-            self.lastError = nil
-          }
+          if mayPresent() { self.lastError = nil }
           onCurrentResult?(.success(response))
         } else {
           self.runtimeApplyStatus = .failed
@@ -4209,7 +4813,7 @@ final class AppModel {
           present(failure.localizedDescription)
           onCurrentResult?(.failure(failure))
         }
-      case .failure(let error):
+      case .failure(let mutationError):
         guard outcome.isCurrent else {
           onSuperseded?()
           return
@@ -4217,85 +4821,154 @@ final class AppModel {
         self.runtimeApplyStatus = .failed
         self.runtimeFailurePreservedPrevious = false
         self.runtimeFailureProfileID = request.profileID ?? visibleProfileID
-        present(error.localizedDescription)
-        Task {
-          do {
-            let observed = try await self.runtimeStateReader()
-            guard outcome.generation == self.runtimeApplyCoordinator.currentGeneration else {
-              return
-            }
-            self.apply(
-              observed,
-              policy: .observation(runtimeCurrent: true, adoptDesiredRuntime: false)
-            )
-            self.helperReachable = true
-            self.runtimeApplyStatus = .failed
-            self.runtimeFailurePreservedPrevious =
-              previouslyRunning && observed.coreRunning
-              && observed.activeProfileID == knownGoodProfileID
-            self.runtimeFailureProfileID = request.profileID ?? visibleProfileID
-          } catch {
-            guard outcome.generation == self.runtimeApplyCoordinator.currentGeneration else {
-              return
-            }
-            self.helperReachable = false
-            self.observedCoreState = .unknown
-          }
-          onCurrentResult?(.failure(error))
+        present(mutationError.localizedDescription)
+        self.startRuntimeReadback(
+          generation: outcome.generation,
+          mutationError: mutationError,
+          request: request,
+          visibleProfileID: visibleProfileID,
+          previouslyRunning: previouslyRunning,
+          knownGoodProfileID: knownGoodProfileID,
+          onCurrentResult: onCurrentResult,
+          onSuperseded: onSuperseded
+        )
+      }
+    }
+    return generation
+  }
+
+  private func startRuntimeReadback(
+    generation: UInt64,
+    mutationError: any Error,
+    request: HelperRequest,
+    visibleProfileID: UUID?,
+    previouslyRunning: Bool,
+    knownGoodProfileID: UUID?,
+    onCurrentResult: (@MainActor (Result<HelperResponse, any Error>) -> Void)?,
+    onSuperseded: (@MainActor () -> Void)?
+  ) {
+    guard !terminalAdmissionClosed else {
+      onSuperseded?()
+      return
+    }
+    let previousTask = runtimeReadbackTask
+    previousTask?.cancel()
+    runtimeReadbackTask = Task { [weak self] in
+      if let previousTask { await previousTask.value }
+      guard let self else { return }
+      defer {
+        if !Task.isCancelled || self.terminalAdmissionClosed {
+          self.runtimeReadbackTask = nil
         }
       }
+      guard !self.terminalAdmissionClosed,
+        generation == self.runtimeMutationController.currentGeneration,
+        !Task.isCancelled
+      else {
+        onSuperseded?()
+        return
+      }
+      let observed = try? await self.runtimeStateReader()
+      guard generation == self.runtimeMutationController.currentGeneration else {
+        onSuperseded?()
+        return
+      }
+      self.runtimeFailurePreservedPrevious = false
+      self.runtimeFailureProfileID = request.profileID ?? visibleProfileID
+      if let observed {
+        if self.apply(
+          observed,
+          policy: .observation(runtimeCurrent: true, adoptDesiredRuntime: false)
+        ) {
+          self.helperReachable = true
+          self.runtimeFailurePreservedPrevious =
+            previouslyRunning && observed.coreRunning
+            && observed.activeProfileID == knownGoodProfileID
+        }
+      } else {
+        self.helperReachable = false
+        self.observedCoreState = .unknown
+        self.helperActiveProfileID = nil
+        self.coreVersion = nil
+      }
+      self.runtimeApplyStatus = .failed
+      onCurrentResult?(.failure(mutationError))
     }
   }
 
   private func applyCurrentDesiredRuntimeIfNeeded(
     onCurrentResult: (@MainActor (Result<HelperResponse, any Error>) -> Void)? = nil,
-    onSuperseded: (@MainActor () -> Void)? = nil
+    onSuperseded: (@MainActor () -> Void)? = nil,
+    visibleProfileID: UUID? = nil,
+    visibleSourceID: UUID? = nil
   ) {
-    runtimeApplyCoordinator.markSaved()
-    if !runtimeApplyCoordinator.isApplying {
+    if !runtimeMutationController.isApplying {
       runtimeApplyStatus = deferredRuntimeApplyPending ? .reconnectRequired : .saved
     }
-    guard desiredCoreRunning != false else { return }
-    guard coreRunning || runtimeApplyCoordinator.isApplying else { return }
+    guard runtimeMutationController.desiredRunning != false else { return }
+    guard coreRunning || runtimeMutationController.isApplying else { return }
     guard let payload = selectedProfile?.payload else {
       cancelLatencyOperation()
       submitRuntimeApply(
         HelperRequest(action: .stop, stopReason: .other),
         onCurrentResult: onCurrentResult,
-        onSuperseded: onSuperseded
+        onSuperseded: onSuperseded,
+        visibleProfileID: visibleProfileID,
+        visibleSourceID: visibleSourceID
       )
       return
     }
     submitRuntimeApply(
       makeStartRequest(profile: payload, profileID: selectedProfileID),
       onCurrentResult: onCurrentResult,
-      onSuperseded: onSuperseded
+      onSuperseded: onSuperseded,
+      visibleProfileID: visibleProfileID,
+      visibleSourceID: visibleSourceID
     )
   }
 
+  @discardableResult
   private func apply(
     _ response: HelperResponse,
     policy: HelperResponsePolicy,
     updateNodeDescriptors: Bool = true
-  ) {
+  ) -> Bool {
     let runtimeCurrent: Bool
     let adoptDesiredRuntime: Bool
     let isObservation: Bool
+    let isStaleMutation: Bool
     switch policy {
     case .observation(let isCurrent, let shouldAdopt):
       runtimeCurrent = isCurrent
       adoptDesiredRuntime = shouldAdopt
       isObservation = true
+      isStaleMutation = false
     case .currentMutation:
       runtimeCurrent = true
       adoptDesiredRuntime = false
       isObservation = false
+      isStaleMutation = false
     case .staleMutation:
       runtimeCurrent = false
       adoptDesiredRuntime = false
       isObservation = false
+      isStaleMutation = true
     }
-    helperStatus = SBMText.localized(response.message)
+    guard !isStaleMutation else { return false }
+    if response.coreRunning {
+      terminalColdOffClaim?.release()
+      terminalColdOffClaim = nil
+    }
+    guard response.legacy1115Retired == true else {
+      if runtimeCurrent {
+        helperReachable = false
+        observedCoreState = .unknown
+        helperActiveProfileID = nil
+        coreVersion = nil
+        lastError = "The one-time legacy helper retirement has not completed."
+      }
+      return false
+    }
     helperUpdateRequired = false
     helperProtocolVersion = response.protocolVersion
     helperVersion = response.helperVersion
@@ -4304,10 +4977,16 @@ final class AppModel {
       response.helperVersion == HelperConstants.helperVersion,
       response.helperRevision == HelperConstants.helperRevision
     else {
-      helperReachable = false
-      return
+      helperUpdateRequired = true
+      if runtimeCurrent {
+        helperReachable = false
+        observedCoreState = .unknown
+        helperActiveProfileID = nil
+        coreVersion = nil
+      }
+      return false
     }
-    guard runtimeCurrent else { return }
+    guard runtimeCurrent else { return true }
     let shouldPrimeLatency = response.coreRunning && !coreRunning
     coreRunning = response.coreRunning
     if response.coreRunning {
@@ -4315,33 +4994,23 @@ final class AppModel {
       startRuntimeLivenessPolling()
     }
     coreVersion = response.coreVersion
-    automaticRecoveryExhausted = response.automaticRecoveryExhausted
     if response.success && response.runtimeOutcome == .reconnectRequired {
       deferredRuntimeApplyPending = true
       if deferredRuntimeApplyPhase != .reconnecting {
         deferredRuntimeApplyPhase = .pending
         deferredRuntimeApplyError = nil
       }
-    } else if response.success,
-      response.coreRunning,
-      response.runtimeOutcome == .applied,
-      response.activeProfileID == selectedProfileID,
-      !runtimeApplyCoordinator.isApplying
-    {
-      deferredRuntimeApplyPending = false
-      deferredRuntimeApplyPhase = .idle
-      deferredRuntimeApplyError = nil
-      clearDeferredRuntimePendingPresentations()
     }
-    if !runtimeApplyCoordinator.isApplying {
+    if !runtimeMutationController.isApplying {
       runtimeApplyStatus =
         deferredRuntimeApplyPending
         ? .reconnectRequired
         : (response.coreRunning ? .active : .saved)
     }
-    if adoptDesiredRuntime, desiredCoreRunning == nil {
-      if response.coreRunning { desiredCoreRunning = true }
-      routingMode = response.mode
+    if adoptDesiredRuntime, response.success,
+      runtimeMutationController.desiredRunning == nil, response.coreRunning
+    {
+      runtimeMutationController.desiredRunning = true
     }
     helperActiveProfileID = response.activeProfileID
     activeIPv6Enabled = response.coreRunning ? response.activeIPv6Enabled : nil
@@ -4351,12 +5020,6 @@ final class AppModel {
     let responseMatchesSelectedProfile =
       selectedProfileID != nil && response.activeProfileID == selectedProfileID
     let responseMatchesRunningSelection = response.coreRunning && responseMatchesSelectedProfile
-    let responseNodeExistsInSelectedProfile =
-      response.selectedNode == .auto
-      || selectedProfile?.payload?.nodes.contains(where: { $0.id == response.selectedNode }) == true
-    if responseMatchesSelectedProfile, responseNodeExistsInSelectedProfile, adoptDesiredRuntime {
-      selectedNodeID = response.selectedNode
-    }
     if updateNodeDescriptors, responseMatchesRunningSelection, !response.nodes.isEmpty {
       let delays = Dictionary(
         uniqueKeysWithValues: nodes.compactMap { node in
@@ -4367,7 +5030,6 @@ final class AppModel {
         return ProxyNode(
           id: descriptor.id,
           name: descriptor.name,
-          symbol: symbol(for: descriptor.kind),
           groupID: metadata?.id,
           groupName: metadata?.name,
           groupOrder: metadata?.groupOrder,
@@ -4377,31 +5039,53 @@ final class AppModel {
       }
     }
     if shouldPrimeLatency {
-      Task { [weak self] in
-        try? await Task.sleep(for: .milliseconds(250))
-        self?.refreshLatencyIfNeeded()
-      }
+      scheduleLatencyRefresh(after: 0.25)
     } else if response.coreRunning {
-      scheduleNextLatencyRefresh()
+      if !isObservation { scheduleNextLatencyRefresh() }
     } else {
-      latencyRefreshTask?.cancel()
-      latencyRefreshTask = nil
+      cancelLatencyOperation()
     }
     if let inspectionSnapshot = routingInspectorState.snapshot,
       inspectionSnapshot != currentRoutingInspectionSnapshot()
     {
       invalidateRoutingInspector()
     }
-    if isObservation, response.success { reconcileDesiredIPv6IfNeeded() }
+    if isObservation, response.success {
+      reconcileDesiredIPv6IfNeeded()
+      restoreStartupVPNIfNeeded(from: response)
+    }
+    return true
+  }
+
+  private func restoreStartupVPNIfNeeded(from response: HelperResponse) {
+    guard
+      !terminalAdmissionClosed,
+      !helperSetupInProgress,
+      !durableStopProofRequired,
+      startupRestorePending
+    else { return }
+    startupRestorePending = false
+    helperEnabled = true
+    helperReachable = true
+    guard !response.coreRunning else { return }
+    guard let profileID = selectedProfileID, let payload = selectedProfile?.payload else {
+      startupRestoreError = SBMText.localized(
+        "Could not restore the VPN because the selected profile is unavailable."
+      )
+      return
+    }
+    startupRestoreError = nil
+    runtimeMutationController.desiredRunning = true
+    submitRuntimeApply(makeStartRequest(profile: payload, profileID: profileID))
   }
 
   private func reconcileDesiredIPv6IfNeeded() {
     guard observedCoreState == .running,
-      desiredCoreRunning != false
+      runtimeMutationController.desiredRunning != false
     else { return }
     guard currentHelperIsReady,
       profileRefreshTask == nil,
-      !runtimeApplyCoordinator.isApplying,
+      !runtimeMutationController.isApplying,
       !deferredRuntimeApplyPending,
       deferredRuntimeApplyPhase != .reconnecting,
       runtimeApplyStatus != .failed
@@ -4417,16 +5101,6 @@ final class AppModel {
     applyCurrentDesiredRuntimeIfNeeded()
   }
 
-  private func symbol(for kind: ProxyNodeKind) -> String {
-    switch kind {
-    case .automatic: "wand.and.stars"
-    case .vless: "shield.lefthalf.filled"
-    case .hysteria2: "bolt.horizontal.fill"
-    case .shadowsocks: "lock.shield"
-    case .native, .unknown: "network"
-    }
-  }
-
   private func groupMetadata(for nodeID: ProxyNodeID) -> (
     id: String, name: String, groupOrder: Int, nodeOrder: Int
   )? {
@@ -4439,50 +5113,77 @@ final class AppModel {
     return nil
   }
 
-  private func enableCurrentHelper() async throws -> HelperResponse {
-    try await HelperLifecycle.enable(service: helperService) {
-      try await self.helperLifecycleSender(
-        HelperRequest(action: .status),
-        5
-      )
+  private func upgradeLegacyHelper() async throws -> HelperResponse {
+    let generation = runtimeMutationController.currentGeneration
+    let upgrade = try await HelperLifecycle.upgradeLegacy1115(
+      service: helperService,
+      bundleURL: applicationBundleURL,
+      probe: {
+        let response = try await self.helperLifecycleSender(HelperRequest(action: .status), 5)
+        try await MainActor.run {
+          try Task.checkCancellation()
+          guard generation == self.runtimeMutationController.currentGeneration else {
+            throw CancellationError()
+          }
+          if response.protocolVersion == HelperConstants.protocolVersion,
+            response.helperVersion == HelperConstants.helperVersion,
+            response.helperRevision == HelperConstants.helperRevision,
+            response.success,
+            !response.coreRunning,
+            response.legacy1115Retired == false
+          {
+            self.durableStopProofRequired = true
+          }
+        }
+        return response
+      },
+      finish: {
+        try await self.helperLifecycleSender(
+          HelperRequest(action: .finishLegacy1115Upgrade), 30
+        )
+      }
+    )
+    if upgrade.newlyRetired, !Task.isCancelled,
+      generation == runtimeMutationController.currentGeneration
+    {
+      durableStopProofRequired = false
     }
+    return upgrade.response
   }
 
   private func refreshRegistrationStatus() {
     helperUpdateRequired = false
-    switch helperService.registrationState {
+    let registrationState = helperService.registrationState
+    switch registrationState {
     case .enabled:
       helperEnabled = true
       helperRequiresApproval = false
-      helperStatus = SBMText.localized("Helper enabled")
     case .requiresApproval:
       helperEnabled = false
       helperReachable = false
       observedCoreState = .unknown
       helperRequiresApproval = true
-      helperStatus = SBMText.localized("Approval required")
     case .notRegistered:
       helperEnabled = false
       helperReachable = false
       observedCoreState = .unknown
       helperRequiresApproval = false
-      helperStatus = SBMText.localized("Helper not enabled")
     case .notFound:
       helperEnabled = false
       helperReachable = false
       observedCoreState = .unknown
       helperRequiresApproval = false
-      helperStatus = SBMText.localized("Helper missing")
     case .unknown:
       helperEnabled = false
       helperReachable = false
       observedCoreState = .unknown
       helperRequiresApproval = false
-      helperStatus = SBMText.localized("Unknown helper state")
     }
+    if registrationState != .enabled { invalidateRefresh() }
   }
 
   private func bootstrapHelper() {
+    guard !terminalAdmissionClosed else { return }
     if helperApprovalPending {
       continueHelperApprovalFlow()
       return
@@ -4499,17 +5200,16 @@ final class AppModel {
 
   private func invalidateRefresh() {
     refreshGeneration += 1
-    refreshInProgress = false
+    statusRefreshTask?.cancel()
   }
 
   private func beginHelperApprovalFlow(openSystemSettings: Bool) {
+    guard !terminalAdmissionClosed else { return }
     helperApprovalPending = true
-    helperApprovalDefaults.set(true, forKey: HelperApprovalPersistence.pendingKey)
     helperEnabled = false
     helperReachable = false
     observedCoreState = .unknown
     helperRequiresApproval = true
-    helperStatus = SBMText.localized("Waiting for approval in System Settings…")
     lastError = nil
     if openSystemSettings, !helperApprovalSettingsPresented {
       helperService.openSystemSettings()
@@ -4520,7 +5220,6 @@ final class AppModel {
 
   private func completeHelperApprovalFlow() {
     helperApprovalPending = false
-    helperApprovalDefaults.removeObject(forKey: HelperApprovalPersistence.pendingKey)
     helperApprovalPollTask?.cancel()
     helperApprovalPollTask = nil
     helperApprovalPolling = false
@@ -4528,6 +5227,7 @@ final class AppModel {
   }
 
   private func continueHelperApprovalFlow() {
+    guard !terminalAdmissionClosed else { return }
     guard helperApprovalPending else {
       refresh()
       return
@@ -4540,7 +5240,7 @@ final class AppModel {
     case .enabled:
       helperEnabled = true
       helperRequiresApproval = false
-      repairHelper()
+      enableHelper()
     case .notRegistered, .notFound:
       helperEnabled = false
       helperRequiresApproval = false
@@ -4550,13 +5250,14 @@ final class AppModel {
       helperReachable = false
       observedCoreState = .unknown
       helperRequiresApproval = false
-      helperStatus = SBMText.localized("Waiting for macOS to update helper approval…")
       startHelperApprovalPolling()
     }
   }
 
   private func startHelperApprovalPolling() {
-    guard helperApprovalPending, helperApprovalPollTask == nil else { return }
+    guard !terminalAdmissionClosed, helperApprovalPending, helperApprovalPollTask == nil else {
+      return
+    }
     helperApprovalPolling = true
     helperApprovalPollTask = Task { [weak self] in
       guard let self else { return }
@@ -4587,48 +5288,27 @@ final class AppModel {
     }
   }
 
-  private func enableLaunchAtLoginIfNeeded() {
+  private func refreshLaunchAtLoginStatus() {
     launchAtLoginEnabled = loginItemService.status == .enabled
-    guard loginItemService.status == .notRegistered else { return }
-    do {
-      try loginItemService.register()
-      launchAtLoginEnabled = loginItemService.status == .enabled
-    } catch {
-      lastError = SBMText.format("Unable to enable launch at login: %@", error.localizedDescription)
-    }
   }
 
-  private func connectAutomaticallyIfNeeded() {
-    guard !runtimeApplyCoordinator.isApplying else { return }
-    guard let payload = selectedProfile?.payload else { return }
-    guard desiredCoreRunning != false else { return }
-    guard
-      AutomaticConnectionPolicy.shouldConnect(
-        didAttemptAutomaticConnection: didAttemptAutomaticConnection,
-        automaticRecoveryExhausted: automaticRecoveryExhausted,
-        helperReady: currentHelperIsReady,
-        profileAvailable: true,
-        coreRunningForSelectedProfile: coreRunning && helperActiveProfileID == selectedProfileID
-      )
-    else { return }
-    didAttemptAutomaticConnection = true
-    desiredCoreRunning = true
-    let request = makeStartRequest(profile: payload, profileID: selectedProfileID)
-    submitRuntimeApply(request) { [weak self] result in
-      if case .failure(let error) = result {
-        self?.lastError = SBMText.format(
-          "Automatic connection failed: %@", error.localizedDescription)
-      }
-    }
-  }
-
-  private var isInstalledInApplications: Bool {
-    applicationBundleURL.resolvingSymlinksInPath().path.hasPrefix("/Applications/")
+  var isInstalledInApplications: Bool {
+    applicationBundleURL.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL.path
+      == "/Applications/SBM.app"
   }
 
   private var currentHelperIsReady: Bool {
     helperEnabled
       && helperReachable
+      && helperProtocolVersion == HelperConstants.protocolVersion
+      && helperVersion == HelperConstants.helperVersion
+      && helperRevision == HelperConstants.helperRevision
+  }
+
+  private var currentRegisteredHelperIsCompatible: Bool {
+    helperEnabled
+      && helperService.registrationState == .enabled
+      && !helperUpdateRequired
       && helperProtocolVersion == HelperConstants.protocolVersion
       && helperVersion == HelperConstants.helperVersion
       && helperRevision == HelperConstants.helperRevision
@@ -4688,26 +5368,79 @@ final class AppModel {
   }
 
   private func synchronizeLatencyTarget(_ target: String) {
+    guard !terminalAdmissionClosed else {
+      markLatencySynchronizationPending()
+      return
+    }
     guard !latencyApplyInProgress else { return }
-    latencyApplyInProgress = true
-    send(
-      HelperRequest(action: .setLatencyTarget, latencyTestURL: target)
-    ) { [weak self] result in
+    beginBusyOperation()
+    latencySyncTask = Task { [weak self] in
       guard let self else { return }
-      self.latencyApplyInProgress = false
-      switch result {
-      case .success:
-        self.latencySettingsIssue = nil
-        self.lastError = nil
-      case .failure(let error):
-        let message = self.setSettingsError(
-          SBMText.localized("Latency runtime synchronization failed"),
-          error: error,
-          additionalSecrets: [target]
-        )
-        self.latencySettingsIssue = .runtimeSynchronization(message)
+      defer {
+        self.latencySyncTask = nil
+        self.endBusyOperation()
+      }
+
+      var target = target
+      while true {
+        guard !self.terminalAdmissionClosed, !Task.isCancelled else { return }
+        let result: Result<HelperResponse, any Error>
+        do {
+          let runtimeGeneration = self.runtimeMutationController.currentGeneration
+          let runtimeMutationWasApplying = self.runtimeMutationController.isApplying
+          let response = try await self.helperRequestSender(
+            HelperRequest(action: .setLatencyTarget, latencyTestURL: target)
+          )
+          guard !self.terminalAdmissionClosed, !Task.isCancelled else { return }
+          self.apply(
+            response,
+            policy: .observation(
+              runtimeCurrent: !runtimeMutationWasApplying
+                && !self.runtimeMutationController.isApplying
+                && runtimeGeneration == self.runtimeMutationController.currentGeneration,
+              adoptDesiredRuntime: false
+            )
+          )
+          if response.protocolVersion != HelperConstants.protocolVersion
+            || response.helperVersion != HelperConstants.helperVersion
+            || response.helperRevision != HelperConstants.helperRevision
+          {
+            result = .failure(AppModelFailure.helperRevisionMismatch)
+          } else if response.success {
+            result = .success(response)
+          } else {
+            result = .failure(AppModelFailure.helperRequestFailed(response.message))
+          }
+        } catch {
+          result = .failure(error)
+        }
+
+        guard !self.terminalAdmissionClosed, !Task.isCancelled else { return }
+        if target != self.latencyTestURL {
+          target = self.latencyTestURL
+          continue
+        }
+        switch result {
+        case .success:
+          self.latencySettingsIssue = nil
+          self.lastError = nil
+        case .failure(let error):
+          let message = self.setSettingsError(
+            SBMText.localized("Latency runtime synchronization failed"),
+            error: error,
+            additionalSecrets: [target]
+          )
+          self.latencySettingsIssue = .runtimeSynchronization(message)
+        }
+        return
       }
     }
+  }
+
+  private func markLatencySynchronizationPending(showAsLastError: Bool = true) {
+    let message = SBMText.localized("Saved locally; background helper synchronization is pending.")
+    latencySettingsIssue = .runtimeSynchronization(message)
+    if showAsLastError { lastError = message }
   }
 
   private func profileSummary(_ profile: VPNProfile) -> String {

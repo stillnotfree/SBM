@@ -31,18 +31,7 @@ import Testing
   }
 }
 
-@Test func olderLatencyStoresDecodeToTheDefaultTarget() throws {
-  let libraryData = Data(
-    """
-    {
-      "profiles": [],
-      "selectedProfileID": null,
-      "localSOCKSEnabled": false,
-      "localSOCKSPort": 1082,
-      "latencyIntervalMinutes": 10
-    }
-    """.utf8
-  )
+@Test func olderHelperStateDecodesToTheDefaultLatencyTarget() throws {
   let helperData = Data(
     """
     {
@@ -58,27 +47,30 @@ import Testing
     """.utf8
   )
 
-  let library = try JSONDecoder().decode(ProfileLibrary.self, from: libraryData)
   let state = try JSONDecoder().decode(PersistentState.self, from: helperData)
 
-  #expect(library.latencyTestURL == LatencyTargetPolicy.defaultURL)
   #expect(state.latencyTestURL == LatencyTargetPolicy.defaultURL)
 }
 
-@Test func latencyTargetPersistsAndInvalidApplyPreservesTheSavedValue() throws {
+@Test @MainActor func latencyTargetPersistsAndInvalidApplyPreservesTheSavedValue() throws {
   let valid = try LatencyTargetPolicy.normalized("https://latency.example.test/check")
   let library = ProfileLibrary(profiles: [], selectedProfileID: nil, latencyTestURL: valid)
   let encoded = try JSONEncoder().encode(library)
   let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: encoded)
   #expect(decoded.latencyTestURL == valid)
 
-  var saved = valid
-  #expect(throws: LatencyTargetFailure.self) {
-    _ = try LatencyTargetSettings.apply(draft: "http://invalid.example.test") { target in
-      saved = target
-    }
-  }
-  #expect(saved == valid)
+  var savedLibraries: [ProfileLibrary] = []
+  let model = AppModel(
+    profileLibraryLoader: { library },
+    profileLibrarySaver: { savedLibraries.append($0) },
+    userDefaults: IsolatedTestUserDefaults(),
+    performStartup: false
+  )
+  model.latencyTestURLDraft = "http://invalid.example.test"
+
+  #expect(!model.applyLatencySettings())
+  #expect(model.latencyTestURL == valid)
+  #expect(savedLibraries.isEmpty)
 }
 
 @Test func latencyTargetStateUpdatesManualDelayWithoutLifecycleAction() throws {
@@ -98,6 +90,7 @@ import Testing
     for: ProxyNodeID(rawValue: "proxy/one"),
     target: state.latencyTestURL
   )
+  #expect(path.hasPrefix("/proxies/proxy%2Fone/delay?"))
   let url = try #require(URL(string: "http://localhost\(path)"))
   let queryItems = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
   #expect(queryItems.first(where: { $0.name == "url" })?.value == target)
@@ -180,12 +173,13 @@ import Testing
       )
     },
     profileLibrarySaver: { savedLibraries.append($0) },
+    userDefaults: IsolatedTestUserDefaults(),
     performStartup: false
   )
 
   model.latencyTestURLDraft = "https://changed.example.test/check"
   model.localSOCKSPortDraft = 1083
-  #expect(model.applyLatencyTestURL())
+  #expect(model.applyLatencySettings())
   #expect(savedLibraries.last?.latencyTestURL == "https://changed.example.test/check")
   #expect(model.applyLocalSOCKSSettings())
   #expect(savedLibraries.last?.localSOCKSPort == 1083)
@@ -193,10 +187,11 @@ import Testing
   let failingModel = AppModel(
     profileLibraryLoader: { .empty },
     profileLibrarySaver: { _ in throw ApplyConfirmationTestFailure.persistence },
+    userDefaults: IsolatedTestUserDefaults(),
     performStartup: false
   )
   failingModel.latencyTestURLDraft = "https://changed.example.test/check"
-  #expect(!failingModel.applyLatencyTestURL())
+  #expect(!failingModel.applyLatencySettings())
   #expect(!failingModel.applyLocalSOCKSSettings())
 }
 
@@ -204,7 +199,7 @@ private enum ApplyConfirmationTestFailure: Error {
   case persistence
 }
 
-@Test func settingsUseOneImporterAndNativePendingFeedbackAndCurrentRoutingCopy() throws {
+@Test func settingsUseOneImporterAndManagedPendingFeedbackAndCurrentRoutingCopy() throws {
   let packageRoot = URL(filePath: #filePath)
     .deletingLastPathComponent()
     .deletingLastPathComponent()
@@ -213,7 +208,7 @@ private enum ApplyConfirmationTestFailure: Error {
     contentsOf: packageRoot.appending(path: "Sources/SBM/SettingsView.swift"), encoding: .utf8)
 
   #expect(source.components(separatedBy: ".fileImporter(").count - 1 == 1)
-  #expect(source.contains(#"Button("Import Full JSON as New Profile…")"#))
+  #expect(!source.contains("Import Full JSON as New Profile"))
   #expect(source.contains(#"Button("Import Routing…")"#))
   #expect(source.contains(#"Button("Open Current…")"#))
   #expect(source.contains("model.openCurrentRoutingPolicy()"))

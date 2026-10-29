@@ -13,6 +13,32 @@ private struct SettingsHelperTextModifier: ViewModifier {
   }
 }
 
+private struct FullWidthDisclosureGroupStyle: DisclosureGroupStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    VStack(spacing: 8) {
+      Button {
+        withAnimation { configuration.isExpanded.toggle() }
+      } label: {
+        HStack {
+          configuration.label
+          Spacer(minLength: 8)
+          Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityValue(Text(configuration.isExpanded ? "Expanded" : "Collapsed"))
+
+      if configuration.isExpanded {
+        configuration.content
+      }
+    }
+  }
+}
+
 extension View {
   fileprivate func settingsHelperText() -> some View {
     modifier(SettingsHelperTextModifier())
@@ -20,7 +46,7 @@ extension View {
 }
 
 struct SettingsView: View {
-  private enum JSONImportKind { case nativeProfile, routing, profileRecovery }
+  private enum JSONImportKind { case routing, profileRecovery, profileRestore }
 
   private let formControlWidth: CGFloat = 300
   private let routingLabelWidth: CGFloat = 110
@@ -32,10 +58,14 @@ struct SettingsView: View {
 
   @Bindable var model: AppModel
   @State private var isImportingJSON = false
-  @State private var jsonImportKind = JSONImportKind.nativeProfile
+  @State private var jsonImportKind = JSONImportKind.routing
   @State private var isConfirmingHWIDRegeneration = false
   @State private var isSubscriptionURLVisible = false
   @State private var isConfirmingProfileReset = false
+  @State private var deletionTarget: (profileID: UUID, sourceID: UUID?)?
+  @State private var dnsSettingsDraft = ManagedDNSSettings.defaults
+  @State private var dnsSettingsError: String?
+  @State private var autoSelectionTarget: (profileID: UUID, sourceID: UUID)?
 
   var body: some View {
     TabView {
@@ -45,9 +75,30 @@ struct SettingsView: View {
         .tabItem { Label("Routing", systemImage: "arrow.triangle.branch") }
       advancedTab
         .tabItem { Label("Advanced", systemImage: "gearshape.2") }
+      settingsTab
+        .tabItem { Label("Settings", systemImage: "gearshape") }
     }
     .frame(minWidth: 620, minHeight: 520)
     .padding()
+    .confirmationDialog(
+      Text(deletionConfirmationTitle),
+      isPresented: Binding(
+        get: { deletionTarget.map { _ in true } ?? false },
+        set: { if !$0 { deletionTarget = nil } }
+      ),
+      titleVisibility: .visible
+    ) {
+      Button("Delete", role: .destructive) {
+        guard let target = deletionTarget else { return }
+        deletionTarget = nil
+        if let sourceID = target.sourceID {
+          model.deleteSelectedSource(profileID: target.profileID, sourceID: sourceID)
+        } else {
+          model.deleteSelectedProfile(profileID: target.profileID)
+        }
+      }
+      Button("Cancel", role: .cancel) { deletionTarget = nil }
+    }
     .confirmationDialog(
       "Regenerate subscription HWID?",
       isPresented: $isConfirmingHWIDRegeneration,
@@ -77,20 +128,61 @@ struct SettingsView: View {
     ) { result in
       guard case .success(let urls) = result, let url = urls.first else { return }
       switch jsonImportKind {
-      case .nativeProfile: model.importNativeProfile(from: url)
       case .routing: model.importRoutingPolicy(from: url)
       case .profileRecovery: model.importRecoveredProfileLibrary(from: url)
+      case .profileRestore: model.restoreProfileLibrary(from: url)
       }
+    }
+    .sheet(
+      isPresented: Binding(
+        get: { autoSelectionTarget != nil },
+        set: { if !$0 { autoSelectionTarget = nil } }
+      ),
+      onDismiss: { autoSelectionTarget = nil }
+    ) {
+      autoSelectionSheet
+    }
+    .onChange(of: model.selectedProfileID) { _, profileID in
+      if profileID != autoSelectionTarget?.profileID { autoSelectionTarget = nil }
+    }
+    .onChange(of: model.selectedSourceID) { _, sourceID in
+      if sourceID != autoSelectionTarget?.sourceID { autoSelectionTarget = nil }
     }
     .onDisappear {
       isSubscriptionURLVisible = false
     }
   }
 
+  private var deletionConfirmationTitle: String {
+    guard let target = deletionTarget,
+      let profile = model.profiles.first(where: { $0.id == target.profileID })
+    else { return SBMText.localized("Delete") }
+    if let sourceID = target.sourceID {
+      guard let source = profile.sources.first(where: { $0.id == sourceID }) else {
+        return SBMText.localized("Delete")
+      }
+      return SBMText.format("Delete source %@ from profile %@", source.name, profile.name)
+    }
+    return SBMText.format("Delete profile: %@", profile.name)
+  }
+
+  @ViewBuilder private var currentErrorCallout: some View {
+    if let error = model.safeCurrentError {
+      Text(SBMText.format("Last error: %@", error))
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .textSelection(.enabled)
+    }
+  }
+
   private var profilesTab: some View {
     Form {
+      currentErrorCallout
       deferredRuntimeApplyCallout
       if model.profileRecoveryRequired { recoverySection }
+      if let profileLoadIssueMessage = model.profileLoadIssueMessage {
+        profileLoadIssueSection(profileLoadIssueMessage)
+      }
       profileSection
       sourceSection
     }
@@ -109,12 +201,43 @@ struct SettingsView: View {
         Button("Show Preserved Copy") { model.revealPreservedProfileLibrary() }
         Spacer()
         Button("Start Empty…", role: .destructive) { isConfirmingProfileReset = true }
-          .disabled(model.coreRunning)
+          .disabled(!model.profileReplacementRuntimeIsSafe)
       }
-      if model.coreRunning {
-        Text("Disconnect the VPN before starting with an empty library.")
+      if !model.profileReplacementRuntimeIsSafe {
+        Text("Disconnect the VPN before starting with an empty profile library.")
           .settingsHelperText()
       }
+    }
+  }
+
+  private func profileLoadIssueSection(_ message: String) -> some View {
+    Section("Profile Data") {
+      Label(message, systemImage: "exclamationmark.triangle.fill")
+        .foregroundStyle(.orange)
+    }
+  }
+
+  private var profileLibraryTransferSection: some View {
+    Section("Backup & Restore") {
+      HStack {
+        Button("Back Up…") {
+          let panel = NSSavePanel()
+          panel.allowedContentTypes = [.json]
+          panel.nameFieldStringValue = "SBM-Profiles.json"
+          guard panel.runModal() == .OK, let url = panel.url else { return }
+          model.backUpProfileLibrary(to: url)
+        }
+        .disabled(!model.canBackUpProfileLibrary)
+        Button("Restore…") {
+          jsonImportKind = .profileRestore
+          isImportingJSON = true
+        }
+        .disabled(!model.canRestoreProfileLibrary)
+      }
+      Text(
+        "This backup includes profile, subscription, and connection credentials. Restore replaces the current profile library and is available only while the VPN runtime is safely stopped."
+      )
+      .settingsHelperText()
     }
   }
 
@@ -142,7 +265,9 @@ struct SettingsView: View {
             }
             .help("Add profile")
             Button {
-              model.deleteSelectedProfile()
+              if let profileID = model.selectedProfileID {
+                deletionTarget = (profileID, nil)
+              }
             } label: {
               Label("Delete selected profile", systemImage: "minus")
                 .labelStyle(.iconOnly).frame(width: 24)
@@ -197,7 +322,11 @@ struct SettingsView: View {
               }
               .help("Add subscription or connection")
               Button {
-                model.deleteSelectedSource()
+                if let profileID = model.selectedProfileID,
+                  let sourceID = model.selectedSourceID
+                {
+                  deletionTarget = (profileID, sourceID)
+                }
               } label: {
                 Label("Delete source", systemImage: "minus")
                   .labelStyle(.iconOnly).frame(width: 24)
@@ -238,15 +367,13 @@ struct SettingsView: View {
               .help(isSubscriptionURLVisible ? "Hide subscription URL" : "Show subscription URL")
             }
           }
-          Text("HTTPS URL · vless:// · hysteria2:// · hy2:// · ss://")
-            .settingsHelperText()
         }
         .disabled(model.selectedSourceID == nil || model.isSyncing)
 
-        DisclosureGroup("Advanced Source Settings") {
-          settingsRow("Exclude regex (optional)") {
+        DisclosureGroup {
+          settingsRow("Exclude regex") {
             TextField(text: $model.sourceExcludeRegex, prompt: Text("(?i)lte|russia")) {
-              Text("Exclude regex (optional)")
+              Text("Exclude regex")
             }
             .multilineTextAlignment(.trailing)
             .labelsHidden()
@@ -266,6 +393,18 @@ struct SettingsView: View {
           }
           settingsRow("X-Device-OS") {
             TextField("X-Device-OS", text: $model.subscriptionDeviceOS)
+              .multilineTextAlignment(.trailing)
+              .labelsHidden()
+              .textFieldStyle(.roundedBorder)
+          }
+          settingsRow("X-Ver-OS") {
+            TextField("X-Ver-OS", text: $model.subscriptionDeviceOSVersion)
+              .multilineTextAlignment(.trailing)
+              .labelsHidden()
+              .textFieldStyle(.roundedBorder)
+          }
+          settingsRow("X-Device-Model") {
+            TextField("X-Device-Model", text: $model.subscriptionDeviceModel)
               .multilineTextAlignment(.trailing)
               .labelsHidden()
               .textFieldStyle(.roundedBorder)
@@ -290,14 +429,17 @@ struct SettingsView: View {
           }
           Text("Each source keeps its own filter and request headers.")
             .settingsHelperText()
+        } label: {
+          Text("Advanced Source Settings")
         }
+        .disclosureGroupStyle(FullWidthDisclosureGroupStyle())
         .disabled(model.selectedSourceID == nil || model.isSyncing)
 
         HStack {
-          Button("Save and Sync") { model.saveAndSyncSubscription() }
+          Button("Save and Refresh") { model.saveAndSyncSubscription() }
             .disabled(
               model.isSyncing || model.helperSetupInProgress
-                || !model.sourceDraftIsValid
+                || !model.sourceDraftIsValid || !model.sourceDraftNeedsSaveOrSync
             )
           if model.isSyncing { ProgressView().controlSize(.small) }
           Text(model.subscriptionStatus)
@@ -309,9 +451,14 @@ struct SettingsView: View {
             .foregroundStyle(.orange)
             .textSelection(.enabled)
         }
-      } else {
-        Text("Full JSON profiles cannot be combined with subscription sources.")
-          .settingsHelperText()
+        Button("Servers for Auto…") {
+          guard let profileID = model.selectedProfileID,
+            let sourceID = model.selectedSourceID
+          else { return }
+          autoSelectionTarget = (profileID: profileID, sourceID: sourceID)
+        }
+        .disabled(model.selectedSourceID == nil)
+        .frame(maxWidth: .infinity, alignment: .center)
       }
     }
   }
@@ -333,6 +480,7 @@ struct SettingsView: View {
 
   private var routingTab: some View {
     Form {
+      currentErrorCallout
       deferredRuntimeApplyCallout
       websiteRoutingSection
       applicationRoutingSection
@@ -411,7 +559,7 @@ struct SettingsView: View {
         }
       }
       Text(
-        "A domain rule also applies to its subdomains. Website rules precede application and imported routing."
+        "A domain rule also applies to its subdomains. Application Routing precedes broader Website and imported policy."
       )
       .settingsHelperText()
       routingMutationFeedback(model.websiteRoutingStatus)
@@ -506,7 +654,8 @@ struct SettingsView: View {
         Text("Domain or IP")
           .lineLimit(1)
           .frame(width: routingLabelWidth, alignment: .leading)
-        TextField(text: $model.routingInspectorInput, prompt: Text("gosuslugi.ru")) {
+        TextField(text: $model.routingInspectorInput, prompt: Text("Enter a domain or IP address"))
+        {
           Text("Domain or IP")
         }
         .labelsHidden()
@@ -521,17 +670,20 @@ struct SettingsView: View {
       }
       .frame(maxWidth: .infinity)
 
-      Text(model.routingInspectorOutput)
-        .font(.callout.weight(.medium)).textSelection(.enabled)
+      if !model.routingInspectorOutput.isEmpty {
+        Text(model.routingInspectorOutput)
+          .font(.callout.weight(.medium)).textSelection(.enabled)
+      }
       if !model.routingInspectorDetails.isEmpty {
         DisclosureGroup("Details") {
           Text(model.routingInspectorDetails)
             .font(.system(.caption, design: .monospaced))
             .foregroundStyle(.secondary).textSelection(.enabled)
         }
+        .disclosureGroupStyle(FullWidthDisclosureGroupStyle())
       }
       Text(
-        "Explain is local and probe-free; remote rule sets use only the active bounded cache check."
+        "Explain uses saved policy only; remote rule-set membership remains unknown locally."
       )
       .settingsHelperText()
     }
@@ -539,7 +691,7 @@ struct SettingsView: View {
 
   private var advancedRoutingSection: some View {
     Section {
-      DisclosureGroup("Advanced Routing JSON") {
+      DisclosureGroup("Routing Rules and Rule Sets (JSON)") {
         Text(model.routingPolicyStatus).foregroundStyle(statusColor)
         HStack {
           Button("Import Routing…") {
@@ -555,24 +707,194 @@ struct SettingsView: View {
         Text("Advanced custom sing-box route rules and remote source/binary rule sets.")
           .settingsHelperText()
       }
+      .disclosureGroupStyle(FullWidthDisclosureGroupStyle())
     }
   }
 
   private var advancedTab: some View {
     Form {
+      currentErrorCallout
       deferredRuntimeApplyCallout
       latencySection
       localSOCKSSection
       ipv6Section
-      Section("Advanced Profile Import") {
-        Button("Import Full JSON as New Profile…") {
-          jsonImportKind = .nativeProfile
-          isImportingJSON = true
-        }
-        .disabled(model.helperSetupInProgress)
-      }
+      dnsSection
     }
     .formStyle(.grouped)
+    .onAppear { dnsSettingsDraft = model.dnsSettings }
+    .onChange(of: dnsSettingsDraft) { _, draft in
+      model.clearStaleDNSValidationError(for: draft)
+    }
+  }
+
+  private var settingsTab: some View {
+    Form {
+      currentErrorCallout
+      deferredRuntimeApplyCallout
+      startupLifecycleSection
+      if !model.profileRecoveryRequired && model.profileLoadIssueMessage == nil {
+        profileLibraryTransferSection
+      }
+      aboutSection
+    }
+    .formStyle(.grouped)
+  }
+
+  private var startupLifecycleSection: some View {
+    Section("Startup") {
+      Toggle(
+        "Launch SBM at login",
+        isOn: Binding(
+          get: { model.launchAtLoginEnabled },
+          set: { model.setLaunchAtLoginEnabled($0) }
+        )
+      )
+      Toggle(
+        "Restore Last Connection State",
+        isOn: Binding(
+          get: { model.restoreLastVPNStateEnabled },
+          set: { model.setRestoreLastVPNStateEnabled($0) }
+        )
+      )
+      Text("When enabled, SBM reconnects after launch only if you last explicitly connected.")
+        .settingsHelperText()
+      if let error = model.launchAtLoginError {
+        Label(error, systemImage: "exclamationmark.triangle")
+          .font(.caption)
+          .foregroundStyle(.orange)
+      }
+      if let error = model.startupRestoreError {
+        Label(error, systemImage: "exclamationmark.triangle")
+          .font(.caption)
+          .foregroundStyle(.orange)
+      }
+    }
+  }
+
+  private var aboutSection: some View {
+    Section("About SBM") {
+      HStack(spacing: 12) {
+        Image(nsImage: NSApplication.shared.applicationIconImage)
+          .resizable()
+          .scaledToFit()
+          .frame(width: 48, height: 48)
+        VStack(alignment: .leading, spacing: 4) {
+          Text("SBM")
+            .font(.headline)
+          Text(SBMText.format("Version %@ (%@)", version, build))
+            .foregroundStyle(.secondary)
+          Text(SBMText.format("sing-box %@", CoreBuildInfo.version))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        Spacer(minLength: 0)
+      }
+
+      Text("Native Apple Silicon menu bar client for sing-box.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+
+      if model.isDownloadingUpdate {
+        ProgressView(value: model.updateDownloadProgress ?? 0)
+        Text("\(Int(((model.updateDownloadProgress ?? 0) * 100).rounded()))%")
+          .font(.caption.monospacedDigit())
+          .foregroundStyle(.secondary)
+      }
+
+      HStack {
+        if model.availableUpdateVersion != nil {
+          Button("Download Update") {
+            model.downloadAndOpenUpdate()
+          }
+          .disabled(model.isDownloadingUpdate || model.isCheckingForUpdates)
+        } else {
+          Button("Check for Updates") {
+            model.checkForUpdates()
+          }
+          .disabled(model.isCheckingForUpdates || model.isDownloadingUpdate)
+        }
+        Spacer(minLength: 8)
+        if !model.isCheckingForUpdates,
+          !model.updateStatus.isEmpty
+        {
+          Text(model.updateStatus)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(model.updateStatus)
+        }
+      }
+    }
+  }
+
+  private var version: String {
+    Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+      ?? "Development"
+  }
+
+  private var build: String {
+    Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "local"
+  }
+
+  private var autoSelectionSheet: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      if let target = autoSelectionTarget,
+        model.selectedProfileID == target.profileID,
+        model.selectedSourceID == target.sourceID,
+        let source = model.selectedProfileSources.first(where: { $0.id == target.sourceID })
+      {
+        Text(SBMText.format("Auto servers for %@", source.name))
+          .font(.headline)
+        Text(
+          "Choose which servers Auto can use. Other servers remain available for manual selection."
+        )
+        .settingsHelperText()
+        ScrollView {
+          VStack(alignment: .leading, spacing: 8) {
+            if let section = model.autoSelectionSections.first(where: {
+              $0.id == target.sourceID.uuidString
+            }) {
+              ForEach(section.nodes) { node in
+                Toggle(
+                  isOn: Binding(
+                    get: { !model.autoSelectionExcludedNodeIDs.contains(node.id) },
+                    set: {
+                      model.setNodeIncludedInAuto(
+                        node.id, included: $0, profileID: target.profileID,
+                        sourceID: target.sourceID
+                      )
+                    }
+                  )
+                ) {
+                  Text(node.name)
+                }
+                .disabled(model.helperSetupInProgress)
+              }
+            } else {
+              Text("This source has no servers yet.")
+                .foregroundStyle(.secondary)
+            }
+          }
+        }
+        .frame(maxHeight: 360)
+        if model.autoSelectionAllExcluded {
+          Text("Auto blocks until you include at least one node.")
+            .settingsHelperText()
+        }
+        routingMutationFeedback(model.autoSelectionStatus)
+      } else {
+        Text("This source is no longer available.")
+          .foregroundStyle(.secondary)
+      }
+      HStack {
+        Spacer()
+        Button("Done") { autoSelectionTarget = nil }
+          .keyboardShortcut(.defaultAction)
+      }
+    }
+    .padding()
+    .frame(minWidth: 360, minHeight: 220, maxHeight: 480)
   }
 
   private var latencySection: some View {
@@ -683,6 +1005,72 @@ struct SettingsView: View {
     }
   }
 
+  private var dnsSection: some View {
+    Section("DNS") {
+      Picker("Direct DNS", selection: $dnsSettingsDraft.direct) {
+        Text("System").tag(ManagedDNSChoice.system)
+        Text("Cloudflare").tag(ManagedDNSChoice.cloudflare)
+        Text("Google").tag(ManagedDNSChoice.google)
+        Text("Yandex").tag(ManagedDNSChoice.yandex)
+        Text("Quad9").tag(ManagedDNSChoice.quad9)
+        Text("AdGuard").tag(ManagedDNSChoice.adguard)
+        Text("Custom DoH").tag(customDNSTag(for: dnsSettingsDraft.direct))
+      }
+      if case .customDoH = dnsSettingsDraft.direct {
+        TextField("DoH URL", text: dnsURLBinding(for: \.direct))
+      }
+      Text("Direct DNS serves Direct traffic and managed proxy-server hostname resolution.")
+        .settingsHelperText()
+      Picker("Proxy DNS", selection: $dnsSettingsDraft.proxy) {
+        Text("Cloudflare").tag(ManagedDNSChoice.cloudflare)
+        Text("Google").tag(ManagedDNSChoice.google)
+        Text("Yandex").tag(ManagedDNSChoice.yandex)
+        Text("Quad9").tag(ManagedDNSChoice.quad9)
+        Text("AdGuard").tag(ManagedDNSChoice.adguard)
+        Text("Custom DoH").tag(customDNSTag(for: dnsSettingsDraft.proxy))
+      }
+      if case .customDoH = dnsSettingsDraft.proxy {
+        TextField("DoH URL", text: dnsURLBinding(for: \.proxy))
+      }
+      Text("Proxy DNS is sent through the selected proxy.").settingsHelperText()
+      if let dnsSettingsError,
+        dnsSettingsError != SBMText.localized("DNS settings are invalid")
+          || (try? dnsSettingsDraft.validated()) == nil
+      {
+        Label(dnsSettingsError, systemImage: "exclamationmark.triangle")
+          .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+      }
+      HStack {
+        Spacer()
+        Button("Apply") {
+          let saved = model.saveDNSSettings(dnsSettingsDraft)
+          dnsSettingsError =
+            saved ? nil : model.lastError ?? SBMText.localized("DNS settings were not saved")
+          if saved { dnsSettingsDraft = model.dnsSettings }
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(model.helperSetupInProgress || dnsSettingsDraft == model.dnsSettings)
+      }
+    }
+  }
+
+  private func customDNSTag(for choice: ManagedDNSChoice) -> ManagedDNSChoice {
+    if case .customDoH = choice { return choice }
+    return .customDoH("")
+  }
+
+  private func dnsURLBinding(
+    for keyPath: WritableKeyPath<ManagedDNSSettings, ManagedDNSChoice>
+  ) -> Binding<String> {
+    Binding(
+      get: {
+        if case .customDoH(let value) = dnsSettingsDraft[keyPath: keyPath] { return value }
+        return ""
+      },
+      set: { dnsSettingsDraft[keyPath: keyPath] = .customDoH($0) }
+    )
+  }
+
   private var statusColor: Color {
     model.subscriptionStatusLevel == .warning
       ? .orange : model.subscriptionStatusLevel == .success ? .green : .secondary
@@ -733,32 +1121,35 @@ struct SettingsView: View {
   @ViewBuilder private func routingMutationFeedback(
     _ status: RoutingMutationPresentation
   ) -> some View {
-    HStack(spacing: 6) {
-      switch status.state {
-      case .saved:
-        if let message = status.message {
-          Text(message).font(.caption).foregroundStyle(.secondary)
+    if status.state != .saved || !(status.message ?? "").isEmpty {
+      HStack(spacing: 6) {
+        switch status.state {
+        case .saved:
+          if let message = status.message {
+            Text(message).font(.caption).foregroundStyle(.secondary)
+          }
+        case .applying:
+          ProgressView().controlSize(.small)
+          Text(status.message ?? "Routing change applying…")
+            .font(.caption).foregroundStyle(.secondary)
+        case .failed:
+          if let message = status.message {
+            Label(message, systemImage: "exclamationmark.triangle")
+              .font(.caption).foregroundStyle(.orange)
+              .textSelection(.enabled)
+          }
+        case .reconnectRequired:
+          Text("Saved; reconnect to apply")
+            .font(.caption).foregroundStyle(.secondary)
         }
-      case .applying:
-        ProgressView().controlSize(.small)
-        Text(status.message ?? "Routing change applying…")
-          .font(.caption).foregroundStyle(.secondary)
-      case .failed:
-        if let message = status.message {
-          Label(message, systemImage: "exclamationmark.triangle")
-            .font(.caption).foregroundStyle(.orange)
-            .textSelection(.enabled)
-        }
-      case .reconnectRequired:
-        Text("Saved; reconnect to apply")
-          .font(.caption).foregroundStyle(.secondary)
+        Spacer(minLength: 0)
       }
-      Spacer(minLength: 0)
+      .frame(maxWidth: .infinity, minHeight: 18, alignment: .leading)
     }
-    .frame(maxWidth: .infinity, minHeight: 18, alignment: .leading)
   }
 
   private func selectRoutedApplication(for ruleID: UUID? = nil) {
+    guard let profileID = model.selectedProfileID else { return }
     let panel = NSOpenPanel()
     panel.title = SBMText.localized("Choose an Application")
     panel.prompt = SBMText.localized(ruleID == nil ? "Add" : "Change")
@@ -777,9 +1168,9 @@ struct SettingsView: View {
         guard response == .OK, let url = panel.url else { return }
         Task { @MainActor in
           if let ruleID {
-            model.replaceApplicationRoutingRule(ruleID, from: url)
+            model.replaceApplicationRoutingRule(ruleID, from: url, profileID: profileID)
           } else {
-            model.addApplicationRoutingRule(from: url)
+            model.addApplicationRoutingRule(from: url, profileID: profileID)
           }
         }
       }
@@ -788,9 +1179,9 @@ struct SettingsView: View {
     NSApplication.shared.activate()
     guard panel.runModal() == .OK, let url = panel.url else { return }
     if let ruleID {
-      model.replaceApplicationRoutingRule(ruleID, from: url)
+      model.replaceApplicationRoutingRule(ruleID, from: url, profileID: profileID)
     } else {
-      model.addApplicationRoutingRule(from: url)
+      model.addApplicationRoutingRule(from: url, profileID: profileID)
     }
   }
 }

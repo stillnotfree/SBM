@@ -4,24 +4,15 @@ import Testing
 
 @testable import SBM
 
-private actor DelayedRuntimeSender {
-  private var requests: [String] = []
-  private var continuations: [CheckedContinuation<String, Never>] = []
+@MainActor
+private final class RegisteredRuntimeTestHelper: HelperServiceManaging {
+  var registrationState: HelperRegistrationState = .enabled
+  var legacyRegistrationState: HelperRegistrationState = .notRegistered
 
-  func send(_ request: String) async -> String {
-    requests.append(request)
-    return await withCheckedContinuation { continuation in
-      continuations.append(continuation)
-    }
-  }
-
-  func requestCount() -> Int { requests.count }
-
-  func recordedRequests() -> [String] { requests }
-
-  func completeNext(with response: String) {
-    continuations.removeFirst().resume(returning: response)
-  }
+  func register() throws {}
+  func unregister() async throws {}
+  func unregisterLegacy() async throws {}
+  func openSystemSettings() {}
 }
 
 private actor DelayedHelperSender {
@@ -44,15 +35,35 @@ private actor DelayedHelperSender {
   }
 }
 
-private actor LatencyRequestRecorder {
-  private var nodes: [ProxyNodeID] = []
+private actor RoutingValidationGate {
+  private var profiles: [CoreProfile] = []
+  private var continuations: [CheckedContinuation<HelperResponse, Never>] = []
 
-  func send(_ node: ProxyNodeID) -> HelperResponse {
+  func validate(_ profile: CoreProfile) async -> HelperResponse {
+    profiles.append(profile)
+    return await withCheckedContinuation { continuations.append($0) }
+  }
+
+  func submittedProfiles() -> [CoreProfile] { profiles }
+
+  func count() -> Int { profiles.count }
+
+  func completeNext() {
+    continuations.removeFirst().resume(
+      returning: HelperResponse(success: true, coreRunning: false, message: "valid")
+    )
+  }
+}
+
+private actor LatencyRequestRecorder {
+  private var nodes: [ProxyNodeID?] = []
+
+  func send(_ node: ProxyNodeID?) -> HelperResponse {
     nodes.append(node)
     return HelperResponse(
       success: true,
       coreRunning: true,
-      delays: [NodeDelay(node: node, milliseconds: 20)],
+      delays: node.map { [NodeDelay(node: $0, milliseconds: 20)] } ?? [],
       message: "latency"
     )
   }
@@ -60,90 +71,90 @@ private actor LatencyRequestRecorder {
   func requestCount() -> Int { nodes.count }
 }
 
-private struct RecordedOutcome: Equatable {
-  let response: String
-  let isCurrent: Bool
-}
-
-private func waitForRequestCount(
-  _ expected: Int,
-  sender: DelayedRuntimeSender
-) async {
-  for _ in 0..<100 {
-    if await sender.requestCount() == expected { return }
-    try? await Task.sleep(for: .milliseconds(1))
-  }
-}
-
 private func waitForRequestCount(
   _ expected: Int,
   sender: DelayedHelperSender
 ) async {
-  for _ in 0..<100 {
-    if await sender.requestCount() == expected { return }
+  let clock = ContinuousClock()
+  let deadline = clock.now.advanced(by: .seconds(2))
+  while clock.now < deadline {
+    if await sender.requestCount() >= expected { return }
     try? await Task.sleep(for: .milliseconds(1))
   }
-}
-
-@Test @MainActor func runtimeApplyConvergesToChangeSavedDuringDelayedStart() async {
-  let sender = DelayedRuntimeSender()
-  let coordinator = RuntimeApplyCoordinator<String, String> { request in
-    await sender.send(request)
-  }
-  var outcomes: [RecordedOutcome] = []
-
-  coordinator.submit("routing-a") { outcome in
-    if case .success(let response) = outcome.result {
-      outcomes.append(RecordedOutcome(response: response, isCurrent: outcome.isCurrent))
-    }
-  }
-  await waitForRequestCount(1, sender: sender)
-
-  coordinator.markSaved()
-  coordinator.submit("routing-b") { outcome in
-    if case .success(let response) = outcome.result {
-      outcomes.append(RecordedOutcome(response: response, isCurrent: outcome.isCurrent))
-    }
-  }
-
-  #expect(await sender.recordedRequests() == ["routing-a"])
-  #expect(coordinator.status == .applying)
-
-  await sender.completeNext(with: "active-a")
-  await waitForRequestCount(2, sender: sender)
-  #expect(await sender.recordedRequests() == ["routing-a", "routing-b"])
-  #expect(outcomes == [RecordedOutcome(response: "active-a", isCurrent: false)])
-
-  await sender.completeNext(with: "active-b")
-  while coordinator.isApplying { await Task.yield() }
-
   #expect(
-    outcomes == [
-      RecordedOutcome(response: "active-a", isCurrent: false),
-      RecordedOutcome(response: "active-b", isCurrent: true),
-    ]
-  )
-  #expect(coordinator.status == .active)
+    await sender.requestCount() >= expected, "runtime request count did not reach \(expected)")
 }
 
-@Test @MainActor func runtimeApplyCoalescesPendingChangesToLatestGeneration() async {
-  let sender = DelayedRuntimeSender()
-  let coordinator = RuntimeApplyCoordinator<String, String> { request in
+@Test @MainActor
+func runtimeMutationCompletesInFlightBeforeStartingLatestPendingRequest() async {
+  let sender = DelayedHelperSender()
+  let controller = RuntimeMutationController { request in
+    await sender.send(request)
+  }
+  var completedCurrentness: [Bool] = []
+
+  controller.submit(HelperRequest(action: .stop, stopReason: .userDisconnect)) { outcome in
+    if case .success = outcome.result { completedCurrentness.append(outcome.isCurrent) }
+  }
+  await waitForRequestCount(1, sender: sender)
+  controller.submit(HelperRequest(action: .start)) { outcome in
+    if case .success = outcome.result { completedCurrentness.append(outcome.isCurrent) }
+  }
+
+  #expect((await sender.recordedRequests()).map(\.action) == [.stop])
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: false, message: "stopped")
+  )
+  await waitForRequestCount(2, sender: sender)
+  #expect((await sender.recordedRequests()).map(\.action) == [.stop, .start])
+  #expect(completedCurrentness == [false])
+
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: true, message: "started")
+  )
+  await waitForModel { !(controller.isApplying) }
+  #expect(completedCurrentness == [false, true])
+}
+
+@Test @MainActor
+func runtimeMutationCoalescesPendingRequestsToLatest() async {
+  let sender = DelayedHelperSender()
+  let controller = RuntimeMutationController { request in
     await sender.send(request)
   }
 
-  coordinator.submit("profile-a") { _ in }
+  controller.submit(HelperRequest(action: .stop)) { _ in }
   await waitForRequestCount(1, sender: sender)
-  coordinator.submit("profile-b") { _ in }
-  coordinator.submit("profile-c") { _ in }
+  controller.submit(HelperRequest(action: .setMode, mode: .global)) { _ in }
+  controller.submit(
+    HelperRequest(action: .setNode, node: ProxyNodeID(rawValue: "latest-node"))
+  ) { _ in }
 
-  await sender.completeNext(with: "active-a")
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: false, message: "stopped")
+  )
   await waitForRequestCount(2, sender: sender)
-  #expect(await sender.recordedRequests() == ["profile-a", "profile-c"])
+  let requests = await sender.recordedRequests()
+  #expect(requests.map(\.action) == [.stop, .setNode])
+  #expect(requests[1].node == ProxyNodeID(rawValue: "latest-node"))
 
-  await sender.completeNext(with: "active-c")
-  while coordinator.isApplying { await Task.yield() }
-  #expect(coordinator.status == .active)
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: true, message: "latest applied")
+  )
+  await waitForModel { !(controller.isApplying) }
+}
+
+@Test @MainActor
+func desiredRunningTracksExplicitConnectAndDisconnectIntent() {
+  let controller = RuntimeMutationController { _ in
+    HelperResponse(success: true, coreRunning: false, message: "unused")
+  }
+
+  #expect(controller.desiredRunning == nil)
+  controller.desiredRunning = true
+  #expect(controller.desiredRunning == true)
+  controller.desiredRunning = false
+  #expect(controller.desiredRunning == false)
 }
 
 @Test @MainActor
@@ -190,34 +201,41 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
       message: "latest active IPv6"
     )
   )
-  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  await waitForModel { !(model.runtimeApplyStatus == .applying) }
   #expect(model.activeIPv6Enabled == false)
 }
 
-@Test @MainActor func replacedPendingGenerationReceivesSupersededCompletion() async {
-  let sender = DelayedRuntimeSender()
-  let coordinator = RuntimeApplyCoordinator<String, String> { request in
+@Test @MainActor
+func replacedPendingMutationReceivesSupersededCompletion() async {
+  let sender = DelayedHelperSender()
+  let controller = RuntimeMutationController { request in
     await sender.send(request)
   }
   var pendingWasSuperseded = false
 
-  coordinator.submit("in-flight") { _ in }
+  controller.submit(HelperRequest(action: .stop)) { _ in }
   await waitForRequestCount(1, sender: sender)
-  coordinator.submit("pending-shutdown") { outcome in
+  controller.submit(HelperRequest(action: .setMode, mode: .global)) { outcome in
     if case .failure(let error) = outcome.result,
-      error is RuntimeApplyCoordinatorFailure
+      error is RuntimeMutationControllerFailure
     {
       pendingWasSuperseded = !outcome.isCurrent
     }
   }
-  coordinator.submit("newer-start") { _ in }
+  controller.submit(
+    HelperRequest(action: .setNode, node: ProxyNodeID(rawValue: "current-node"))
+  ) { _ in }
 
   #expect(pendingWasSuperseded)
-  await sender.completeNext(with: "stale")
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: false, message: "stopped")
+  )
   await waitForRequestCount(2, sender: sender)
-  #expect(await sender.recordedRequests() == ["in-flight", "newer-start"])
-  await sender.completeNext(with: "current")
-  while coordinator.isApplying { await Task.yield() }
+  #expect((await sender.recordedRequests()).map(\.action) == [.stop, .setNode])
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: true, message: "current")
+  )
+  await waitForModel { !(controller.isApplying) }
 }
 
 @Test @MainActor func routingRemovalDuringDelayedStartIsAppliedAfterStart() async throws {
@@ -255,8 +273,12 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
   var savedLibraries: [ProfileLibrary] = []
   let model = AppModel(
     runtimeSender: { request in await sender.send(request) },
+    profileValidator: { _ in
+      HelperResponse(success: true, coreRunning: false, message: "valid")
+    },
     profileLibraryLoader: { library },
     profileLibrarySaver: { savedLibraries.append($0) },
+    userDefaults: IsolatedTestUserDefaults(),
     performStartup: false
   )
   model.helperEnabled = true
@@ -269,8 +291,9 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
   model.clearRoutingPolicy()
 
   #expect(model.runtimeApplyStatus == .applying)
-  #expect(model.subscriptionStatus == "Routing policy removal applying")
+  await waitForModel { model.subscriptionStatus == "Routing policy applying" }
   #expect(savedLibraries.last?.profiles.first?.payload?.routingPolicyForTesting == nil)
+  #expect(model.routingPolicyMutationStatus.state == .applying)
 
   await sender.completeNext(
     with: HelperResponse(
@@ -281,8 +304,10 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
     )
   )
   await waitForRequestCount(2, sender: sender)
+  #expect(await sender.requestCount() == 2)
   let requests = await sender.recordedRequests()
   #expect(requests.map(\.action) == [.start, .start])
+  guard requests.count == 2 else { return }
   guard case .compatibility(let secondProfile) = requests[1].profile else {
     Issue.record("The converged request did not contain a compatibility profile.")
     return
@@ -297,10 +322,448 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
       message: "active-b"
     )
   )
-  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  await waitForModel { !(model.runtimeApplyStatus == .applying) }
 
   #expect(model.runtimeApplyStatus == .active)
   #expect(model.subscriptionStatus == "Routing policy removed and active")
+}
+
+@Test @MainActor func routingPolicyRemovalR1InvalidatesAndRefreshesInspector() async {
+  let profileID = UUID()
+  let policy = routingPolicyFixture()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Inspector",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-inspector"), server: "inspector.example.test")
+        ],
+        routingPolicy: policy
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    sender: sender
+  )
+  model.routingInspectorInput = "8.8.8.8"
+  model.inspectRouting()
+  let oldSnapshot = model.routingInspectorState.snapshot
+
+  #expect(oldSnapshot != nil)
+  #expect(model.routingInspectorOutput.contains("DIRECT"))
+
+  model.clearRoutingPolicy()
+
+  #expect(model.routingInspectorState == .idle)
+  #expect(model.routingInspectorState.snapshot == nil)
+  await waitForRoutingModel { model.routingPolicyMutationStatus.state == .saved }
+  #expect(model.profiles.first?.payload?.routingPolicyForTesting == nil)
+
+  model.inspectRouting()
+  #expect(model.routingInspectorOutput.contains("PROXY"))
+  #expect(!model.routingInspectorOutput.contains("DIRECT"))
+  #expect(await sender.requestCount() == 0)
+}
+
+@Test @MainActor func routingPolicyRemovalR2KeepsOtherFieldsAndUsesCommonCommit() async {
+  let profileID = UUID()
+  let nodeID = ProxyNodeID(rawValue: "node-preserved")
+  let connection = runtimeTestConnection(id: nodeID, server: "preserved.example.test")
+  let group = ProxyNodeGroup(id: "group-preserved", name: "Preserved", nodes: [nodeID])
+  let applicationRule = ApplicationRoutingRule(
+    displayName: "Browser",
+    bundlePath: "/Applications/Browser.app",
+    executablePath: "/Applications/Browser.app/Contents/MacOS/Browser",
+    target: .direct
+  )
+  let websiteRule = WebsiteRoutingRule(domain: "preserved.example.test", target: .reject)
+  let originalDate = Date(timeIntervalSince1970: 1)
+  let original = ManagedProfile(
+    id: profileID,
+    name: "Preserved fields",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [connection],
+        routingPolicy: routingPolicyFixture(),
+        nodeGroups: [group],
+        applicationRoutingRules: [applicationRule],
+        websiteRoutingRules: [websiteRule],
+        autoExcludedNodeIDs: [nodeID]
+      )
+    ),
+    updatedAt: originalDate
+  )
+  let library = ProfileLibrary(profiles: [original], selectedProfileID: profileID)
+  let sender = DelayedHelperSender()
+  var savedLibraries: [ProfileLibrary] = []
+  let model = AppModel(
+    helperService: RegisteredRuntimeTestHelper(),
+    runtimeSender: { request in await sender.send(request) },
+    profileValidator: { _ in
+      HelperResponse(success: true, coreRunning: false, message: "valid")
+    },
+    profileLibraryLoader: { library },
+    profileLibrarySaver: { savedLibraries.append($0) },
+    userDefaults: IsolatedTestUserDefaults(),
+    performStartup: false
+  )
+  prepareRoutingMutationHelper(model)
+
+  model.clearRoutingPolicy()
+  await waitForRoutingModel { model.routingPolicyMutationStatus.state == .saved }
+
+  guard let updated = model.profiles.first,
+    case .compatibility(let payload) = updated.payload
+  else {
+    Issue.record("The selected compatibility profile was not preserved.")
+    return
+  }
+  #expect(payload.routingPolicy == nil)
+  #expect(payload.connections == [connection])
+  #expect(payload.nodeGroups == [group])
+  #expect(payload.applicationRoutingRules == [applicationRule])
+  #expect(payload.websiteRoutingRules == [websiteRule])
+  #expect(payload.autoExcludedNodeIDs == [nodeID])
+  #expect(updated.updatedAt.map { $0 > originalDate } == true)
+  #expect(model.routingPolicyMutationStatus.message == "Routing policy removed")
+  #expect(savedLibraries.last?.profiles.first == updated)
+  #expect(await sender.requestCount() == 0)
+}
+
+@Test @MainActor func routingPolicyRemovalR3PersistenceFailurePreservesKnownGoodState() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Known good",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-known"), server: "known.example.test")
+        ],
+        routingPolicy: routingPolicyFixture()
+      )
+    )
+  )
+  let library = ProfileLibrary(profiles: [profile], selectedProfileID: profileID)
+  var durableLibrary = library
+  let sender = DelayedHelperSender()
+  let model = AppModel(
+    helperService: RegisteredRuntimeTestHelper(),
+    runtimeSender: { request in await sender.send(request) },
+    profileValidator: { _ in
+      HelperResponse(success: true, coreRunning: false, message: "valid")
+    },
+    profileLibraryLoader: { library },
+    profileLibrarySaver: { candidate in
+      if candidate.profiles.first?.payload?.routingPolicyForTesting == nil {
+        throw NSError(domain: "RoutingPersistenceTest", code: 1)
+      }
+      durableLibrary = candidate
+    },
+    userDefaults: IsolatedTestUserDefaults(),
+    performStartup: false
+  )
+  prepareRoutingMutationHelper(model)
+  model.coreRunning = true
+  model.routingInspectorInput = "8.8.8.8"
+  model.inspectRouting()
+  #expect(model.routingInspectorOutput.contains("DIRECT"))
+
+  model.clearRoutingPolicy()
+
+  #expect(model.routingInspectorState == .idle)
+  await waitForRoutingModel { model.routingPolicyMutationStatus.state == .failed }
+  #expect(model.profiles.first?.payload?.routingPolicyForTesting == routingPolicyFixture())
+  #expect(durableLibrary.profiles.first?.payload?.routingPolicyForTesting == routingPolicyFixture())
+  #expect(model.routingInspectorState == .idle)
+  #expect(await sender.requestCount() == 0)
+}
+
+@Test @MainActor func routingPolicyRemovalR4RuntimeFailureCompensatesCurrentProfile() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Runtime rollback",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-rollback"), server: "rollback.example.test")
+        ],
+        routingPolicy: routingPolicyFixture()
+      )
+    )
+  )
+  let library = ProfileLibrary(profiles: [profile], selectedProfileID: profileID)
+  var durableLibrary = library
+  let sender = DelayedHelperSender()
+  let model = AppModel(
+    helperService: RegisteredRuntimeTestHelper(),
+    runtimeSender: { request in await sender.send(request) },
+    profileValidator: { _ in
+      HelperResponse(success: true, coreRunning: false, message: "valid")
+    },
+    profileLibraryLoader: { library },
+    profileLibrarySaver: { durableLibrary = $0 },
+    userDefaults: IsolatedTestUserDefaults(),
+    performStartup: false
+  )
+  prepareRoutingMutationHelper(model)
+  model.coreRunning = true
+
+  model.clearRoutingPolicy()
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: false,
+      coreRunning: true,
+      activeProfileID: profileID,
+      message: "injected apply failure"
+    )
+  )
+  await waitForRoutingModel { model.routingPolicyMutationStatus.state == .failed }
+
+  #expect(model.profiles.first?.payload?.routingPolicyForTesting == routingPolicyFixture())
+  #expect(durableLibrary.profiles.first?.payload?.routingPolicyForTesting == routingPolicyFixture())
+  #expect(
+    model.routingPolicyMutationStatus.message
+      == "Apply failed — previous routing remains active"
+  )
+}
+
+@Test @MainActor func routingPolicyRemovalR5RebasesBeforeLaterRoutingEdit() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Queued routes",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-queued"), server: "queued.example.test")
+        ],
+        routingPolicy: routingPolicyFixture()
+      )
+    )
+  )
+  let library = ProfileLibrary(profiles: [profile], selectedProfileID: profileID)
+  let validator = RoutingValidationGate()
+  let sender = DelayedHelperSender()
+  let model = AppModel(
+    helperService: RegisteredRuntimeTestHelper(),
+    runtimeSender: { request in await sender.send(request) },
+    profileValidator: { candidate in await validator.validate(candidate) },
+    profileLibraryLoader: { library },
+    profileLibrarySaver: { _ in },
+    userDefaults: IsolatedTestUserDefaults(),
+    performStartup: false
+  )
+  prepareRoutingMutationHelper(model)
+  model.coreRunning = true
+
+  model.clearRoutingPolicy()
+  await waitForValidationCount(1, validator: validator)
+  model.websiteRoutingInput = "queued.example.test"
+  model.websiteRoutingTarget = .direct
+  model.addWebsiteRoutingRule()
+  #expect(model.websiteRoutingStatus.state == .applying)
+
+  await validator.completeNext()
+  await waitForValidationCount(2, validator: validator)
+  let validated = await validator.submittedProfiles()
+  guard validated.count == 2,
+    case .compatibility(let first) = validated[0],
+    case .compatibility(let second) = validated[1]
+  else {
+    Issue.record("Both queued routing candidates were not validated.")
+    return
+  }
+  #expect(first.routingPolicy == nil)
+  #expect(first.websiteRoutingRules.isEmpty)
+  #expect(second.routingPolicy == nil)
+  #expect(second.websiteRoutingRules.map(\.domain) == ["queued.example.test"])
+
+  await validator.completeNext()
+  await waitForRequestCount(1, sender: sender)
+  var requests = await sender.recordedRequests()
+  #expect(requests.map(\.action) == [.start])
+  guard case .compatibility(let firstStart) = requests[0].profile else {
+    Issue.record("The removal Start did not carry a compatibility profile.")
+    return
+  }
+  #expect(firstStart.routingPolicy == nil)
+  #expect(firstStart.websiteRoutingRules.isEmpty)
+
+  await waitForRoutingModel {
+    model.profiles.first?.payload?.websiteRoutingRules.first?.domain == "queued.example.test"
+  }
+  #expect(model.profiles.first?.payload?.routingPolicyForTesting == nil)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: false,
+      coreRunning: true,
+      activeProfileID: profileID,
+      message: "superseded removal apply failed"
+    )
+  )
+  await waitForRequestCount(2, sender: sender)
+  requests = await sender.recordedRequests()
+  #expect(requests.map(\.action) == [.start, .start])
+  guard case .compatibility(let latestStart) = requests[1].profile else {
+    Issue.record("The later routing Start did not carry a compatibility profile.")
+    return
+  }
+  #expect(latestStart.routingPolicy == nil)
+  #expect(latestStart.websiteRoutingRules.map(\.domain) == ["queued.example.test"])
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      message: "latest routes active"
+    )
+  )
+  await waitForRoutingModel { model.runtimeApplyStatus == .active }
+  #expect(model.profiles.first?.payload?.routingPolicyForTesting == nil)
+  #expect(model.profiles.first?.payload?.websiteRoutingRules.first?.domain == "queued.example.test")
+}
+
+@Test @MainActor func routingEditR6R7DuringReconnectStartIsSavedAndRemainsPending() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Reconnect routing",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-reconnect"), server: "reconnect.example.test")
+        ]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let confirmed = HelperResponse(
+    success: true,
+    coreRunning: true,
+    activeProfileID: profileID,
+    activeIPv6Enabled: true,
+    runtimeOutcome: .applied,
+    message: "confirmed"
+  )
+  let model = AppModel(
+    helperService: RegisteredRuntimeTestHelper(),
+    runtimeSender: { request in await sender.send(request) },
+    profileValidator: { _ in
+      HelperResponse(success: true, coreRunning: false, message: "valid")
+    },
+    profileLibraryLoader: {
+      ProfileLibrary(profiles: [profile], selectedProfileID: profileID)
+    },
+    profileLibrarySaver: { _ in },
+    userDefaults: IsolatedTestUserDefaults(),
+    runtimeStateReader: { confirmed },
+    performStartup: false
+  )
+  prepareRoutingMutationHelper(model)
+  model.coreRunning = true
+
+  model.setIPv6Enabled(true)
+  await waitForRequestCount(1, sender: sender)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      activeIPv6Enabled: false,
+      runtimeOutcome: .reconnectRequired,
+      message: "deferred"
+    )
+  )
+  await waitForRoutingModel { model.deferredRuntimeApplyPhase == .pending }
+
+  model.reconnectToApply()
+  await waitForRequestCount(2, sender: sender)
+  #expect((await sender.recordedRequests()).map(\.action) == [.start, .stop])
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: false, message: "stopped")
+  )
+  await waitForRequestCount(3, sender: sender)
+  #expect(model.deferredRuntimeApplyPhase == .reconnecting)
+
+  model.websiteRoutingInput = "after-basis.example.test"
+  model.websiteRoutingTarget = .direct
+  model.addWebsiteRoutingRule()
+  await waitForRoutingModel { model.websiteRoutingStatus.state == .saved }
+
+  #expect(
+    model.profiles.first?.payload?.websiteRoutingRules.first?.domain == "after-basis.example.test")
+  #expect(model.deferredRuntimeApplyPhase == .reconnecting)
+  #expect(await sender.requestCount() == 3)
+
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      activeIPv6Enabled: true,
+      runtimeOutcome: .applied,
+      message: "reconnect start completed"
+    )
+  )
+  await waitForRoutingModel { model.deferredRuntimeApplyPhase == .pending }
+
+  #expect(model.runtimeApplyStatus == .reconnectRequired)
+  #expect(model.deferredRuntimeApplyError == nil)
+  #expect(model.deferredRuntimeApplyPresentation?.headline == "Changes ready to apply")
+  #expect(await sender.requestCount() == 3)
+  #expect((await sender.recordedRequests()).map(\.action) == [.start, .stop, .start])
+}
+
+@Test @MainActor func ordinaryRoutingEditR8StillSubmitsOneStart() async {
+  let profileID = UUID()
+  let profile = ManagedProfile(
+    id: profileID,
+    name: "Ordinary route",
+    payload: .compatibility(
+      VPNProfile(
+        connections: [
+          runtimeTestConnection(
+            id: ProxyNodeID(rawValue: "node-ordinary"), server: "ordinary.example.test")
+        ]
+      )
+    )
+  )
+  let sender = DelayedHelperSender()
+  let model = runtimeTestModel(
+    library: ProfileLibrary(profiles: [profile], selectedProfileID: profileID),
+    sender: sender
+  )
+  model.coreRunning = true
+  model.websiteRoutingInput = "ordinary.example.test"
+  model.websiteRoutingTarget = .reject
+  model.addWebsiteRoutingRule()
+
+  await waitForRequestCount(1, sender: sender)
+  let request = await sender.recordedRequests()[0]
+  #expect(request.action == .start)
+  #expect(request.profile?.websiteRoutingRules.first?.target == .reject)
+  await sender.completeNext(
+    with: HelperResponse(
+      success: true,
+      coreRunning: true,
+      activeProfileID: profileID,
+      message: "ordinary route active"
+    )
+  )
+  await waitForRoutingModel { model.runtimeApplyStatus == .active }
+  #expect(await sender.requestCount() == 1)
+  #expect(model.websiteRoutingStatus.state == .saved)
 }
 
 @Test @MainActor func profileSwitchAndNodeSelectionConvergeAfterDelayedStart() async throws {
@@ -349,7 +812,7 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
       activeProfileID: profileBID,
       message: "node-b"
     ))
-  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  await waitForModel { !(model.runtimeApplyStatus == .applying) }
   #expect(model.selectedProfileID == profileBID)
   #expect(model.selectedNodeID == nodeB)
 
@@ -496,15 +959,12 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
 
   model.setApplicationRoutingTarget(applicationRule.id, target: .direct)
   await waitForRequestCount(1, sender: sender)
-  let generationDuringApply = model.desiredRuntimeGeneration
   model.routingInspectorApplicationID = applicationRule.id
   model.routingInspectorInput = "google.com"
   model.inspectRouting()
-  #expect(model.desiredRuntimeGeneration == generationDuringApply)
   #expect(await sender.requestCount() == 1)
   #expect(
-    model.routingInspectorOutput
-      == "IPv6: REJECT\nIPv4 + Private address / IPv4 + Public address: DIRECT"
+    model.routingInspectorOutput == "IPv6: REJECT\nIPv4: DIRECT"
   )
   #expect(model.routingInspectorDetails.contains("Traffic from: Browser"))
 
@@ -531,7 +991,7 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
       activeProfileID: profileID,
       message: "latest-without-application-rule"
     ))
-  while model.runtimeApplyStatus == .applying { await Task.yield() }
+  await waitForModel { !(model.runtimeApplyStatus == .applying) }
   #expect(model.applicationRoutingRules.isEmpty)
   #expect(model.runtimeApplyStatus == .active)
 }
@@ -576,6 +1036,7 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
       )
     },
     profileLibrarySaver: { _ in },
+    userDefaults: IsolatedTestUserDefaults(),
     performStartup: false
   )
   model.helperEnabled = true
@@ -588,7 +1049,7 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
   await waitForModel { model.runtimeApplyStatus == .failed }
 
   #expect(model.routingPolicyStatus == "Apply failed — previous routing remains active")
-  #expect(model.routingPolicyStatusLevel == .warning)
+  #expect(model.safeCurrentError?.contains("candidate start failed") == true)
   #expect(model.applicationRoutingRules.first?.target == .selectedProxy)
 }
 
@@ -627,6 +1088,7 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
       )
     },
     profileLibrarySaver: { _ in },
+    userDefaults: IsolatedTestUserDefaults(),
     runtimeStateReader: {
       HelperResponse(
         success: true,
@@ -645,7 +1107,7 @@ func staleRuntimeIPv6ReplyCannotOverwriteNewerDesiredPolicy() async {
 
   model.setApplicationRoutingTarget(rule.id, target: .direct)
   await waitForModel {
-    model.subscriptionStatus == "Apply failed — previous routing remains active"
+    model.routingPolicyStatus == "Apply failed — previous routing remains active"
   }
 
   #expect(model.routingPolicyStatus == "Apply failed — previous routing remains active")
@@ -884,6 +1346,7 @@ func reconnectToApplyStopsBeforeStartingAndClearsPendingOnlyAfterAuthoritativeSt
       ProfileLibrary(profiles: [profile], selectedProfileID: profileID)
     },
     profileLibrarySaver: { _ in },
+    userDefaults: IsolatedTestUserDefaults(),
     runtimeStateReader: {
       HelperResponse(
         success: true,
@@ -918,7 +1381,6 @@ func reconnectToApplyStopsBeforeStartingAndClearsPendingOnlyAfterAuthoritativeSt
   await waitForRequestCount(2, sender: sender)
   #expect(await sender.recordedRequests().map(\.action) == [.start, .stop])
   model.reconnectToApply()
-  await Task.yield()
   #expect(await sender.requestCount() == 2)
 
   await sender.completeNext(
@@ -1114,7 +1576,6 @@ func reconnectToApplyConnectFailureLeavesTheVpnStoppedWithoutRetryLoop() async {
   await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
 
   model.setSelectedNode(nodeB)
-  await Task.yield()
 
   #expect(model.selectedNodeID == nodeB)
   #expect(model.runtimeApplyStatus == .reconnectRequired)
@@ -1164,7 +1625,6 @@ func reconnectToApplyConnectFailureLeavesTheVpnStoppedWithoutRetryLoop() async {
   await waitForModel { model.runtimeApplyStatus == .reconnectRequired }
 
   model.testLatency()
-  await Task.yield()
 
   #expect(await latency.requestCount() == 0)
   #expect(
@@ -1177,17 +1637,19 @@ func reconnectToApplyConnectFailureLeavesTheVpnStoppedWithoutRetryLoop() async {
 private func runtimeTestModel(
   library: ProfileLibrary,
   sender: DelayedHelperSender,
+  userDefaults: UserDefaults = IsolatedTestUserDefaults(),
   manager: SubscriptionManager = SubscriptionManager(),
-  latencySender: @escaping @Sendable (ProxyNodeID) async throws -> HelperResponse = { node in
+  latencySender: @escaping @Sendable (ProxyNodeID?) async throws -> HelperResponse = { node in
     HelperResponse(
       success: true,
       coreRunning: true,
-      delays: [NodeDelay(node: node, milliseconds: 20)],
+      delays: node.map { [NodeDelay(node: $0, milliseconds: 20)] } ?? [],
       message: "latency"
     )
   }
 ) -> AppModel {
   let model = AppModel(
+    helperService: RegisteredRuntimeTestHelper(),
     subscriptionManager: manager,
     runtimeSender: { request in await sender.send(request) },
     profileValidator: { _ in
@@ -1195,6 +1657,7 @@ private func runtimeTestModel(
     },
     profileLibraryLoader: { library },
     profileLibrarySaver: { _ in },
+    userDefaults: userDefaults,
     latencySender: latencySender,
     performStartup: false
   )
@@ -1207,10 +1670,12 @@ private func runtimeTestModel(
 
 @MainActor
 private func waitForModel(_ predicate: @MainActor () -> Bool) async {
-  for _ in 0..<1_000 {
-    if predicate() { return }
-    await Task.yield()
+  let clock = ContinuousClock()
+  let deadline = clock.now.advanced(by: .seconds(2))
+  while !predicate(), clock.now < deadline {
+    try? await Task.sleep(for: .milliseconds(1))
   }
+  #expect(predicate(), "model condition did not become true within 2 seconds")
 }
 
 private func runtimeTestConnection(id: ProxyNodeID, server: String) -> ManagedConnection {
@@ -1234,6 +1699,46 @@ extension CoreProfile {
   }
 }
 
+@MainActor
+private func prepareRoutingMutationHelper(_ model: AppModel) {
+  model.helperEnabled = true
+  model.helperReachable = true
+  model.helperVersion = HelperConstants.helperVersion
+  model.helperRevision = HelperConstants.helperRevision
+}
+
+private func routingPolicyFixture() -> RoutingPolicy {
+  RoutingPolicy(
+    configuration: Data(
+      #"{"route":{"rules":[{"ip_cidr":["8.8.8.8/32"],"action":"route","outbound":"direct"}]}}"#.utf8
+    )
+  )
+}
+
+private func waitForValidationCount(
+  _ expected: Int,
+  validator: RoutingValidationGate
+) async {
+  let clock = ContinuousClock()
+  let deadline = clock.now.advanced(by: .seconds(2))
+  while clock.now < deadline {
+    if await validator.count() >= expected { return }
+    try? await Task.sleep(for: .milliseconds(1))
+  }
+  #expect(await validator.count() >= expected, "validation count did not reach \(expected)")
+}
+
+@MainActor
+private func waitForRoutingModel(_ predicate: @MainActor () -> Bool) async {
+  let clock = ContinuousClock()
+  let deadline = clock.now.advanced(by: .seconds(2))
+  while clock.now < deadline {
+    if predicate() { return }
+    try? await Task.sleep(for: .milliseconds(1))
+  }
+  #expect(predicate(), "routing model condition did not become true within 2 seconds")
+}
+
 extension ManagedOutbound {
   fileprivate var serverForRuntimeTest: String {
     switch self {
@@ -1242,4 +1747,53 @@ extension ManagedOutbound {
     case .shadowsocks(let value): value.server
     }
   }
+}
+
+@Test @MainActor
+func runtimeMutationSupersededCompletionCanReentrantlyReplaceVisiblePending() async {
+  let sender = DelayedHelperSender()
+  let controller = RuntimeMutationController { request in
+    await sender.send(request)
+  }
+  var completions: [String: Int] = [:]
+  let latestNode = ProxyNodeID(rawValue: "reentrant-latest")
+
+  controller.submit(HelperRequest(action: .stop)) { _ in
+    completions["physical"] = (completions["physical"] ?? 0) + 1
+  }
+  await waitForRequestCount(1, sender: sender)
+  controller.submit(HelperRequest(action: .setMode, mode: .global)) { outcome in
+    if case .failure = outcome.result {
+      completions["A"] = (completions["A"] ?? 0) + 1
+      controller.submit(HelperRequest(action: .setNode, node: latestNode)) { latest in
+        completions["C"] = (completions["C"] ?? 0) + 1
+        #expect(latest.isCurrent)
+      }
+    }
+  }
+  let bGeneration = controller.submit(HelperRequest(action: .setMode, mode: .direct)) { outcome in
+    if case .failure = outcome.result {
+      completions["B"] = (completions["B"] ?? 0) + 1
+    }
+  }
+
+  #expect(bGeneration == 3)
+  #expect(controller.currentGeneration == 4)
+  #expect(completions["A"] == 1)
+  #expect(completions["B"] == 1)
+  #expect(await sender.recordedRequests().map(\.action) == [.stop])
+
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: false, message: "stopped")
+  )
+  await waitForRequestCount(2, sender: sender)
+  let requests = await sender.recordedRequests()
+  #expect(requests.map(\.action) == [.stop, .setNode])
+  #expect(requests.last?.node == latestNode)
+  await sender.completeNext(
+    with: HelperResponse(success: true, coreRunning: false, message: "latest applied")
+  )
+  await waitForModel { !(controller.isApplying) }
+
+  #expect(completions == ["A": 1, "B": 1, "C": 1, "physical": 1])
 }

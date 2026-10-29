@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stillnotfree.sbm.helper.v12</string>
+    <key>BundleProgram</key>
+    <string>Contents/Resources/SBMHelper</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SBM_HELPER_SERVICE_LABEL</key>
+        <string>com.stillnotfree.sbm.helper.v12</string>
+    </dict>
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>/var/run/com.stillnotfree.sbm.helper.v12.sock</string>
+            <key>SockPathOwner</key>
+            <integer>0</integer>
+            <key>SockPathGroup</key>
+            <integer>80</integer>
+            <key>SockPathMode</key>
+            <integer>432</integer>
+        </dict>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>1</integer>
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+</dict>
+</plist>
